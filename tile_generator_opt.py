@@ -16,6 +16,12 @@ import subprocess
 import sys
 import fiona
 import gc
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
+import os
+import time
+
+max_workers = os.cpu_count()
 
 TILE_SIZE = 256
 DRAW_COMMANDS = {
@@ -435,7 +441,6 @@ def read_features_from_geojson(geojson_file, config):
             })
     return features
 
-def generate_tiles_all_zooms(features, output_dir, zoom_levels, max_file_size=65536):
     tile_features_by_zoom = {z: defaultdict(list) for z in zoom_levels}
     print("Assigning features to tiles for all zoom levels...")
 
@@ -485,13 +490,96 @@ def generate_tiles_all_zooms(features, output_dir, zoom_levels, max_file_size=65
         if not jobs:
             jobs.append((0, 0, [], zoom, output_dir, max_file_size, get_simplify_tolerance_for_zoom(zoom)))
 
-        for job in tqdm(jobs, desc=f"Writing tiles (zoom {zoom})"):
-            tile_size = tile_worker(job)
-            tile_sizes.append(tile_size)
+        max_workers = os.cpu_count() or 4
+        tile_times = []
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_job = {executor.submit(tile_worker, job): job for job in jobs}
+            with tqdm(total=len(jobs), desc=f"Writing tiles (zoom {zoom})") as pbar:
+                for future in as_completed(future_to_job):
+                    start_time = time.time()
+                    tile_size = future.result()
+                    elapsed = time.time() - start_time
+                    tile_times.append(elapsed)
+                    tile_sizes.append(tile_size)
+                    avg_time = sum(tile_times) / len(tile_times) if tile_times else 0
+                    pbar.set_postfix({
+                        "workers": max_workers,
+                        "avg_tile_time": f"{avg_time:.3f}s"
+                    })
+                    pbar.update(1)
+        avg_tile_size = sum(tile_sizes) / len(tile_sizes) if tile_sizes else 0
+        print(f"Zoom {zoom}: average tile size = {avg_tile_size:.2f} bytes")
+
+def generate_tiles_all_zooms(features, output_dir, zoom_levels, max_file_size=65536):
+    tile_features_by_zoom = {z: defaultdict(list) for z in zoom_levels}
+    print("Assigning features to tiles for all zoom levels...")
+
+    for feat in tqdm(features, desc="Assigning features"):
+        for zoom in zoom_levels:
+            if zoom < feat["zoom_filter"]:
+                continue
+            geom = feat["geom"]
+            if not geom.is_valid or geom.is_empty:
+                continue
+            simplify_tolerance = get_simplify_tolerance_for_zoom(zoom)
+            feature_geom = geom
+            if simplify_tolerance is not None and geom.geom_type in ("LineString", "MultiLineString"):
+                try:
+                    feature_geom = feature_geom.simplify(simplify_tolerance, preserve_topology=True)
+                except Exception:
+                    pass
+            if feature_geom.is_empty or not feature_geom.is_valid:
+                continue
+
+            minx, miny, maxx, maxy = feature_geom.bounds
+            n = 2 ** zoom
+            xtile_min, ytile_min = deg2num(miny, minx, zoom)
+            xtile_max, ytile_max = deg2num(maxy, maxx, zoom)
+
+            for xt in range(min(xtile_min, xtile_max), max(xtile_min, xtile_max) + 1):
+                for yt in range(min(ytile_min, ytile_max), max(ytile_min, ytile_max) + 1):
+                    t_lon_min, t_lat_min, t_lon_max, t_lat_max = tile_latlon_bounds(xt, yt, zoom)
+                    tile_bbox = box(t_lon_min, t_lat_min, t_lon_max, t_lat_max)
+                    try:
+                        clipped_geom = feature_geom.intersection(tile_bbox)
+                    except Exception:
+                        continue
+                    if not clipped_geom.is_empty:
+                        new_feat = feat.copy()
+                        new_feat["geom"] = clipped_geom
+                        tile_features_by_zoom[zoom][(xt, yt)].append(new_feat)
+
+    print("Writing tiles for all zoom levels...")
+
+    for zoom in zoom_levels:
+        tiles_features = tile_features_by_zoom[zoom]
+        jobs = []
+        tile_sizes = []
+        tile_times = []
+        for (x, y), feats in tiles_features.items():
+            jobs.append((x, y, feats, zoom, output_dir, max_file_size, get_simplify_tolerance_for_zoom(zoom)))
+        if not jobs:
+            jobs.append((0, 0, [], zoom, output_dir, max_file_size, get_simplify_tolerance_for_zoom(zoom)))
+
+        max_workers = os.cpu_count() or 4
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_job = {executor.submit(tile_worker, job): job for job in jobs}
+            with tqdm(total=len(jobs), desc=f"Writing tiles (zoom {zoom})") as pbar:
+                for future in as_completed(future_to_job):
+                    tile_size, elapsed = future.result()
+                    tile_sizes.append(tile_size)
+                    tile_times.append(elapsed)
+                    avg_time = sum(tile_times) / len(tile_times) if tile_times else 0
+                    pbar.set_postfix({
+                        "workers": max_workers,
+                        "avg_tile_time": f"{avg_time:.3f}s"
+                    })
+                    pbar.update(1)
         avg_tile_size = sum(tile_sizes) / len(tile_sizes) if tile_sizes else 0
         print(f"Zoom {zoom}: average tile size = {avg_tile_size:.2f} bytes")
 
 def tile_worker(args):
+    start_time = time.time()
     x, y, feats, zoom, output_dir, max_file_size, simplify_tolerance = args
 
     ordered_feats = sorted(feats, key=lambda f: f.get("priority", 5))
@@ -531,7 +619,8 @@ def tile_worker(args):
     tile_size = len(buffer)
     del all_commands, ordered_feats, buffer
     gc.collect()
-    return tile_size
+    elapsed = time.time() - start_time
+    return tile_size, elapsed
 
 def main():
     parser = argparse.ArgumentParser(description="OSM vector tile generator (bin format, uint16 tile coordinates, visually lossless, optimized fields)")

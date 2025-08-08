@@ -212,13 +212,12 @@ def render_tile_surface(tile, bg_color, fill_mode):
                         y += dy
                     pts.append((uint16_to_tile_pixel(x), uint16_to_tile_pixel(y)))
                 if fill_mode and len(pts) >= 3:
-    # Dibuja primero el relleno con el MISMO color que el borde
                     pygame.draw.polygon(surface, rgb, pts, 0)
                     closed = pts[0] == pts[-1]
                     for i in range(len(pts)-1):
                         p1 = pts[i]
                         p2 = pts[i+1]
-                        if not fill_mode and is_tile_border_point(p1) and is_tile_border_point(p2):
+                        if is_tile_border_point(p1) and is_tile_border_point(p2):
                             # pygame.draw.line(surface, bg_color, p1, p2, 1)
                             continue
                         else:
@@ -227,7 +226,7 @@ def render_tile_surface(tile, bg_color, fill_mode):
                     if closed:
                         p1 = pts[-1]
                         p2 = pts[0]
-                        if not fill_mode and is_tile_border_point(p1) and is_tile_border_point(p2):
+                        if fill_mode and is_tile_border_point(p1) and is_tile_border_point(p2):
                             # pygame.draw.line(surface, bg_color, p1, p2, 1)
                             continue
                         else:
@@ -239,7 +238,6 @@ def render_tile_surface(tile, bg_color, fill_mode):
                         p1 = pts[i]
                         p2 = pts[i+1]
                         if not fill_mode and is_tile_border_point(p1) and is_tile_border_point(p2):
-                            # pygame.draw.line(surface, bg_color, p1, p2, 1)
                             continue
                         else:
                             pygame.draw.line(surface, rgb, p1, p2, 1)
@@ -247,7 +245,6 @@ def render_tile_surface(tile, bg_color, fill_mode):
                         p1 = pts[-1]
                         p2 = pts[0]
                         if not fill_mode and is_tile_border_point(p1) and is_tile_border_point(p2):
-                            # pygame.draw.line(surface, bg_color, p1, p2, 1)
                             continue
                         else:
                             pygame.draw.line(surface, rgb, p1, p2, 1)
