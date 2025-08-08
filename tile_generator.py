@@ -16,10 +16,13 @@ import subprocess
 import sys
 import fiona
 import gc
-from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
-import os
 import time
+
+import ijson
+import decimal
+
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 max_workers = os.cpu_count()
 
@@ -33,6 +36,48 @@ DRAW_COMMANDS = {
 }
 
 UINT16_TILE_SIZE = 65536
+
+def extract_layer_to_tmpfile(args):
+    layer, i, layers, geojson_file, pbf_file, config, LAYER_FIELDS, config_fields = args
+    logs = []
+    possible = LAYER_FIELDS[layer]
+    available = get_layer_fields_from_pbf(pbf_file, layer)
+    allowed = possible & available & config_fields
+    where_clause = build_ogr2ogr_where_clause_from_config(config, allowed)
+    if not where_clause:
+        logs.append(f"Skipping layer {layer}: no matching fields in config/PBF.")
+        return None, logs
+    logs.append(f"[{i+1}/{len(layers)}] Extracted layer: {layer} (fields: {', '.join(sorted(allowed))})")
+    tmp_layer_file = f"{geojson_file}_{layer}.tmp"
+    if os.path.exists(tmp_layer_file):
+        os.remove(tmp_layer_file)
+    select_fields = ",".join(sorted(allowed))
+    cmd = [
+        "ogr2ogr",
+        "-f", "GeoJSON",
+        "-nlt", "PROMOTE_TO_MULTI",
+        "-where", where_clause,
+        "-select", select_fields,
+        tmp_layer_file,
+        pbf_file,
+        layer
+    ]
+    result = subprocess.run(cmd, capture_output=True)
+    if result.returncode != 0:
+        logs.append(f"Error running ogr2ogr for layer {layer}: {result.stderr.decode()}")
+        return None, logs
+    return tmp_layer_file, logs
+
+def decimal_default(obj):
+    if isinstance(obj, decimal.Decimal):
+        return float(obj)
+    raise TypeError
+
+def read_tmp_geojson_features_stream(tmp_file, config_fields):
+    with open(tmp_file, "r", encoding="utf-8") as f:
+        for feat in ijson.items(f, "features.item"):
+            feat['properties'] = {k: v for k, v in feat['properties'].items() if k in config_fields}
+            yield feat
 
 def deg2num(lat_deg, lon_deg, zoom):
     lat_rad = math.radians(lat_deg)
@@ -53,7 +98,7 @@ def coords_to_pixel_coords_uint16(coords, zoom, tile_x, tile_y):
     for lon, lat in coords:
         px_global, py_global = deg2pixel(lat, lon, zoom)
         x = (px_global - tile_x * TILE_SIZE) * (UINT16_TILE_SIZE - 1) / (TILE_SIZE - 1)
-        y = (py_global - tile_y * TILE_SIZE) * (UINT16_TILE_SIZE - 1) / (TILE_SIZE - 1)
+        y = ((py_global - tile_y * TILE_SIZE) * (UINT16_TILE_SIZE - 1) / (TILE_SIZE - 1))
         x = int(round(x))
         y = int(round(y))
         x = max(0, min(UINT16_TILE_SIZE - 1, x))
@@ -69,18 +114,6 @@ def remove_duplicate_points(points):
         if pt != result[-1]:
             result.append(pt)
     return result
-
-def hex_to_rgb565(hex_color):
-    try:
-        if not hex_color or not isinstance(hex_color, str) or not hex_color.startswith("#"):
-            return 0xFFFF
-        r = int(hex_color[1:3], 16)
-        g = int(hex_color[3:5], 16)
-        b = int(hex_color[5:7], 16)
-        rgb565 = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)
-        return min(65535, max(0, rgb565))
-    except Exception:
-        return 0xFFFF
 
 def hex_to_rgb332(hex_color):
     try:
@@ -102,31 +135,6 @@ def get_style_for_tags(tags, config):
         if k in config:
             return config[k], k
     return {}, None
-
-def try_make_valid_polygon(coords):
-    from shapely.geometry import Polygon, MultiPolygon, GeometryCollection
-    try:
-        poly = Polygon(coords)
-        if poly.is_valid:
-            return poly
-        fixed = poly.buffer(0)
-        if fixed.is_empty:
-            return None
-        if isinstance(fixed, (Polygon, MultiPolygon)):
-            if isinstance(fixed, MultiPolygon):
-                largest = max(fixed.geoms, key=lambda g: g.area)
-                return largest
-            return fixed
-        elif isinstance(fixed, GeometryCollection):
-            polys = [g for g in fixed.geoms if isinstance(g, Polygon)]
-            if polys:
-                largest = max(polys, key=lambda g: g.area)
-                return largest
-            return None
-        else:
-            return None
-    except Exception:
-        return None
 
 def tile_latlon_bounds(tile_x, tile_y, zoom, pixel_margin=0):
     n = 2.0 ** zoom
@@ -331,7 +339,6 @@ def build_ogr2ogr_where_clause_from_config(config, allowed_fields):
     return where_clause
 
 def get_config_fields(config):
-    # Recoge los campos que aparecen en las claves del config
     fields = set()
     for k in config.keys():
         if "=" in k:
@@ -340,6 +347,14 @@ def get_config_fields(config):
         else:
             fields.add(k)
     return fields
+
+def count_features(tmp_files, config_fields):
+    total = 0
+    for tmp_file in tmp_files:
+        with open(tmp_file, "r", encoding="utf-8") as f:
+            for _ in ijson.items(f, "features.item"):
+                total += 1
+    return total
 
 def extract_geojson_from_pbf(pbf_file, geojson_file, config):
     print("Extracting PBF with ogr2ogr using SQL filter and minimal fields based on style...")
@@ -353,70 +368,55 @@ def extract_geojson_from_pbf(pbf_file, geojson_file, config):
         "other_relations": {"place", "natural"}
     }
     layers = ["points", "lines", "multilinestrings", "multipolygons", "other_relations"]
-    tmp_files = []
     config_fields = get_config_fields(config)
-    for i, layer in enumerate(layers):
-        possible = LAYER_FIELDS[layer]
-        available = get_layer_fields_from_pbf(pbf_file, layer)
-        allowed = possible & available & config_fields
-        where_clause = build_ogr2ogr_where_clause_from_config(config, allowed)
-        if not where_clause:
-            print(f"Skipping layer {layer}: no matching fields in config/PBF.")
-            continue
-        print(f"[{i+1}/{len(layers)}] Extracting layer: {layer} (fields: {', '.join(sorted(allowed))})")
-        tmp_layer_file = f"{geojson_file}_{layer}.tmp"
-        if os.path.exists(tmp_layer_file):
-            os.remove(tmp_layer_file)
-        select_fields = ",".join(sorted(allowed))
-        cmd = [
-            "ogr2ogr",
-            "-f", "GeoJSON",
-            "-nlt", "PROMOTE_TO_MULTI",
-            "-where", where_clause,
-            "-select", select_fields,
-            tmp_layer_file,
-            pbf_file,
-            layer
-        ]
-        result = subprocess.run(cmd, capture_output=True)
-        if result.returncode != 0:
-            print(f"Error running ogr2ogr for layer {layer}:", result.stderr.decode())
-            continue
-        tmp_files.append(tmp_layer_file)
+
+    print("Extracting layers ...")
+    extract_args = [
+        (layer, i, layers, geojson_file, pbf_file, config, LAYER_FIELDS, config_fields)
+        for i, layer in enumerate(layers)
+    ]
+    tmp_files = []
+    all_logs = []
+    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(extract_layer_to_tmpfile, arg) for arg in extract_args]
+        for future in as_completed(futures):
+            tmp_file, logs = future.result()
+            all_logs.extend(logs)
+            if tmp_file:
+                tmp_files.append(tmp_file)
+    for log in all_logs:
+        print(log)
     if not tmp_files:
         print("Could not extract any layer from OSM PBF.")
         sys.exit(1)
-    print("Merging temporary GeoJSONs...")
-    features = []
-    file_feature_counts = []
-    print("Counting features in temporary files...")
+
+    print("Counting total features ...")
+    total_features_to_merge = count_features(tmp_files, config_fields)
+    print(f"Total features to merge: {total_features_to_merge}")
+
+    print("Merging and writing temporary GeoJSONs ...")
+    total_features = 0
+    with open(geojson_file, "w", encoding="utf-8") as out, tqdm(total=total_features_to_merge, desc="Merging features") as pbar:
+        out.write('{"type": "FeatureCollection", "features": [\n')
+        first = True
+        counter = 0
+        for tmp_file in tmp_files:
+            for feat in read_tmp_geojson_features_stream(tmp_file, config_fields):
+                if not first:
+                    out.write(',\n')
+                json.dump(feat, out, default=decimal_default)
+                first = False
+                total_features += 1
+                counter += 1
+                pbar.update(1)
+                if counter % 10000 == 0:
+                    gc.collect()
+        out.write('\n]}\n')
+
     for tmp_file in tmp_files:
-        with open(tmp_file, "r", encoding="utf-8") as f:
-            gj = json.load(f)
-            n = len(gj.get("features", []))
-            file_feature_counts.append((tmp_file, n))
-    total_features = sum(n for _, n in file_feature_counts)
-    with tqdm(total=total_features, desc="Merging features") as pbar:
-        for tmp_file, n in file_feature_counts:
-            with open(tmp_file, "r", encoding="utf-8") as f:
-                gj = json.load(f)
-                feats = gj.get("features", [])
-                # Limpiar las propiedades, solo dejar las presentes en config_fields
-                for feat in feats:
-                    feat['properties'] = {k: v for k, v in feat['properties'].items() if k in config_fields}
-                features.extend(feats)
-                pbar.update(len(feats))
-            os.remove(tmp_file)
-    print(f"Total merged features: {len(features)}")
-    print(f"Writing merged features to {geojson_file}...")
-    geojson_final = {
-        "type": "FeatureCollection",
-        "features": features
-    }
-    with open(geojson_file, "w", encoding="utf-8") as f:
-        json.dump(geojson_final, f)
+        os.remove(tmp_file)
+    print(f"Total merged features: {total_features}")
     print(f"GeoJSON file generated successfully at {geojson_file}")
-    del features
     gc.collect()
 
 def read_features_from_geojson(geojson_file, config):
@@ -440,75 +440,6 @@ def read_features_from_geojson(geojson_file, config):
                 "priority": priority
             })
     return features
-
-    tile_features_by_zoom = {z: defaultdict(list) for z in zoom_levels}
-    print("Assigning features to tiles for all zoom levels...")
-
-    for feat in tqdm(features, desc="Assigning features"):
-        for zoom in zoom_levels:
-            if zoom < feat["zoom_filter"]:
-                continue
-            geom = feat["geom"]
-            if not geom.is_valid or geom.is_empty:
-                continue
-            simplify_tolerance = get_simplify_tolerance_for_zoom(zoom)
-            feature_geom = geom
-            if simplify_tolerance is not None and geom.geom_type in ("LineString", "MultiLineString"):
-                try:
-                    feature_geom = feature_geom.simplify(simplify_tolerance, preserve_topology=True)
-                except Exception:
-                    pass
-            if feature_geom.is_empty or not feature_geom.is_valid:
-                continue
-
-            minx, miny, maxx, maxy = feature_geom.bounds
-            n = 2 ** zoom
-            xtile_min, ytile_min = deg2num(miny, minx, zoom)
-            xtile_max, ytile_max = deg2num(maxy, maxx, zoom)
-
-            for xt in range(min(xtile_min, xtile_max), max(xtile_min, xtile_max) + 1):
-                for yt in range(min(ytile_min, ytile_max), max(ytile_min, ytile_max) + 1):
-                    t_lon_min, t_lat_min, t_lon_max, t_lat_max = tile_latlon_bounds(xt, yt, zoom)
-                    tile_bbox = box(t_lon_min, t_lat_min, t_lon_max, t_lat_max)
-                    try:
-                        clipped_geom = feature_geom.intersection(tile_bbox)
-                    except Exception:
-                        continue
-                    if not clipped_geom.is_empty:
-                        new_feat = feat.copy()
-                        new_feat["geom"] = clipped_geom
-                        tile_features_by_zoom[zoom][(xt, yt)].append(new_feat)
-
-    print("Writing tiles for all zoom levels...")
-
-    for zoom in zoom_levels:
-        tiles_features = tile_features_by_zoom[zoom]
-        jobs = []
-        tile_sizes = []
-        for (x, y), feats in tiles_features.items():
-            jobs.append((x, y, feats, zoom, output_dir, max_file_size, get_simplify_tolerance_for_zoom(zoom)))
-        if not jobs:
-            jobs.append((0, 0, [], zoom, output_dir, max_file_size, get_simplify_tolerance_for_zoom(zoom)))
-
-        max_workers = os.cpu_count() or 4
-        tile_times = []
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_job = {executor.submit(tile_worker, job): job for job in jobs}
-            with tqdm(total=len(jobs), desc=f"Writing tiles (zoom {zoom})") as pbar:
-                for future in as_completed(future_to_job):
-                    start_time = time.time()
-                    tile_size = future.result()
-                    elapsed = time.time() - start_time
-                    tile_times.append(elapsed)
-                    tile_sizes.append(tile_size)
-                    avg_time = sum(tile_times) / len(tile_times) if tile_times else 0
-                    pbar.set_postfix({
-                        "workers": max_workers,
-                        "avg_tile_time": f"{avg_time:.3f}s"
-                    })
-                    pbar.update(1)
-        avg_tile_size = sum(tile_sizes) / len(tile_sizes) if tile_sizes else 0
-        print(f"Zoom {zoom}: average tile size = {avg_tile_size:.2f} bytes")
 
 def generate_tiles_all_zooms(features, output_dir, zoom_levels, max_file_size=65536):
     tile_features_by_zoom = {z: defaultdict(list) for z in zoom_levels}
@@ -561,8 +492,8 @@ def generate_tiles_all_zooms(features, output_dir, zoom_levels, max_file_size=65
         if not jobs:
             jobs.append((0, 0, [], zoom, output_dir, max_file_size, get_simplify_tolerance_for_zoom(zoom)))
 
-        max_workers = os.cpu_count() or 4
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        max_workers_local = os.cpu_count() or 4
+        with ProcessPoolExecutor(max_workers=max_workers_local) as executor:
             future_to_job = {executor.submit(tile_worker, job): job for job in jobs}
             with tqdm(total=len(jobs), desc=f"Writing tiles (zoom {zoom})") as pbar:
                 for future in as_completed(future_to_job):
@@ -571,7 +502,7 @@ def generate_tiles_all_zooms(features, output_dir, zoom_levels, max_file_size=65
                     tile_times.append(elapsed)
                     avg_time = sum(tile_times) / len(tile_times) if tile_times else 0
                     pbar.set_postfix({
-                        "workers": max_workers,
+                        "workers": max_workers_local,
                         "avg_tile_time": f"{avg_time:.3f}s"
                     })
                     pbar.update(1)
