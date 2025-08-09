@@ -3,4 +3,7 @@
 *.bin
 *.tmp
 .gitignore
-
+*.gz
+ESP32
+tile_generator_gzip.py
+tile_viewer_gzip.py

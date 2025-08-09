@@ -20,6 +20,7 @@ DRAW_COMMANDS = {
     3: "STROKE_POLYGON",
     5: "HORIZONTAL_LINE",
     6: "VERTICAL_LINE",
+    0x80: "SET_COLOR",  # Comando de estado para optimización de colores
 }
 
 UINT16_TILE_SIZE = 65536
@@ -116,6 +117,8 @@ def read_varint(data, offset):
     result = 0
     shift = 0
     while True:
+        if offset >= len(data):
+            return result, offset
         b = data[offset]
         offset += 1
         result |= (b & 0x7F) << shift
@@ -145,6 +148,7 @@ def render_tile_surface(tile, bg_color, fill_mode):
     surface = pygame.Surface((TILE_SIZE, TILE_SIZE))
     surface.fill(bg_color)
     filepath = tile['file']
+    
     if filepath.endswith('.png'):
         try:
             img = pygame.image.load(filepath)
@@ -165,15 +169,27 @@ def render_tile_surface(tile, bg_color, fill_mode):
         return surface
 
     offset = 0
-    num_cmds, offset = read_varint(data, offset)
-    for _ in range(num_cmds):
-        if offset >= len(data):
-            break
-        try:
+    current_color = None  # Estado del color actual
+    
+    try:
+        num_cmds, offset = read_varint(data, offset)
+        
+        for cmd_idx in range(num_cmds):
+            if offset >= len(data):
+                break
+                
             cmd_type, offset = read_varint(data, offset)
-            color = data[offset]
-            offset += 1
-            rgb = rgb332_to_rgb888(color)
+            
+            if cmd_type == 0x80:  # SET_COLOR
+                if offset >= len(data):
+                    break
+                current_color = data[offset]
+                offset += 1
+                continue  # No dibujar nada, solo actualizar estado
+            
+            # Para comandos de geometría, usar current_color
+            rgb = rgb332_to_rgb888(current_color) if current_color is not None else (255, 255, 255)
+            
             if cmd_type == 1:  # LINE
                 x1, offset = read_zigzag(data, offset)
                 y1, offset = read_zigzag(data, offset)
@@ -186,6 +202,7 @@ def render_tile_surface(tile, bg_color, fill_mode):
             elif cmd_type == 2:  # POLYLINE
                 n_pts, offset = read_varint(data, offset)
                 pts = []
+                x, y = 0, 0
                 for i in range(n_pts):
                     if i == 0:
                         x, offset = read_zigzag(data, offset)
@@ -201,6 +218,7 @@ def render_tile_surface(tile, bg_color, fill_mode):
             elif cmd_type == 3:  # STROKE_POLYGON
                 n_pts, offset = read_varint(data, offset)
                 pts = []
+                x, y = 0, 0
                 for i in range(n_pts):
                     if i == 0:
                         x, offset = read_zigzag(data, offset)
@@ -211,29 +229,27 @@ def render_tile_surface(tile, bg_color, fill_mode):
                         x += dx
                         y += dy
                     pts.append((uint16_to_tile_pixel(x), uint16_to_tile_pixel(y)))
+                    
                 if fill_mode and len(pts) >= 3:
                     pygame.draw.polygon(surface, rgb, pts, 0)
-                    closed = pts[0] == pts[-1]
+                    closed = pts[0] == pts[-1] if len(pts) > 0 else False
                     for i in range(len(pts)-1):
                         p1 = pts[i]
                         p2 = pts[i+1]
                         if is_tile_border_point(p1) and is_tile_border_point(p2):
-                            # pygame.draw.line(surface, bg_color, p1, p2, 1)
                             continue
                         else:
                             border_rgb = darken_color(rgb)
                             pygame.draw.line(surface, border_rgb, p1, p2, 2)
-                    if closed:
+                    if closed and len(pts) > 1:
                         p1 = pts[-1]
                         p2 = pts[0]
-                        if fill_mode and is_tile_border_point(p1) and is_tile_border_point(p2):
-                            # pygame.draw.line(surface, bg_color, p1, p2, 1)
-                            continue
-                        else:
+                        if not (is_tile_border_point(p1) and is_tile_border_point(p2)):
                             border_rgb = darken_color(rgb)
                             pygame.draw.line(surface, border_rgb, p1, p2, 2)
+                            
                 if len(pts) >= 2:
-                    closed = pts[0] == pts[-1]
+                    closed = pts[0] == pts[-1] if len(pts) > 0 else False
                     for i in range(len(pts)-1):
                         p1 = pts[i]
                         p2 = pts[i+1]
@@ -241,12 +257,10 @@ def render_tile_surface(tile, bg_color, fill_mode):
                             continue
                         else:
                             pygame.draw.line(surface, rgb, p1, p2, 1)
-                    if closed:
+                    if closed and len(pts) > 1:
                         p1 = pts[-1]
                         p2 = pts[0]
-                        if not fill_mode and is_tile_border_point(p1) and is_tile_border_point(p2):
-                            continue
-                        else:
+                        if not (not fill_mode and is_tile_border_point(p1) and is_tile_border_point(p2)):
                             pygame.draw.line(surface, rgb, p1, p2, 1)
             elif cmd_type == 5:  # HORIZONTAL_LINE
                 x1, offset = read_zigzag(data, offset)
@@ -262,9 +276,10 @@ def render_tile_surface(tile, bg_color, fill_mode):
                 y2 = y1 + dy
                 pygame.draw.line(surface, rgb, (uint16_to_tile_pixel(x), uint16_to_tile_pixel(y1)),
                                  (uint16_to_tile_pixel(x), uint16_to_tile_pixel(y2)), 1)
-        except Exception as e:
-            print(f"Error reading command in {filepath}: {e}")
-            break
+                                 
+    except Exception as e:
+        print(f"Error parsing commands in {filepath}: {e}")
+        print(f"Error at offset: {offset}, data length: {len(data)}")
 
     return surface
 
@@ -463,7 +478,7 @@ def main(base_dir):
 
     pygame.init()
     screen = pygame.display.set_mode((WINDOW_WIDTH, WINDOW_HEIGHT))
-    pygame.display.set_caption(f"Map: {base_dir}")
+    pygame.display.set_caption(f"Map: {base_dir} - Optimized with SET_COLOR")
     font = pygame.font.SysFont(None, 16)
     font_main = pygame.font.SysFont(None, 18)
     font_b = pygame.font.SysFont(None, 16)

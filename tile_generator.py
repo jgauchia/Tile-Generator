@@ -33,6 +33,7 @@ DRAW_COMMANDS = {
     'STROKE_POLYGON': 3,
     'HORIZONTAL_LINE': 5,
     'VERTICAL_LINE': 6,
+    'SET_COLOR': 0x80,  # Comando de estado para optimización de colores
 }
 
 UINT16_TILE_SIZE = 65536
@@ -204,43 +205,91 @@ def pack_varint(n):
 def pack_zigzag(n):
     return pack_varint((n << 1) ^ (n >> 31))
 
+def insert_color_commands(commands):
+    """
+    Inserta comandos SET_COLOR y elimina campo color de comandos de geometría.
+    Esto reduce la redundancia cuando múltiples comandos consecutivos usan el mismo color.
+    """
+    if not commands:
+        return commands
+    
+    result = []
+    current_color = None
+    color_commands_inserted = 0
+    
+    for cmd in commands:
+        cmd_color = cmd.get('color')
+        
+        # Si cambia el color, insertar SET_COLOR
+        if cmd_color != current_color:
+            result.append({
+                'type': DRAW_COMMANDS['SET_COLOR'], 
+                'color': cmd_color
+            })
+            current_color = cmd_color
+            color_commands_inserted += 1
+        
+        # Agregar comando sin campo color
+        cmd_copy = {k: v for k, v in cmd.items() if k != 'color'}
+        result.append(cmd_copy)
+    
+    # Calcular ahorro real: eliminamos N colores incrustados, agregamos M comandos SET_COLOR
+    original_commands = len(commands)
+    optimized_commands = len(result)
+    colors_removed = original_commands  # Cada comando original tenía un color
+    colors_added = color_commands_inserted  # Comandos SET_COLOR agregados
+    net_savings = colors_removed - colors_added  # Ahorro neto en bytes
+    
+    return result, net_savings
+
 def pack_draw_commands(commands):
+    """
+    Empaqueta comandos de dibujo en formato binario optimizado.
+    Soporta comandos SET_COLOR para reducir redundancia de colores.
+    """
     out = bytearray()
     out += pack_varint(len(commands))
+    
     for cmd in commands:
         t = cmd['type']
-        color = cmd['color'] & 0xFF
         out += pack_varint(t)
-        out += struct.pack("B", color)
-        if t == DRAW_COMMANDS['LINE']:
-            x1, y1, x2, y2 = map(clamp_uint16, [cmd['x1'], cmd['y1'], cmd['x2'], cmd['y2']])
-            out += pack_zigzag(x1)
-            out += pack_zigzag(y1)
-            out += pack_zigzag(x2 - x1)
-            out += pack_zigzag(y2 - y1)
-        elif t == DRAW_COMMANDS['POLYLINE'] or t == DRAW_COMMANDS['STROKE_POLYGON']:
-            pts = cmd['points']
-            out += pack_varint(len(pts))
-            prev_x, prev_y = 0, 0
-            for i, (x, y) in enumerate(pts):
-                x, y = clamp_uint16(x), clamp_uint16(y)
-                if i == 0:
-                    out += pack_zigzag(x)
-                    out += pack_zigzag(y)
-                else:
-                    out += pack_zigzag(x - prev_x)
-                    out += pack_zigzag(y - prev_y)
-                prev_x, prev_y = x, y
-        elif t == DRAW_COMMANDS['HORIZONTAL_LINE']:
-            x1, x2, y = clamp_uint16(cmd['x1']), clamp_uint16(cmd['x2']), clamp_uint16(cmd['y'])
-            out += pack_zigzag(x1)
-            out += pack_zigzag(x2 - x1)
-            out += pack_zigzag(y)
-        elif t == DRAW_COMMANDS['VERTICAL_LINE']:
-            x, y1, y2 = clamp_uint16(cmd['x']), clamp_uint16(cmd['y1']), clamp_uint16(cmd['y2'])
-            out += pack_zigzag(x)
-            out += pack_zigzag(y1)
-            out += pack_zigzag(y2 - y1)
+        
+        if t == DRAW_COMMANDS['SET_COLOR']:
+            # Solo empaqueta el color
+            color = cmd['color'] & 0xFF
+            out += struct.pack("B", color)
+        else:
+            # Para comandos de geometría, NO incluir color (se usa current_color)
+            # Empaquetar datos geométricos
+            if t == DRAW_COMMANDS['LINE']:
+                x1, y1, x2, y2 = map(clamp_uint16, [cmd['x1'], cmd['y1'], cmd['x2'], cmd['y2']])
+                out += pack_zigzag(x1)
+                out += pack_zigzag(y1)
+                out += pack_zigzag(x2 - x1)
+                out += pack_zigzag(y2 - y1)
+            elif t == DRAW_COMMANDS['POLYLINE'] or t == DRAW_COMMANDS['STROKE_POLYGON']:
+                pts = cmd['points']
+                out += pack_varint(len(pts))
+                prev_x, prev_y = 0, 0
+                for i, (x, y) in enumerate(pts):
+                    x, y = clamp_uint16(x), clamp_uint16(y)
+                    if i == 0:
+                        out += pack_zigzag(x)
+                        out += pack_zigzag(y)
+                    else:
+                        out += pack_zigzag(x - prev_x)
+                        out += pack_zigzag(y - prev_y)
+                    prev_x, prev_y = x, y
+            elif t == DRAW_COMMANDS['HORIZONTAL_LINE']:
+                x1, x2, y = clamp_uint16(cmd['x1']), clamp_uint16(cmd['x2']), clamp_uint16(cmd['y'])
+                out += pack_zigzag(x1)
+                out += pack_zigzag(x2 - x1)
+                out += pack_zigzag(y)
+            elif t == DRAW_COMMANDS['VERTICAL_LINE']:
+                x, y1, y2 = clamp_uint16(cmd['x']), clamp_uint16(cmd['y1']), clamp_uint16(cmd['y2'])
+                out += pack_zigzag(x)
+                out += pack_zigzag(y1)
+                out += pack_zigzag(y2 - y1)
     return out
 
 def ensure_closed_ring(ring):
@@ -418,149 +467,185 @@ def extract_geojson_from_pbf(pbf_file, geojson_file, config):
     print(f"Total merged features: {total_features}")
     print(f"GeoJSON file generated successfully at {geojson_file}")
     gc.collect()
+    return total_features_to_merge
 
-def read_features_from_geojson(geojson_file, config):
-    features = []
+def streaming_assign_features_to_tiles_by_zoom(geojson_file, config, output_dir, zoom_levels, max_file_size=65536, total_features=None, summary_stats=None):
     config_fields = get_config_fields(config)
-    with fiona.open(geojson_file) as src:
-        for feat in src:
-            tags = {k: v for k, v in feat['properties'].items() if k in config_fields}
-            geom = shape(feat['geometry'])
-            style, stylekey = get_style_for_tags(tags, config)
-            if not style:
-                continue
-            priority = style.get("priority", 5)
-            color = hex_to_rgb332(style.get("color", "#FFFFFF"))
-            zoom_filter = style.get("zoom", 6)
-            features.append({
-                "geom": geom,
-                "color": color,
-                "zoom_filter": zoom_filter,
-                "tags": tags,
-                "priority": priority
-            })
-    return features
 
-def generate_tiles_all_zooms(features, output_dir, zoom_levels, max_file_size=65536):
-    tile_features_by_zoom = {z: defaultdict(list) for z in zoom_levels}
-    print("Assigning features to tiles for all zoom levels...")
+    # Prepare a mapping: zoom -> set(tags) that should be visible in that zoom
+    zoom_to_valid_tags = {}
+    for zoom in zoom_levels:
+        valid_tags = set()
+        for k, v in config.items():
+            if v.get("zoom", 0) <= zoom:
+                valid_tags.add(k)
+        zoom_to_valid_tags[zoom] = valid_tags
 
-    for feat in tqdm(features, desc="Assigning features"):
-        for zoom in zoom_levels:
-            if zoom < feat["zoom_filter"]:
-                continue
-            geom = feat["geom"]
-            if not geom.is_valid or geom.is_empty:
-                continue
-            simplify_tolerance = get_simplify_tolerance_for_zoom(zoom)
-            feature_geom = geom
-            if simplify_tolerance is not None and geom.geom_type in ("LineString", "MultiLineString"):
-                try:
-                    feature_geom = feature_geom.simplify(simplify_tolerance, preserve_topology=True)
-                except Exception:
-                    pass
-            if feature_geom.is_empty or not feature_geom.is_valid:
-                continue
+    # For total features progress bar
+    total_features_count = total_features if total_features is not None else None
 
-            minx, miny, maxx, maxy = feature_geom.bounds
-            n = 2 ** zoom
-            xtile_min, ytile_min = deg2num(miny, minx, zoom)
-            xtile_max, ytile_max = deg2num(maxy, maxx, zoom)
-
-            for xt in range(min(xtile_min, xtile_max), max(xtile_min, xtile_max) + 1):
-                for yt in range(min(ytile_min, ytile_max), max(ytile_min, ytile_max) + 1):
-                    t_lon_min, t_lat_min, t_lon_max, t_lat_max = tile_latlon_bounds(xt, yt, zoom)
-                    tile_bbox = box(t_lon_min, t_lat_min, t_lon_max, t_lat_max)
-                    try:
-                        clipped_geom = feature_geom.intersection(tile_bbox)
-                    except Exception:
-                        continue
-                    if not clipped_geom.is_empty:
-                        new_feat = feat.copy()
-                        new_feat["geom"] = clipped_geom
-                        tile_features_by_zoom[zoom][(xt, yt)].append(new_feat)
-
-    print("Writing tiles for all zoom levels...")
+    import psutil
+    process = psutil.Process(os.getpid())
 
     for zoom in zoom_levels:
-        tiles_features = tile_features_by_zoom[zoom]
-        jobs = []
-        tile_sizes = []
-        tile_times = []
-        for (x, y), feats in tiles_features.items():
-            jobs.append((x, y, feats, zoom, output_dir, max_file_size, get_simplify_tolerance_for_zoom(zoom)))
-        if not jobs:
-            jobs.append((0, 0, [], zoom, output_dir, max_file_size, get_simplify_tolerance_for_zoom(zoom)))
+        print(f"\n========== Processing zoom level {zoom} ==========")
+        print(f"[Zoom {zoom}] Step 1: Reading relevant features from GeoJSON...")
 
-        max_workers_local = os.cpu_count() or 4
-        with ProcessPoolExecutor(max_workers=max_workers_local) as executor:
-            future_to_job = {executor.submit(tile_worker, job): job for job in jobs}
-            with tqdm(total=len(jobs), desc=f"Writing tiles (zoom {zoom})") as pbar:
-                for future in as_completed(future_to_job):
-                    tile_size, elapsed = future.result()
-                    tile_sizes.append(tile_size)
-                    tile_times.append(elapsed)
-                    avg_time = sum(tile_times) / len(tile_times) if tile_times else 0
-                    pbar.set_postfix({
-                        "workers": max_workers_local,
-                        "avg_tile_time": f"{avg_time:.3f}s"
-                    })
-                    pbar.update(1)
-        avg_tile_size = sum(tile_sizes) / len(tile_sizes) if tile_sizes else 0
-        print(f"Zoom {zoom}: average tile size = {avg_tile_size:.2f} bytes")
+        # Assign valid tags for this zoom
+        valid_tags = zoom_to_valid_tags[zoom]
 
-def tile_worker(args):
-    start_time = time.time()
-    x, y, feats, zoom, output_dir, max_file_size, simplify_tolerance = args
+        # tile_buffers: {(xt, yt): [list of commands]}
+        tile_buffers = defaultdict(list)
+        assigned_features = 0
 
-    ordered_feats = sorted(feats, key=lambda f: f.get("priority", 5))
+        mem_start = process.memory_info().rss / 1024 / 1024
+        t0 = time.time()
 
-    all_commands = []
-    for feat in ordered_feats:
-        cmds = geometry_to_draw_commands(
-            feat["geom"], feat["color"], feat["tags"], zoom, x, y, simplify_tolerance=simplify_tolerance
-        )
-        all_commands.extend(cmds)
+        # Step 1: reading and assignment (streaming, only relevant features)
+        with open(geojson_file, "r", encoding="utf-8") as f, tqdm(desc=f"[Zoom {zoom}] Reading & assignment", total=total_features_count) as pbar_read:
+            for feat in ijson.items(f, "features.item"):
+                tags = {k: v for k, v in feat['properties'].items() if k in config_fields}
+                style, stylekey = get_style_for_tags(tags, config)
+                if not style:
+                    pbar_read.update(1)
+                    continue
+                # Does this feature apply to the current zoom?
+                if stylekey not in valid_tags:
+                    pbar_read.update(1)
+                    continue
+                if not feat.get('geometry'):
+                    pbar_read.update(1)
+                    continue
+                try:
+                    geom = shape(feat['geometry'])
+                except Exception:
+                    pbar_read.update(1)
+                    continue
+                if not geom.is_valid or geom.is_empty:
+                    pbar_read.update(1)
+                    continue
 
-    tile_dir = os.path.join(output_dir, str(zoom), str(x))
-    os.makedirs(tile_dir, exist_ok=True)
-    filename = os.path.join(tile_dir, f"{y}.bin")
+                simplify_tolerance = get_simplify_tolerance_for_zoom(zoom)
+                feature_geom = geom
+                if simplify_tolerance is not None and geom.geom_type in ("LineString", "MultiLineString"):
+                    try:
+                        feature_geom = feature_geom.simplify(simplify_tolerance, preserve_topology=True)
+                    except Exception:
+                        pass
+                if feature_geom.is_empty or not feature_geom.is_valid:
+                    pbar_read.update(1)
+                    continue
 
-    buffer = bytearray()
-    num_cmds_written = 0
-    header = pack_varint(0)
-    buffer += header
+                priority = style.get("priority", 5)
+                color = hex_to_rgb332(style.get("color", "#FFFFFF"))
 
-    for cmd in all_commands:
-        cmd_bytes = pack_draw_commands([cmd])[len(pack_varint(1)):]
-        tmp_num_cmds = num_cmds_written + 1
-        tmp_header = pack_varint(tmp_num_cmds)
-        tmp_buffer_size = len(tmp_header) + len(buffer[len(header):]) + len(cmd_bytes)
-        if tmp_buffer_size > max_file_size:
-            break
-        buffer = tmp_header + buffer[len(header):] + cmd_bytes
-        header = tmp_header
-        num_cmds_written += 1
+                minx, miny, maxx, maxy = feature_geom.bounds
+                n = 2 ** zoom
+                xtile_min, ytile_min = deg2num(miny, minx, zoom)
+                xtile_max, ytile_max = deg2num(maxy, maxx, zoom)
 
-    if num_cmds_written == 0:
-        buffer = pack_varint(0)
-    with open(filename, "wb") as f:
-        f.write(buffer)
+                for xt in range(min(xtile_min, xtile_max), max(xtile_min, xtile_max) + 1):
+                    for yt in range(min(ytile_min, ytile_max), max(ytile_min, ytile_max) + 1):
+                        t_lon_min, t_lat_min, t_lon_max, t_lat_max = tile_latlon_bounds(xt, yt, zoom)
+                        tile_bbox = box(t_lon_min, t_lat_min, t_lon_max, t_lat_max)
+                        try:
+                            clipped_geom = feature_geom.intersection(tile_bbox)
+                        except Exception:
+                            continue
+                        if not clipped_geom.is_empty:
+                            cmds = geometry_to_draw_commands(
+                                clipped_geom, color, tags, zoom, xt, yt, simplify_tolerance=simplify_tolerance
+                            )
+                            for cmd in cmds:
+                                cmd['priority'] = priority
+                                tile_buffers[(xt, yt)].append(cmd)
+                assigned_features += 1
+                pbar_read.update(1)
+        print(f"[Zoom {zoom}] Assigned features: {assigned_features}")
 
-    tile_size = len(buffer)
-    del all_commands, ordered_feats, buffer
-    gc.collect()
-    elapsed = time.time() - start_time
-    return tile_size, elapsed
+        print(f"[Zoom {zoom}] Step 2: Optimizing and creating tiles...")
+        total_bytes_saved = 0
+        tiles_optimized = 0
+        total_tiles_processed = 0
+        
+        with tqdm(total=len(tile_buffers), desc=f"[Zoom {zoom}] Creating optimized tiles") as pbar_tiles:
+            for (xt, yt), cmds in tile_buffers.items():
+                tile_dir = os.path.join(output_dir, str(zoom), str(xt))
+                os.makedirs(tile_dir, exist_ok=True)
+                filename = os.path.join(tile_dir, f"{yt}.bin")
+                
+                # Paso 1: Ordenar por prioridad y color
+                cmds_sorted = sorted(cmds, key=lambda c: (c['priority'], c['color']))
+                
+                # Paso 2: Insertar comandos SET_COLOR y calcular ahorro
+                cmds_optimized, bytes_saved = insert_color_commands(cmds_sorted)
+                
+                # Empaquetar comandos optimizados
+                buffer = pack_draw_commands(cmds_optimized)
+                
+                # Escribir archivo
+                with open(filename, "wb") as fbin:
+                    fbin.write(buffer)
+                
+                # Estadísticas de optimización
+                if bytes_saved > 0:
+                    tiles_optimized += 1
+                    total_bytes_saved += bytes_saved
+                
+                total_tiles_processed += 1
+                pbar_tiles.update(1)
+        
+        # Calcular estadísticas de optimización mejoradas
+        avg_savings_per_tile = total_bytes_saved / max(total_tiles_processed, 1)
+        optimization_ratio = (tiles_optimized / max(total_tiles_processed, 1)) * 100
+        
+        print(f"[Zoom {zoom}] SET_COLOR Optimization results:")
+        print(f"  - Tiles optimized: {tiles_optimized}/{total_tiles_processed} ({optimization_ratio:.1f}%)")
+        print(f"  - Total bytes saved: {total_bytes_saved} bytes")
+        print(f"  - Average savings per optimized tile: {avg_savings_per_tile:.1f} bytes")
+        
+        tile_buffers.clear()
+        gc.collect()
+        t1 = time.time()
+        mem_end = process.memory_info().rss / 1024 / 1024
+
+        if summary_stats is not None:
+            summary_stats.append({
+                "Zoom level": zoom,
+                "Number of elements": assigned_features,
+                "Memory usage (MB)": int(mem_end),
+                "Processing time (s)": round(t1 - t0, 2),
+                "Notes": f"SET_COLOR: {tiles_optimized}/{total_tiles_processed} tiles, {total_bytes_saved}B saved"
+            })
+
+        print(f"[Zoom {zoom}] Tiles written with SET_COLOR optimization.")
+
+def print_summary_table(summary_stats):
+    print('\n' + '+' + '-'*12 + '+' + '-'*21 + '+' + '-'*20 + '+' + '-'*21 + '+' + '-'*50 + '+')
+    print('| {:<10} | {:<19} | {:<18} | {:<19} | {:<48} |'.format(
+        "Zoom level", "Number of elements", "Memory usage (MB)", "Processing time (s)", "Notes"))
+    print('+' + '-'*12 + '+' + '-'*21 + '+' + '-'*20 + '+' + '-'*21 + '+' + '-'*50 + '+')
+
+    for entry in summary_stats:
+        print('| {:<10} | {:<19} | {:<18} | {:<19} | {:<48} |'.format(
+            entry["Zoom level"],
+            entry["Number of elements"],
+            entry["Memory usage (MB)"],
+            entry["Processing time (s)"],
+            entry["Notes"][:48]  # Truncate long notes
+        ))
+    print('+' + '-'*12 + '+' + '-'*21 + '+' + '-'*20 + '+' + '-'*21 + '+' + '-'*50 + '+')
 
 def main():
-    parser = argparse.ArgumentParser(description="OSM vector tile generator (bin format, uint16 tile coordinates, visually lossless, optimized fields)")
+    parser = argparse.ArgumentParser(description="OSM vector tile generator with SET_COLOR optimization (Paso 2 COMPLETADO)")
     parser.add_argument("pbf_file", help="Path to .pbf file")
     parser.add_argument("output_dir", help="Output directory")
     parser.add_argument("config_file", help="JSON config with features/colors")
     parser.add_argument("--zoom", help="Zoom level or range (e.g. 12 or 6-17)", default="6-17")
     parser.add_argument("--max-file-size", help="Maximum file size in KB", type=int, default=128)
+    
     args = parser.parse_args()
+    
     if "-" in args.zoom:
         start, end = map(int, args.zoom.split("-"))
         zoom_levels = list(range(start, end + 1))
@@ -572,18 +657,18 @@ def main():
         config = json.load(f)
 
     geojson_tmp = os.path.abspath("tmp_extract.geojson")
-    extract_geojson_from_pbf(args.pbf_file, geojson_tmp, config)
+    total_features_to_merge = extract_geojson_from_pbf(args.pbf_file, geojson_tmp, config)
 
-    print("Reading features from merged GeoJSON...")
-    features = read_features_from_geojson(geojson_tmp, config)
-    print(f"Total features collected: {len(features)}")
+    print("Reading features and assigning to tiles with SET_COLOR optimization...")
+    summary_stats = []
+    streaming_assign_features_to_tiles_by_zoom(geojson_tmp, config, args.output_dir, zoom_levels, max_file_size, total_features=total_features_to_merge, summary_stats=summary_stats)
+    print("Process completed successfully with SET_COLOR optimization.")
 
-    generate_tiles_all_zooms(features, args.output_dir, zoom_levels, max_file_size)
-    print("Process completed successfully.")
+    print("\nProcessing completed. Summary:")
+    print_summary_table(summary_stats)
 
     if os.path.exists(geojson_tmp):
         os.remove(geojson_tmp)
-    del features, config
     gc.collect()
 
 if __name__ == "__main__":
