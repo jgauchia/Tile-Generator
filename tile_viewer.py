@@ -20,19 +20,23 @@ DRAW_COMMANDS = {
     3: "STROKE_POLYGON",
     5: "HORIZONTAL_LINE",
     6: "VERTICAL_LINE",
-    0x80: "SET_COLOR",        # Comando original (RGB332 directo)
-    0x81: "SET_COLOR_INDEX",  # NUEVO: Comando de paleta (índice)
+    0x80: "SET_COLOR",        # Original command (direct RGB332)
+    0x81: "SET_COLOR_INDEX",  # Palette command (index)
+    # Feature-specific optimized commands
+    0x82: "RECTANGLE",        # Optimized rectangle for buildings
+    0x83: "STRAIGHT_LINE",    # Optimized straight line for highways
+    0x84: "HIGHWAY_SEGMENT",  # Highway segment with continuity
 }
 
 UINT16_TILE_SIZE = 65536
 
-# Variables globales para paleta (se pueden cargar dinámicamente)
-GLOBAL_PALETTE = {}  # Se carga desde un archivo de configuración o se deduce
+# Global variables for palette (can be loaded dynamically)
+GLOBAL_PALETTE = {}  # Loaded from configuration file or deduced
 
 def load_global_palette_from_config(config_file):
     """
-    Carga la paleta global desde el archivo de configuración.
-    Esto permite al viewer conocer la paleta usada por el generator.
+    Loads the global palette from the configuration file.
+    This allows the viewer to know the palette used by the generator.
     """
     global GLOBAL_PALETTE
     try:
@@ -40,7 +44,7 @@ def load_global_palette_from_config(config_file):
         with open(config_file, 'r') as f:
             config = json.load(f)
         
-        # Extraer colores únicos del JSON (mismo algoritmo que el generator)
+        # Extract unique colors from JSON (same algorithm as generator)
         unique_colors = set()
         for feature_key, feature_config in config.items():
             if isinstance(feature_config, dict) and 'color' in feature_config:
@@ -50,7 +54,7 @@ def load_global_palette_from_config(config_file):
         
         sorted_colors = sorted(list(unique_colors))
         
-        # Crear paleta: index -> RGB888
+        # Create palette: index -> RGB888
         GLOBAL_PALETTE = {}
         for index, hex_color in enumerate(sorted_colors):
             rgb888 = hex_to_rgb888(hex_color)
@@ -64,7 +68,7 @@ def load_global_palette_from_config(config_file):
         return False
 
 def hex_to_rgb888(hex_color):
-    """Convierte color hex a RGB888"""
+    """Converts hex color to RGB888"""
     try:
         if not hex_color or not hex_color.startswith("#"):
             return (255, 255, 255)
@@ -219,7 +223,7 @@ def render_tile_surface(tile, bg_color, fill_mode):
         return surface
 
     offset = 0
-    current_color = None  # Estado del color actual
+    current_color = None  # Current color state
     
     try:
         num_cmds, offset = read_varint(data, offset)
@@ -230,29 +234,29 @@ def render_tile_surface(tile, bg_color, fill_mode):
                 
             cmd_type, offset = read_varint(data, offset)
             
-            if cmd_type == 0x80:  # SET_COLOR (RGB332 directo)
+            if cmd_type == 0x80:  # SET_COLOR (direct RGB332)
                 if offset >= len(data):
                     break
                 current_color = data[offset]
                 offset += 1
-                continue  # No dibujar nada, solo actualizar estado
-            elif cmd_type == 0x81:  # SET_COLOR_INDEX (nuevo comando de paleta)
+                continue  # Don't draw anything, just update state
+            elif cmd_type == 0x81:  # SET_COLOR_INDEX (new palette command)
                 if offset >= len(data):
                     break
                 color_index, offset = read_varint(data, offset)
                 
-                # Convertir índice a RGB usando paleta global
+                # Convert index to RGB using global palette
                 if color_index in GLOBAL_PALETTE:
                     rgb = GLOBAL_PALETTE[color_index]
-                    # Simular el RGB332 para mantener compatibilidad
+                    # Simulate RGB332 to maintain compatibility
                     current_color = ((rgb[0] & 0xE0) | ((rgb[1] & 0xE0) >> 3) | (rgb[2] >> 6))
                 else:
-                    # Fallback si no tenemos la paleta
-                    current_color = 255  # Color por defecto
+                    # Fallback if we don't have the palette
+                    current_color = 255  # Default color
                     print(f"[VIEWER] Warning: Unknown palette index {color_index}")
-                continue  # No dibujar nada, solo actualizar estado
+                continue  # Don't draw anything, just update state
             
-            # Para comandos de geometría, usar current_color
+            # For geometry commands, use current_color
             rgb = rgb332_to_rgb888(current_color) if current_color is not None else (255, 255, 255)
             
             if cmd_type == 1:  # LINE
@@ -341,6 +345,55 @@ def render_tile_surface(tile, bg_color, fill_mode):
                 y2 = y1 + dy
                 pygame.draw.line(surface, rgb, (uint16_to_tile_pixel(x), uint16_to_tile_pixel(y1)),
                                  (uint16_to_tile_pixel(x), uint16_to_tile_pixel(y2)), 1)
+            elif cmd_type == 0x82:  # RECTANGLE (feature-specific optimized)
+                x1, offset = read_zigzag(data, offset)
+                y1, offset = read_zigzag(data, offset)
+                dx, offset = read_zigzag(data, offset)
+                dy, offset = read_zigzag(data, offset)
+                x2 = x1 + dx
+                y2 = y1 + dy
+                
+                # Convert to screen coordinates
+                px1 = uint16_to_tile_pixel(x1)
+                py1 = uint16_to_tile_pixel(y1)
+                px2 = uint16_to_tile_pixel(x2)
+                py2 = uint16_to_tile_pixel(y2)
+                
+                # Draw rectangle (for buildings)
+                rect = pygame.Rect(min(px1, px2), min(py1, py2), 
+                                 abs(px2 - px1), abs(py2 - py1))
+                
+                if fill_mode:
+                    pygame.draw.rect(surface, rgb, rect, 0)  # Filled
+                    pygame.draw.rect(surface, darken_color(rgb), rect, 1)  # Border
+                else:
+                    pygame.draw.rect(surface, rgb, rect, 1)  # Outline only
+                    
+            elif cmd_type == 0x83:  # STRAIGHT_LINE (feature-specific optimized)
+                x1, offset = read_zigzag(data, offset)
+                y1, offset = read_zigzag(data, offset)
+                dx, offset = read_zigzag(data, offset)
+                dy, offset = read_zigzag(data, offset)
+                x2 = x1 + dx
+                y2 = y1 + dy
+                
+                # Draw optimized straight line (for highways)
+                pygame.draw.line(surface, rgb, 
+                               (uint16_to_tile_pixel(x1), uint16_to_tile_pixel(y1)),
+                               (uint16_to_tile_pixel(x2), uint16_to_tile_pixel(y2)), 2)  # Thicker for highways
+                               
+            elif cmd_type == 0x84:  # HIGHWAY_SEGMENT (reserved for future use)
+                # Currently same as STRAIGHT_LINE, but reserved for highway-specific optimizations
+                x1, offset = read_zigzag(data, offset)
+                y1, offset = read_zigzag(data, offset)
+                dx, offset = read_zigzag(data, offset)
+                dy, offset = read_zigzag(data, offset)
+                x2 = x1 + dx
+                y2 = y1 + dy
+                
+                pygame.draw.line(surface, rgb, 
+                               (uint16_to_tile_pixel(x1), uint16_to_tile_pixel(y1)),
+                               (uint16_to_tile_pixel(x2), uint16_to_tile_pixel(y2)), 2)
             else:
                 print(f"[VIEWER] Unknown command type: {cmd_type} (0x{cmd_type:02x})")
                                  
@@ -511,8 +564,8 @@ def decimal_to_gms(decimal, is_latitude=True):
     return f"{degrees}°{minutes}'{seconds:.2f}\" {sign}"
 
 def main(base_dir):
-    # Intentar cargar paleta desde features.json si existe
-    config_file = "features.json"  # Puedes cambiar esto por el path correcto
+    # Try to load palette from features.json if it exists
+    config_file = "features.json"  # You can change this to the correct path
     if os.path.exists(config_file):
         load_global_palette_from_config(config_file)
     else:
@@ -552,7 +605,7 @@ def main(base_dir):
 
     pygame.init()
     screen = pygame.display.set_mode((WINDOW_WIDTH, WINDOW_HEIGHT))
-    pygame.display.set_caption(f"Map: {base_dir} - Dynamic Palette Support")
+    pygame.display.set_caption(f"Map: {base_dir} - Feature-Specific Optimizations Support")
     font = pygame.font.SysFont(None, 16)
     font_main = pygame.font.SysFont(None, 18)
     font_b = pygame.font.SysFont(None, 16)

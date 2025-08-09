@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 import osmium
 import shapely.wkb as wkblib
 from shapely.geometry import (
@@ -33,15 +34,22 @@ DRAW_COMMANDS = {
     'STROKE_POLYGON': 3,
     'HORIZONTAL_LINE': 5,
     'VERTICAL_LINE': 6,
-    'SET_COLOR': 0x80,  # Comando de estado para color RGB332 directo
-    'SET_COLOR_INDEX': 0x81,  # NUEVO: Comando de estado para índice de paleta
+    'SET_COLOR': 0x80,  # State command for direct RGB332 color
+    'SET_COLOR_INDEX': 0x81,  # State command for palette index
+    # Feature-specific optimized commands
+    'RECTANGLE': 0x82,  # Optimized rectangle for buildings
+    'STRAIGHT_LINE': 0x83,  # Optimized straight line for highways
+    'HIGHWAY_SEGMENT': 0x84,  # Highway segment with continuity
 }
 
 UINT16_TILE_SIZE = 65536
 
-# Variables globales para paleta dinámica
+# Global variables for dynamic palette
 GLOBAL_COLOR_PALETTE = {}  # hex_color -> index
 GLOBAL_INDEX_TO_RGB332 = {}  # index -> rgb332_value
+
+# Global variables for feature detection
+DETECTED_FEATURE_TYPES = set()  # highway, building, waterway, etc.
 
 def extract_layer_to_tmpfile(args):
     layer, i, layers, geojson_file, pbf_file, config, LAYER_FIELDS, config_fields = args
@@ -123,14 +131,14 @@ def remove_duplicate_points(points):
 
 def precompute_global_color_palette(config):
     """
-    Analiza el JSON de configuración y pre-computa una paleta global de colores.
-    Esto se ejecuta una sola vez al inicio del programa.
+    Analyzes the configuration JSON and pre-computes a global color palette.
+    This is executed once at the beginning of the program.
     """
     global GLOBAL_COLOR_PALETTE, GLOBAL_INDEX_TO_RGB332
     
     print("Analyzing colors from features.json to build dynamic palette...")
     
-    # Extraer todos los colores únicos del JSON
+    # Extract all unique colors from JSON
     unique_colors = set()
     for feature_key, feature_config in config.items():
         if isinstance(feature_config, dict) and 'color' in feature_config:
@@ -138,10 +146,10 @@ def precompute_global_color_palette(config):
             if hex_color and isinstance(hex_color, str) and hex_color.startswith("#"):
                 unique_colors.add(hex_color)
     
-    # Ordenar colores para consistencia
+    # Sort colors for consistency
     sorted_colors = sorted(list(unique_colors))
     
-    # Crear mapas de paleta
+    # Create palette maps
     GLOBAL_COLOR_PALETTE = {}
     GLOBAL_INDEX_TO_RGB332 = {}
     
@@ -155,7 +163,7 @@ def precompute_global_color_palette(config):
     print(f"  - Palette indices: 0-{len(unique_colors)-1}")
     print(f"  - Memory saving potential: {len(unique_colors)} colors -> compact indices")
     
-    # Mostrar algunos ejemplos
+    # Show some examples
     examples = list(sorted_colors)[:5]
     for hex_color in examples:
         index = GLOBAL_COLOR_PALETTE[hex_color]
@@ -167,8 +175,230 @@ def precompute_global_color_palette(config):
     
     return len(unique_colors)
 
+def detect_feature_types(config):
+    """
+    Detects what types of OSM features are configured to apply specific optimizations.
+    """
+    global DETECTED_FEATURE_TYPES
+    
+    print("\nAnalyzing features.json for feature-specific optimizations...")
+    
+    feature_types = set()
+    
+    for feature_key, feature_config in config.items():
+        if isinstance(feature_config, dict):
+            # Detect highways/roads
+            if any(keyword in feature_key.lower() for keyword in ['highway', 'road', 'street', 'primary', 'secondary', 'trunk', 'motorway']):
+                feature_types.add('highway')
+            
+            # Detect buildings
+            if any(keyword in feature_key.lower() for keyword in ['building', 'residential', 'commercial', 'industrial']):
+                feature_types.add('building')
+            
+            # Detect waterways
+            if any(keyword in feature_key.lower() for keyword in ['waterway', 'river', 'stream', 'canal']):
+                feature_types.add('waterway')
+            
+            # Detect natural features
+            if any(keyword in feature_key.lower() for keyword in ['natural', 'landuse', 'forest', 'park']):
+                feature_types.add('natural')
+    
+    DETECTED_FEATURE_TYPES = feature_types
+    
+    print(f"Feature types detected for optimization:")
+    for ftype in sorted(feature_types):
+        print(f"  ✓ {ftype}")
+    
+    if not feature_types:
+        print("  → No specific feature types detected, using general optimizations")
+    
+    return feature_types
+
+def is_rectangle(points, tolerance=5):
+    """
+    Detects if a polygon is approximately rectangular.
+    """
+    if len(points) < 4:
+        return False, None
+    
+    # A rectangle must have exactly 4 corners (plus closing point)
+    if len(points) != 5 or points[0] != points[-1]:
+        return False, None
+    
+    # Get the 4 unique corners
+    corners = points[:4]
+    
+    # Calculate distances between consecutive points
+    distances = []
+    for i in range(4):
+        p1 = corners[i]
+        p2 = corners[(i + 1) % 4]
+        dist = math.sqrt((p2[0] - p1[0])**2 + (p2[1] - p1[1])**2)
+        distances.append(dist)
+    
+    # In a rectangle, opposite sides must be equal
+    if (abs(distances[0] - distances[2]) <= tolerance and 
+        abs(distances[1] - distances[3]) <= tolerance):
+        
+        # Calculate bounding box for the rectangle
+        xs = [p[0] for p in corners]
+        ys = [p[1] for p in corners]
+        min_x, max_x = min(xs), max(xs)
+        min_y, max_y = min(ys), max(ys)
+        
+        return True, (min_x, min_y, max_x, max_y)
+    
+    return False, None
+
+def is_straight_line(points, tolerance=3):
+    """
+    Detects if a line is approximately straight.
+    """
+    if len(points) < 3:
+        return True  # 2 points always form a straight line
+    
+    # Calculate the straight line between first and last point
+    start = points[0]
+    end = points[-1]
+    
+    # Check that all intermediate points are close to this line
+    for point in points[1:-1]:
+        # Calculate distance from point to line
+        distance = point_to_line_distance(point, start, end)
+        if distance > tolerance:
+            return False
+    
+    return True
+
+def point_to_line_distance(point, line_start, line_end):
+    """
+    Calculates the distance from a point to a line.
+    """
+    x0, y0 = point
+    x1, y1 = line_start
+    x2, y2 = line_end
+    
+    # If the line is a point
+    if x1 == x2 and y1 == y2:
+        return math.sqrt((x0 - x1)**2 + (y0 - y1)**2)
+    
+    # Point-to-line distance formula
+    numerator = abs((y2 - y1) * x0 - (x2 - x1) * y0 + x2 * y1 - y2 * x1)
+    denominator = math.sqrt((y2 - y1)**2 + (x2 - x1)**2)
+    
+    return numerator / denominator if denominator > 0 else 0
+
+def optimize_buildings(commands):
+    """
+    Optimizes commands specific to buildings.
+    Converts rectangular polygons to more efficient RECTANGLE commands.
+    """
+    if 'building' not in DETECTED_FEATURE_TYPES:
+        return commands, 0
+    
+    optimized_commands = []
+    rectangles_optimized = 0
+    
+    for cmd in commands:
+        if cmd['type'] == DRAW_COMMANDS['STROKE_POLYGON']:
+            points = cmd.get('points', [])
+            is_rect, bbox = is_rectangle(points)
+            
+            if is_rect and bbox:
+                # Convert to optimized RECTANGLE command
+                min_x, min_y, max_x, max_y = bbox
+                optimized_cmd = {
+                    'type': DRAW_COMMANDS['RECTANGLE'],
+                    'x1': min_x,
+                    'y1': min_y,
+                    'x2': max_x,
+                    'y2': max_y,
+                    'priority': cmd.get('priority', 5)
+                }
+                
+                # Preserve color information
+                if 'color' in cmd:
+                    optimized_cmd['color'] = cmd['color']
+                if 'color_hex' in cmd:
+                    optimized_cmd['color_hex'] = cmd['color_hex']
+                
+                optimized_commands.append(optimized_cmd)
+                rectangles_optimized += 1
+            else:
+                # Keep original command
+                optimized_commands.append(cmd)
+        else:
+            optimized_commands.append(cmd)
+    
+    return optimized_commands, rectangles_optimized
+
+def optimize_highways(commands):
+    """
+    Optimizes commands specific to highways.
+    Detects straight lines and converts them to more efficient commands.
+    """
+    if 'highway' not in DETECTED_FEATURE_TYPES:
+        return commands, 0
+    
+    optimized_commands = []
+    straight_lines_optimized = 0
+    
+    for cmd in commands:
+        if cmd['type'] == DRAW_COMMANDS['POLYLINE']:
+            points = cmd.get('points', [])
+            
+            if len(points) >= 3 and is_straight_line(points):
+                # Convert to optimized STRAIGHT_LINE command
+                start = points[0]
+                end = points[-1]
+                optimized_cmd = {
+                    'type': DRAW_COMMANDS['STRAIGHT_LINE'],
+                    'x1': start[0],
+                    'y1': start[1],
+                    'x2': end[0],
+                    'y2': end[1],
+                    'priority': cmd.get('priority', 5)
+                }
+                
+                # Preserve color information
+                if 'color' in cmd:
+                    optimized_cmd['color'] = cmd['color']
+                if 'color_hex' in cmd:
+                    optimized_cmd['color_hex'] = cmd['color_hex']
+                
+                optimized_commands.append(optimized_cmd)
+                straight_lines_optimized += 1
+            else:
+                # Keep original command
+                optimized_commands.append(cmd)
+        else:
+            optimized_commands.append(cmd)
+    
+    return optimized_commands, straight_lines_optimized
+
+def apply_feature_specific_optimizations(commands):
+    """
+    Applies all feature-specific optimizations.
+    """
+    if not DETECTED_FEATURE_TYPES:
+        return commands, 0
+    
+    # Apply optimizations in sequence
+    optimized_commands = commands
+    total_optimizations = 0
+    
+    if 'building' in DETECTED_FEATURE_TYPES:
+        optimized_commands, building_opts = optimize_buildings(optimized_commands)
+        total_optimizations += building_opts
+    
+    if 'highway' in DETECTED_FEATURE_TYPES:
+        optimized_commands, highway_opts = optimize_highways(optimized_commands)
+        total_optimizations += highway_opts
+    
+    return optimized_commands, total_optimizations
+
 def hex_to_rgb332_direct(hex_color):
-    """Conversión directa hex a RGB332 sin usar paleta"""
+    """Direct hex to RGB332 conversion without using palette"""
     try:
         if not hex_color or not isinstance(hex_color, str) or not hex_color.startswith("#"):
             return 0xFF
@@ -181,8 +411,8 @@ def hex_to_rgb332_direct(hex_color):
 
 def hex_to_color_index(hex_color):
     """
-    Convierte un color hex a su índice en la paleta global.
-    Retorna el índice si el color está en la paleta, sino retorna None.
+    Converts a hex color to its index in the global palette.
+    Returns the index if the color is in the palette, otherwise None.
     """
     global GLOBAL_COLOR_PALETTE
     return GLOBAL_COLOR_PALETTE.get(hex_color, None)
@@ -267,8 +497,8 @@ def pack_zigzag(n):
 
 def insert_palette_commands(commands):
     """
-    Inserta comandos SET_COLOR_INDEX optimizados usando la paleta global.
-    Esta es la función del Paso 3 que maximiza la compresión.
+    Inserts optimized SET_COLOR_INDEX commands using the global palette.
+    This function maximizes compression.
     """
     if not commands:
         return commands, 0
@@ -278,14 +508,14 @@ def insert_palette_commands(commands):
     color_commands_inserted = 0
     
     for cmd in commands:
-        cmd_color_hex = cmd.get('color_hex')  # Necesitamos el hex original
-        cmd_color_rgb332 = cmd.get('color')   # RGB332 para fallback
+        cmd_color_hex = cmd.get('color_hex')  # We need the original hex
+        cmd_color_rgb332 = cmd.get('color')   # RGB332 for fallback
         
-        # Intentar usar paleta primero
+        # Try using palette first
         color_index = hex_to_color_index(cmd_color_hex) if cmd_color_hex else None
         
         if color_index is not None:
-            # Usar paleta optimizada
+            # Use optimized palette
             if color_index != current_color_index:
                 result.append({
                     'type': DRAW_COMMANDS['SET_COLOR_INDEX'], 
@@ -294,7 +524,7 @@ def insert_palette_commands(commands):
                 current_color_index = color_index
                 color_commands_inserted += 1
         else:
-            # Fallback a SET_COLOR directo
+            # Fallback to direct SET_COLOR
             if cmd_color_rgb332 != current_color_index:  # Reset current_color_index
                 result.append({
                     'type': DRAW_COMMANDS['SET_COLOR'], 
@@ -303,23 +533,23 @@ def insert_palette_commands(commands):
                 current_color_index = cmd_color_rgb332
                 color_commands_inserted += 1
         
-        # Agregar comando sin campos de color
+        # Add command without color fields
         cmd_copy = {k: v for k, v in cmd.items() if k not in ['color', 'color_hex']}
         result.append(cmd_copy)
     
-    # Calcular ahorro real
+    # Calculate real savings
     original_commands = len(commands)
     optimized_commands = len(result)
-    colors_removed = original_commands  # Cada comando original tenía un color
-    colors_added = color_commands_inserted  # Comandos SET_COLOR* agregados
-    net_savings = colors_removed - colors_added  # Ahorro neto en bytes
+    colors_removed = original_commands  # Each original command had a color
+    colors_added = color_commands_inserted  # SET_COLOR* commands added
+    net_savings = colors_removed - colors_added  # Net savings in bytes
     
     return result, net_savings
 
 def pack_draw_commands(commands):
     """
-    Empaqueta comandos de dibujo en formato binario optimizado.
-    Soporta tanto SET_COLOR como SET_COLOR_INDEX para máxima compatibilidad.
+    Packs drawing commands into optimized binary format.
+    Adds support for new feature-specific commands.
     """
     out = bytearray()
     out += pack_varint(len(commands))
@@ -329,16 +559,29 @@ def pack_draw_commands(commands):
         out += pack_varint(t)
         
         if t == DRAW_COMMANDS['SET_COLOR']:
-            # Comando SET_COLOR original (RGB332 directo)
+            # Original SET_COLOR command (direct RGB332)
             color = cmd['color'] & 0xFF
             out += struct.pack("B", color)
         elif t == DRAW_COMMANDS['SET_COLOR_INDEX']:
-            # NUEVO: Comando SET_COLOR_INDEX (índice de paleta)
-            color_index = cmd['color_index'] & 0xFF  # Limitar a 255 índices máximo
-            out += pack_varint(color_index)  # Usar varint para índices más eficientes
+            # SET_COLOR_INDEX command (palette index)
+            color_index = cmd['color_index'] & 0xFF
+            out += pack_varint(color_index)
+        elif t == DRAW_COMMANDS['RECTANGLE']:
+            # Optimized RECTANGLE command
+            x1, y1, x2, y2 = map(clamp_uint16, [cmd['x1'], cmd['y1'], cmd['x2'], cmd['y2']])
+            out += pack_zigzag(x1)
+            out += pack_zigzag(y1)
+            out += pack_zigzag(x2 - x1)
+            out += pack_zigzag(y2 - y1)
+        elif t == DRAW_COMMANDS['STRAIGHT_LINE']:
+            # Optimized STRAIGHT_LINE command
+            x1, y1, x2, y2 = map(clamp_uint16, [cmd['x1'], cmd['y1'], cmd['x2'], cmd['y2']])
+            out += pack_zigzag(x1)
+            out += pack_zigzag(y1)
+            out += pack_zigzag(x2 - x1)
+            out += pack_zigzag(y2 - y1)
         else:
-            # Para comandos de geometría, NO incluir color (se usa current_color)
-            # Empaquetar datos geométricos
+            # Original geometric commands
             if t == DRAW_COMMANDS['LINE']:
                 x1, y1, x2, y2 = map(clamp_uint16, [cmd['x1'], cmd['y1'], cmd['x2'], cmd['y2']])
                 out += pack_zigzag(x1)
@@ -611,7 +854,7 @@ def streaming_assign_features_to_tiles_by_zoom(geojson_file, config, output_dir,
 
     for zoom in zoom_levels:
         print(f"\n========== Processing zoom level {zoom} ==========")
-        print(f"[Zoom {zoom}] Step 1: Reading relevant features from GeoJSON...")
+        print(f"[Zoom {zoom}] Reading relevant features from GeoJSON...")
 
         # Assign valid tags for this zoom
         valid_tags = zoom_to_valid_tags[zoom]
@@ -623,7 +866,7 @@ def streaming_assign_features_to_tiles_by_zoom(geojson_file, config, output_dir,
         mem_start = process.memory_info().rss / 1024 / 1024
         t0 = time.time()
 
-        # Step 1: reading and assignment (streaming, only relevant features)
+        # Reading and assignment (streaming, only relevant features)
         with open(geojson_file, "r", encoding="utf-8") as f, tqdm(desc=f"[Zoom {zoom}] Reading & assignment", total=total_features_count) as pbar_read:
             for feat in ijson.items(f, "features.item"):
                 tags = {k: v for k, v in feat['properties'].items() if k in config_fields}
@@ -687,31 +930,36 @@ def streaming_assign_features_to_tiles_by_zoom(geojson_file, config, output_dir,
                 pbar_read.update(1)
         print(f"[Zoom {zoom}] Assigned features: {assigned_features}")
 
-        print(f"[Zoom {zoom}] Step 2: Optimizing with dynamic palette...")
+        print(f"[Zoom {zoom}] Optimizing with feature-specific optimizations...")
         total_bytes_saved = 0
         tiles_optimized = 0
         total_tiles_processed = 0
+        total_feature_optimizations = 0
         
-        with tqdm(total=len(tile_buffers), desc=f"[Zoom {zoom}] Creating palette-optimized tiles") as pbar_tiles:
+        with tqdm(total=len(tile_buffers), desc=f"[Zoom {zoom}] Creating optimized tiles") as pbar_tiles:
             for (xt, yt), cmds in tile_buffers.items():
                 tile_dir = os.path.join(output_dir, str(zoom), str(xt))
                 os.makedirs(tile_dir, exist_ok=True)
                 filename = os.path.join(tile_dir, f"{yt}.bin")
                 
-                # Paso 1: Ordenar por prioridad y color
+                # Sort by priority and color
                 cmds_sorted = sorted(cmds, key=lambda c: (c['priority'], c['color']))
                 
-                # Paso 3: Insertar comandos de paleta optimizados
-                cmds_optimized, bytes_saved = insert_palette_commands(cmds_sorted)
+                # Apply feature-specific optimizations
+                cmds_feature_optimized, feature_optimizations = apply_feature_specific_optimizations(cmds_sorted)
+                total_feature_optimizations += feature_optimizations
                 
-                # Empaquetar comandos optimizados
+                # Insert optimized palette commands
+                cmds_optimized, bytes_saved = insert_palette_commands(cmds_feature_optimized)
+                
+                # Pack optimized commands
                 buffer = pack_draw_commands(cmds_optimized)
                 
-                # Escribir archivo
+                # Write file
                 with open(filename, "wb") as fbin:
                     fbin.write(buffer)
                 
-                # Estadísticas de optimización
+                # Optimization statistics
                 if bytes_saved > 0:
                     tiles_optimized += 1
                     total_bytes_saved += bytes_saved
@@ -719,15 +967,16 @@ def streaming_assign_features_to_tiles_by_zoom(geojson_file, config, output_dir,
                 total_tiles_processed += 1
                 pbar_tiles.update(1)
         
-        # Calcular estadísticas de optimización mejoradas
+        # Calculate improved optimization statistics
         avg_savings_per_tile = total_bytes_saved / max(total_tiles_processed, 1)
         optimization_ratio = (tiles_optimized / max(total_tiles_processed, 1)) * 100
         
-        print(f"[Zoom {zoom}] Dynamic Palette Optimization results:")
-        print(f"  - Tiles optimized: {tiles_optimized}/{total_tiles_processed} ({optimization_ratio:.1f}%)")
-        print(f"  - Total bytes saved: {total_bytes_saved} bytes")
-        print(f"  - Average savings per optimized tile: {avg_savings_per_tile:.1f} bytes")
-        print(f"  - Palette size: {len(GLOBAL_COLOR_PALETTE)} colors")
+        print(f"[Zoom {zoom}] Feature-Specific Optimization results:")
+        print(f"  - Feature types detected: {', '.join(sorted(DETECTED_FEATURE_TYPES)) if DETECTED_FEATURE_TYPES else 'none'}")
+        print(f"  - Feature optimizations applied: {total_feature_optimizations}")
+        print(f"  - Tiles with palette optimization: {tiles_optimized}/{total_tiles_processed} ({optimization_ratio:.1f}%)")
+        print(f"  - Total bytes saved (palette): {total_bytes_saved} bytes")
+        print(f"  - Average savings per tile: {avg_savings_per_tile:.1f} bytes")
         
         tile_buffers.clear()
         gc.collect()
@@ -735,15 +984,19 @@ def streaming_assign_features_to_tiles_by_zoom(geojson_file, config, output_dir,
         mem_end = process.memory_info().rss / 1024 / 1024
 
         if summary_stats is not None:
+            notes = f"FEATURES: {', '.join(sorted(DETECTED_FEATURE_TYPES)) if DETECTED_FEATURE_TYPES else 'general'}"
+            notes += f" | PALETTE: {tiles_optimized}/{total_tiles_processed} tiles"
+            notes += f" | {total_bytes_saved}B saved | {len(GLOBAL_COLOR_PALETTE)} colors"
+            
             summary_stats.append({
                 "Zoom level": zoom,
                 "Number of elements": assigned_features,
                 "Memory usage (MB)": int(mem_end),
                 "Processing time (s)": round(t1 - t0, 2),
-                "Notes": f"PALETTE: {tiles_optimized}/{total_tiles_processed} tiles, {total_bytes_saved}B saved, {len(GLOBAL_COLOR_PALETTE)} colors"
+                "Notes": notes[:68]  # Truncate for table display
             })
 
-        print(f"[Zoom {zoom}] Tiles written with dynamic palette optimization.")
+        print(f"[Zoom {zoom}] Tiles written with feature-specific + dynamic palette optimization.")
 
 def print_summary_table(summary_stats):
     print('\n' + '+' + '-'*12 + '+' + '-'*21 + '+' + '-'*20 + '+' + '-'*21 + '+' + '-'*70 + '+')
@@ -762,7 +1015,7 @@ def print_summary_table(summary_stats):
     print('+' + '-'*12 + '+' + '-'*21 + '+' + '-'*20 + '+' + '-'*21 + '+' + '-'*70 + '+')
 
 def main():
-    parser = argparse.ArgumentParser(description="OSM vector tile generator with Dynamic Palette optimization (Paso 3 IMPLEMENTADO)")
+    parser = argparse.ArgumentParser(description="OSM vector tile generator with feature-specific optimizations")
     parser.add_argument("pbf_file", help="Path to .pbf file")
     parser.add_argument("output_dir", help="Output directory")
     parser.add_argument("config_file", help="JSON config with features/colors")
@@ -781,17 +1034,21 @@ def main():
     with open(args.config_file, "r") as f:
         config = json.load(f)
 
-    # PASO 3: Pre-computar paleta dinámica basada en el JSON
+    # Pre-compute dynamic palette based on JSON
     palette_size = precompute_global_color_palette(config)
     print(f"\nDynamic palette ready with {palette_size} colors from your features.json")
+
+    # Detect feature types for specific optimizations
+    feature_types = detect_feature_types(config)
+    print(f"Ready for feature-specific optimizations: {', '.join(sorted(feature_types)) if feature_types else 'general optimization only'}")
 
     geojson_tmp = os.path.abspath("tmp_extract.geojson")
     total_features_to_merge = extract_geojson_from_pbf(args.pbf_file, geojson_tmp, config)
 
-    print("Reading features and assigning to tiles with Dynamic Palette optimization...")
+    print("Reading features and assigning to tiles with feature-specific + dynamic palette optimization...")
     summary_stats = []
     streaming_assign_features_to_tiles_by_zoom(geojson_tmp, config, args.output_dir, zoom_levels, max_file_size, total_features=total_features_to_merge, summary_stats=summary_stats)
-    print("Process completed successfully with Dynamic Palette optimization.")
+    print("Process completed successfully with feature-specific + dynamic palette optimization.")
 
     print("\nProcessing completed. Summary:")
     print_summary_table(summary_stats)
