@@ -20,10 +20,60 @@ DRAW_COMMANDS = {
     3: "STROKE_POLYGON",
     5: "HORIZONTAL_LINE",
     6: "VERTICAL_LINE",
-    0x80: "SET_COLOR",  # Comando de estado para optimización de colores
+    0x80: "SET_COLOR",        # Comando original (RGB332 directo)
+    0x81: "SET_COLOR_INDEX",  # NUEVO: Comando de paleta (índice)
 }
 
 UINT16_TILE_SIZE = 65536
+
+# Variables globales para paleta (se pueden cargar dinámicamente)
+GLOBAL_PALETTE = {}  # Se carga desde un archivo de configuración o se deduce
+
+def load_global_palette_from_config(config_file):
+    """
+    Carga la paleta global desde el archivo de configuración.
+    Esto permite al viewer conocer la paleta usada por el generator.
+    """
+    global GLOBAL_PALETTE
+    try:
+        import json
+        with open(config_file, 'r') as f:
+            config = json.load(f)
+        
+        # Extraer colores únicos del JSON (mismo algoritmo que el generator)
+        unique_colors = set()
+        for feature_key, feature_config in config.items():
+            if isinstance(feature_config, dict) and 'color' in feature_config:
+                hex_color = feature_config['color']
+                if hex_color and isinstance(hex_color, str) and hex_color.startswith("#"):
+                    unique_colors.add(hex_color)
+        
+        sorted_colors = sorted(list(unique_colors))
+        
+        # Crear paleta: index -> RGB888
+        GLOBAL_PALETTE = {}
+        for index, hex_color in enumerate(sorted_colors):
+            rgb888 = hex_to_rgb888(hex_color)
+            GLOBAL_PALETTE[index] = rgb888
+        
+        print(f"[VIEWER] Loaded dynamic palette: {len(GLOBAL_PALETTE)} colors")
+        return True
+    except Exception as e:
+        print(f"[VIEWER] Could not load palette from config: {e}")
+        print(f"[VIEWER] Will use fallback palette if needed")
+        return False
+
+def hex_to_rgb888(hex_color):
+    """Convierte color hex a RGB888"""
+    try:
+        if not hex_color or not hex_color.startswith("#"):
+            return (255, 255, 255)
+        r = int(hex_color[1:3], 16)
+        g = int(hex_color[3:5], 16)
+        b = int(hex_color[5:7], 16)
+        return (r, g, b)
+    except:
+        return (255, 255, 255)
 
 def rgb565_to_rgb888(c):
     r = (c >> 11) & 0x1F
@@ -180,11 +230,26 @@ def render_tile_surface(tile, bg_color, fill_mode):
                 
             cmd_type, offset = read_varint(data, offset)
             
-            if cmd_type == 0x80:  # SET_COLOR
+            if cmd_type == 0x80:  # SET_COLOR (RGB332 directo)
                 if offset >= len(data):
                     break
                 current_color = data[offset]
                 offset += 1
+                continue  # No dibujar nada, solo actualizar estado
+            elif cmd_type == 0x81:  # SET_COLOR_INDEX (nuevo comando de paleta)
+                if offset >= len(data):
+                    break
+                color_index, offset = read_varint(data, offset)
+                
+                # Convertir índice a RGB usando paleta global
+                if color_index in GLOBAL_PALETTE:
+                    rgb = GLOBAL_PALETTE[color_index]
+                    # Simular el RGB332 para mantener compatibilidad
+                    current_color = ((rgb[0] & 0xE0) | ((rgb[1] & 0xE0) >> 3) | (rgb[2] >> 6))
+                else:
+                    # Fallback si no tenemos la paleta
+                    current_color = 255  # Color por defecto
+                    print(f"[VIEWER] Warning: Unknown palette index {color_index}")
                 continue  # No dibujar nada, solo actualizar estado
             
             # Para comandos de geometría, usar current_color
@@ -276,6 +341,8 @@ def render_tile_surface(tile, bg_color, fill_mode):
                 y2 = y1 + dy
                 pygame.draw.line(surface, rgb, (uint16_to_tile_pixel(x), uint16_to_tile_pixel(y1)),
                                  (uint16_to_tile_pixel(x), uint16_to_tile_pixel(y2)), 1)
+            else:
+                print(f"[VIEWER] Unknown command type: {cmd_type} (0x{cmd_type:02x})")
                                  
     except Exception as e:
         print(f"Error parsing commands in {filepath}: {e}")
@@ -444,6 +511,13 @@ def decimal_to_gms(decimal, is_latitude=True):
     return f"{degrees}°{minutes}'{seconds:.2f}\" {sign}"
 
 def main(base_dir):
+    # Intentar cargar paleta desde features.json si existe
+    config_file = "features.json"  # Puedes cambiar esto por el path correcto
+    if os.path.exists(config_file):
+        load_global_palette_from_config(config_file)
+    else:
+        print(f"[VIEWER] Config file {config_file} not found, using fallback colors")
+
     zoom_dirs = [d for d in os.listdir(base_dir) if os.path.isdir(os.path.join(base_dir, d)) and d.isdigit()]
     zoom_levels_list = sorted([int(d) for d in zoom_dirs])
     if not zoom_levels_list:
@@ -478,7 +552,7 @@ def main(base_dir):
 
     pygame.init()
     screen = pygame.display.set_mode((WINDOW_WIDTH, WINDOW_HEIGHT))
-    pygame.display.set_caption(f"Map: {base_dir} - Optimized with SET_COLOR")
+    pygame.display.set_caption(f"Map: {base_dir} - Dynamic Palette Support")
     font = pygame.font.SysFont(None, 16)
     font_main = pygame.font.SysFont(None, 18)
     font_b = pygame.font.SysFont(None, 16)
@@ -834,5 +908,6 @@ if __name__ == "__main__":
         print("Keys: [arrows] move, [ ] [ ] zoom level, mouse scroll: zoom level")
         print("Mouse: drag to pan, buttons for background, tile labels, GPS cursor, fill polygons. [l] toggle labels")
         print("Example: python tile_viewer.py VECTORMAP")
+        print("Note: Place features.json in current directory for dynamic palette support")
         sys.exit(1)
     main(sys.argv[1])

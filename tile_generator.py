@@ -33,10 +33,15 @@ DRAW_COMMANDS = {
     'STROKE_POLYGON': 3,
     'HORIZONTAL_LINE': 5,
     'VERTICAL_LINE': 6,
-    'SET_COLOR': 0x80,  # Comando de estado para optimización de colores
+    'SET_COLOR': 0x80,  # Comando de estado para color RGB332 directo
+    'SET_COLOR_INDEX': 0x81,  # NUEVO: Comando de estado para índice de paleta
 }
 
 UINT16_TILE_SIZE = 65536
+
+# Variables globales para paleta dinámica
+GLOBAL_COLOR_PALETTE = {}  # hex_color -> index
+GLOBAL_INDEX_TO_RGB332 = {}  # index -> rgb332_value
 
 def extract_layer_to_tmpfile(args):
     layer, i, layers, geojson_file, pbf_file, config, LAYER_FIELDS, config_fields = args
@@ -116,7 +121,54 @@ def remove_duplicate_points(points):
             result.append(pt)
     return result
 
-def hex_to_rgb332(hex_color):
+def precompute_global_color_palette(config):
+    """
+    Analiza el JSON de configuración y pre-computa una paleta global de colores.
+    Esto se ejecuta una sola vez al inicio del programa.
+    """
+    global GLOBAL_COLOR_PALETTE, GLOBAL_INDEX_TO_RGB332
+    
+    print("Analyzing colors from features.json to build dynamic palette...")
+    
+    # Extraer todos los colores únicos del JSON
+    unique_colors = set()
+    for feature_key, feature_config in config.items():
+        if isinstance(feature_config, dict) and 'color' in feature_config:
+            hex_color = feature_config['color']
+            if hex_color and isinstance(hex_color, str) and hex_color.startswith("#"):
+                unique_colors.add(hex_color)
+    
+    # Ordenar colores para consistencia
+    sorted_colors = sorted(list(unique_colors))
+    
+    # Crear mapas de paleta
+    GLOBAL_COLOR_PALETTE = {}
+    GLOBAL_INDEX_TO_RGB332 = {}
+    
+    for index, hex_color in enumerate(sorted_colors):
+        rgb332_value = hex_to_rgb332_direct(hex_color)
+        GLOBAL_COLOR_PALETTE[hex_color] = index
+        GLOBAL_INDEX_TO_RGB332[index] = rgb332_value
+    
+    print(f"Dynamic color palette created:")
+    print(f"  - Total unique colors: {len(unique_colors)}")
+    print(f"  - Palette indices: 0-{len(unique_colors)-1}")
+    print(f"  - Memory saving potential: {len(unique_colors)} colors -> compact indices")
+    
+    # Mostrar algunos ejemplos
+    examples = list(sorted_colors)[:5]
+    for hex_color in examples:
+        index = GLOBAL_COLOR_PALETTE[hex_color]
+        rgb332 = GLOBAL_INDEX_TO_RGB332[index]
+        print(f"    {hex_color} -> index {index} -> RGB332 {rgb332}")
+    
+    if len(unique_colors) > 5:
+        print(f"    ... and {len(unique_colors) - 5} more colors")
+    
+    return len(unique_colors)
+
+def hex_to_rgb332_direct(hex_color):
+    """Conversión directa hex a RGB332 sin usar paleta"""
     try:
         if not hex_color or not isinstance(hex_color, str) or not hex_color.startswith("#"):
             return 0xFF
@@ -126,6 +178,14 @@ def hex_to_rgb332(hex_color):
         return ((r & 0xE0) | ((g & 0xE0) >> 3) | (b >> 6))
     except Exception:
         return 0xFF
+
+def hex_to_color_index(hex_color):
+    """
+    Convierte un color hex a su índice en la paleta global.
+    Retorna el índice si el color está en la paleta, sino retorna None.
+    """
+    global GLOBAL_COLOR_PALETTE
+    return GLOBAL_COLOR_PALETTE.get(hex_color, None)
 
 def get_style_for_tags(tags, config):
     for k, v in tags.items():
@@ -205,39 +265,53 @@ def pack_varint(n):
 def pack_zigzag(n):
     return pack_varint((n << 1) ^ (n >> 31))
 
-def insert_color_commands(commands):
+def insert_palette_commands(commands):
     """
-    Inserta comandos SET_COLOR y elimina campo color de comandos de geometría.
-    Esto reduce la redundancia cuando múltiples comandos consecutivos usan el mismo color.
+    Inserta comandos SET_COLOR_INDEX optimizados usando la paleta global.
+    Esta es la función del Paso 3 que maximiza la compresión.
     """
     if not commands:
-        return commands
+        return commands, 0
     
     result = []
-    current_color = None
+    current_color_index = None
     color_commands_inserted = 0
     
     for cmd in commands:
-        cmd_color = cmd.get('color')
+        cmd_color_hex = cmd.get('color_hex')  # Necesitamos el hex original
+        cmd_color_rgb332 = cmd.get('color')   # RGB332 para fallback
         
-        # Si cambia el color, insertar SET_COLOR
-        if cmd_color != current_color:
-            result.append({
-                'type': DRAW_COMMANDS['SET_COLOR'], 
-                'color': cmd_color
-            })
-            current_color = cmd_color
-            color_commands_inserted += 1
+        # Intentar usar paleta primero
+        color_index = hex_to_color_index(cmd_color_hex) if cmd_color_hex else None
         
-        # Agregar comando sin campo color
-        cmd_copy = {k: v for k, v in cmd.items() if k != 'color'}
+        if color_index is not None:
+            # Usar paleta optimizada
+            if color_index != current_color_index:
+                result.append({
+                    'type': DRAW_COMMANDS['SET_COLOR_INDEX'], 
+                    'color_index': color_index
+                })
+                current_color_index = color_index
+                color_commands_inserted += 1
+        else:
+            # Fallback a SET_COLOR directo
+            if cmd_color_rgb332 != current_color_index:  # Reset current_color_index
+                result.append({
+                    'type': DRAW_COMMANDS['SET_COLOR'], 
+                    'color': cmd_color_rgb332
+                })
+                current_color_index = cmd_color_rgb332
+                color_commands_inserted += 1
+        
+        # Agregar comando sin campos de color
+        cmd_copy = {k: v for k, v in cmd.items() if k not in ['color', 'color_hex']}
         result.append(cmd_copy)
     
-    # Calcular ahorro real: eliminamos N colores incrustados, agregamos M comandos SET_COLOR
+    # Calcular ahorro real
     original_commands = len(commands)
     optimized_commands = len(result)
     colors_removed = original_commands  # Cada comando original tenía un color
-    colors_added = color_commands_inserted  # Comandos SET_COLOR agregados
+    colors_added = color_commands_inserted  # Comandos SET_COLOR* agregados
     net_savings = colors_removed - colors_added  # Ahorro neto en bytes
     
     return result, net_savings
@@ -245,7 +319,7 @@ def insert_color_commands(commands):
 def pack_draw_commands(commands):
     """
     Empaqueta comandos de dibujo en formato binario optimizado.
-    Soporta comandos SET_COLOR para reducir redundancia de colores.
+    Soporta tanto SET_COLOR como SET_COLOR_INDEX para máxima compatibilidad.
     """
     out = bytearray()
     out += pack_varint(len(commands))
@@ -255,9 +329,13 @@ def pack_draw_commands(commands):
         out += pack_varint(t)
         
         if t == DRAW_COMMANDS['SET_COLOR']:
-            # Solo empaqueta el color
+            # Comando SET_COLOR original (RGB332 directo)
             color = cmd['color'] & 0xFF
             out += struct.pack("B", color)
+        elif t == DRAW_COMMANDS['SET_COLOR_INDEX']:
+            # NUEVO: Comando SET_COLOR_INDEX (índice de paleta)
+            color_index = cmd['color_index'] & 0xFF  # Limitar a 255 índices máximo
+            out += pack_varint(color_index)  # Usar varint para índices más eficientes
         else:
             # Para comandos de geometría, NO incluir color (se usa current_color)
             # Empaquetar datos geométricos
@@ -299,7 +377,7 @@ def ensure_closed_ring(ring):
         return ring + [ring[0]]
     return ring
 
-def geometry_to_draw_commands(geom, color, tags, zoom, tile_x, tile_y, simplify_tolerance=None):
+def geometry_to_draw_commands(geom, color, tags, zoom, tile_x, tile_y, simplify_tolerance=None, hex_color=None):
     commands = []
     def process_geom(g):
         local_cmds = []
@@ -310,14 +388,28 @@ def geometry_to_draw_commands(geom, color, tags, zoom, tile_x, tile_y, simplify_
             exterior_pixels = coords_to_pixel_coords_uint16(exterior, zoom, tile_x, tile_y)
             exterior_pixels = ensure_closed_ring(exterior_pixels)
             if len(set(exterior_pixels)) >= 3:
-                local_cmds.append({'type': DRAW_COMMANDS['STROKE_POLYGON'], 'points': exterior_pixels, 'color': color})
+                cmd = {
+                    'type': DRAW_COMMANDS['STROKE_POLYGON'], 
+                    'points': exterior_pixels, 
+                    'color': color
+                }
+                if hex_color:
+                    cmd['color_hex'] = hex_color
+                local_cmds.append(cmd)
         elif g.geom_type == "MultiPolygon":
             for poly in g.geoms:
                 exterior = remove_duplicate_points(list(poly.exterior.coords))
                 exterior_pixels = coords_to_pixel_coords_uint16(exterior, zoom, tile_x, tile_y)
                 exterior_pixels = ensure_closed_ring(exterior_pixels)
                 if len(set(exterior_pixels)) >= 3:
-                    local_cmds.append({'type': DRAW_COMMANDS['STROKE_POLYGON'], 'points': exterior_pixels, 'color': color})
+                    cmd = {
+                        'type': DRAW_COMMANDS['STROKE_POLYGON'], 
+                        'points': exterior_pixels, 
+                        'color': color
+                    }
+                    if hex_color:
+                        cmd['color_hex'] = hex_color
+                    local_cmds.append(cmd)
         elif g.geom_type == "LineString":
             coords = remove_duplicate_points(list(g.coords))
             if len(coords) < 2:
@@ -328,19 +420,49 @@ def geometry_to_draw_commands(geom, color, tags, zoom, tile_x, tile_y, simplify_
             is_closed = coords[0] == coords[-1]
             if is_closed and is_area(tags):
                 if len(set(pixel_coords)) >= 3:
-                    local_cmds.append({'type': DRAW_COMMANDS['STROKE_POLYGON'], 'points': pixel_coords, 'color': color})
+                    cmd = {
+                        'type': DRAW_COMMANDS['STROKE_POLYGON'], 
+                        'points': pixel_coords, 
+                        'color': color
+                    }
+                    if hex_color:
+                        cmd['color_hex'] = hex_color
+                    local_cmds.append(cmd)
             else:
                 if len(pixel_coords) == 2:
                     x1, y1 = pixel_coords[0]
                     x2, y2 = pixel_coords[1]
+                    cmd_data = {'color': color}
+                    if hex_color:
+                        cmd_data['color_hex'] = hex_color
+                    
                     if y1 == y2:
-                        local_cmds.append({'type': DRAW_COMMANDS['HORIZONTAL_LINE'], 'x1': x1, 'x2': x2, 'y': y1, 'color': color})
+                        cmd_data.update({
+                            'type': DRAW_COMMANDS['HORIZONTAL_LINE'], 
+                            'x1': x1, 'x2': x2, 'y': y1
+                        })
+                        local_cmds.append(cmd_data)
                     elif x1 == x2:
-                        local_cmds.append({'type': DRAW_COMMANDS['VERTICAL_LINE'], 'x': x1, 'y1': y1, 'y2': y2, 'color': color})
+                        cmd_data.update({
+                            'type': DRAW_COMMANDS['VERTICAL_LINE'], 
+                            'x': x1, 'y1': y1, 'y2': y2
+                        })
+                        local_cmds.append(cmd_data)
                     else:
-                        local_cmds.append({'type': DRAW_COMMANDS['LINE'], 'x1': x1, 'y1': y1, 'x2': x2, 'y2': y2, 'color': color})
+                        cmd_data.update({
+                            'type': DRAW_COMMANDS['LINE'], 
+                            'x1': x1, 'y1': y1, 'x2': x2, 'y2': y2
+                        })
+                        local_cmds.append(cmd_data)
                 else:
-                    local_cmds.append({'type': DRAW_COMMANDS['POLYLINE'], 'points': pixel_coords, 'color': color})
+                    cmd = {
+                        'type': DRAW_COMMANDS['POLYLINE'], 
+                        'points': pixel_coords, 
+                        'color': color
+                    }
+                    if hex_color:
+                        cmd['color_hex'] = hex_color
+                    local_cmds.append(cmd)
                 if 'natural' in tags and tags['natural'] == 'coastline':
                     print("COASTLINE CMD:", pixel_coords)
         elif g.geom_type == "MultiLineString":
@@ -537,7 +659,8 @@ def streaming_assign_features_to_tiles_by_zoom(geojson_file, config, output_dir,
                     continue
 
                 priority = style.get("priority", 5)
-                color = hex_to_rgb332(style.get("color", "#FFFFFF"))
+                hex_color = style.get("color", "#FFFFFF")
+                color = hex_to_rgb332_direct(hex_color)
 
                 minx, miny, maxx, maxy = feature_geom.bounds
                 n = 2 ** zoom
@@ -554,7 +677,8 @@ def streaming_assign_features_to_tiles_by_zoom(geojson_file, config, output_dir,
                             continue
                         if not clipped_geom.is_empty:
                             cmds = geometry_to_draw_commands(
-                                clipped_geom, color, tags, zoom, xt, yt, simplify_tolerance=simplify_tolerance
+                                clipped_geom, color, tags, zoom, xt, yt, 
+                                simplify_tolerance=simplify_tolerance, hex_color=hex_color
                             )
                             for cmd in cmds:
                                 cmd['priority'] = priority
@@ -563,12 +687,12 @@ def streaming_assign_features_to_tiles_by_zoom(geojson_file, config, output_dir,
                 pbar_read.update(1)
         print(f"[Zoom {zoom}] Assigned features: {assigned_features}")
 
-        print(f"[Zoom {zoom}] Step 2: Optimizing and creating tiles...")
+        print(f"[Zoom {zoom}] Step 2: Optimizing with dynamic palette...")
         total_bytes_saved = 0
         tiles_optimized = 0
         total_tiles_processed = 0
         
-        with tqdm(total=len(tile_buffers), desc=f"[Zoom {zoom}] Creating optimized tiles") as pbar_tiles:
+        with tqdm(total=len(tile_buffers), desc=f"[Zoom {zoom}] Creating palette-optimized tiles") as pbar_tiles:
             for (xt, yt), cmds in tile_buffers.items():
                 tile_dir = os.path.join(output_dir, str(zoom), str(xt))
                 os.makedirs(tile_dir, exist_ok=True)
@@ -577,8 +701,8 @@ def streaming_assign_features_to_tiles_by_zoom(geojson_file, config, output_dir,
                 # Paso 1: Ordenar por prioridad y color
                 cmds_sorted = sorted(cmds, key=lambda c: (c['priority'], c['color']))
                 
-                # Paso 2: Insertar comandos SET_COLOR y calcular ahorro
-                cmds_optimized, bytes_saved = insert_color_commands(cmds_sorted)
+                # Paso 3: Insertar comandos de paleta optimizados
+                cmds_optimized, bytes_saved = insert_palette_commands(cmds_sorted)
                 
                 # Empaquetar comandos optimizados
                 buffer = pack_draw_commands(cmds_optimized)
@@ -599,10 +723,11 @@ def streaming_assign_features_to_tiles_by_zoom(geojson_file, config, output_dir,
         avg_savings_per_tile = total_bytes_saved / max(total_tiles_processed, 1)
         optimization_ratio = (tiles_optimized / max(total_tiles_processed, 1)) * 100
         
-        print(f"[Zoom {zoom}] SET_COLOR Optimization results:")
+        print(f"[Zoom {zoom}] Dynamic Palette Optimization results:")
         print(f"  - Tiles optimized: {tiles_optimized}/{total_tiles_processed} ({optimization_ratio:.1f}%)")
         print(f"  - Total bytes saved: {total_bytes_saved} bytes")
         print(f"  - Average savings per optimized tile: {avg_savings_per_tile:.1f} bytes")
+        print(f"  - Palette size: {len(GLOBAL_COLOR_PALETTE)} colors")
         
         tile_buffers.clear()
         gc.collect()
@@ -615,29 +740,29 @@ def streaming_assign_features_to_tiles_by_zoom(geojson_file, config, output_dir,
                 "Number of elements": assigned_features,
                 "Memory usage (MB)": int(mem_end),
                 "Processing time (s)": round(t1 - t0, 2),
-                "Notes": f"SET_COLOR: {tiles_optimized}/{total_tiles_processed} tiles, {total_bytes_saved}B saved"
+                "Notes": f"PALETTE: {tiles_optimized}/{total_tiles_processed} tiles, {total_bytes_saved}B saved, {len(GLOBAL_COLOR_PALETTE)} colors"
             })
 
-        print(f"[Zoom {zoom}] Tiles written with SET_COLOR optimization.")
+        print(f"[Zoom {zoom}] Tiles written with dynamic palette optimization.")
 
 def print_summary_table(summary_stats):
-    print('\n' + '+' + '-'*12 + '+' + '-'*21 + '+' + '-'*20 + '+' + '-'*21 + '+' + '-'*50 + '+')
-    print('| {:<10} | {:<19} | {:<18} | {:<19} | {:<48} |'.format(
+    print('\n' + '+' + '-'*12 + '+' + '-'*21 + '+' + '-'*20 + '+' + '-'*21 + '+' + '-'*70 + '+')
+    print('| {:<10} | {:<19} | {:<18} | {:<19} | {:<68} |'.format(
         "Zoom level", "Number of elements", "Memory usage (MB)", "Processing time (s)", "Notes"))
-    print('+' + '-'*12 + '+' + '-'*21 + '+' + '-'*20 + '+' + '-'*21 + '+' + '-'*50 + '+')
+    print('+' + '-'*12 + '+' + '-'*21 + '+' + '-'*20 + '+' + '-'*21 + '+' + '-'*70 + '+')
 
     for entry in summary_stats:
-        print('| {:<10} | {:<19} | {:<18} | {:<19} | {:<48} |'.format(
+        print('| {:<10} | {:<19} | {:<18} | {:<19} | {:<68} |'.format(
             entry["Zoom level"],
             entry["Number of elements"],
             entry["Memory usage (MB)"],
             entry["Processing time (s)"],
-            entry["Notes"][:48]  # Truncate long notes
+            entry["Notes"][:68]  # Truncate long notes
         ))
-    print('+' + '-'*12 + '+' + '-'*21 + '+' + '-'*20 + '+' + '-'*21 + '+' + '-'*50 + '+')
+    print('+' + '-'*12 + '+' + '-'*21 + '+' + '-'*20 + '+' + '-'*21 + '+' + '-'*70 + '+')
 
 def main():
-    parser = argparse.ArgumentParser(description="OSM vector tile generator with SET_COLOR optimization (Paso 2 COMPLETADO)")
+    parser = argparse.ArgumentParser(description="OSM vector tile generator with Dynamic Palette optimization (Paso 3 IMPLEMENTADO)")
     parser.add_argument("pbf_file", help="Path to .pbf file")
     parser.add_argument("output_dir", help="Output directory")
     parser.add_argument("config_file", help="JSON config with features/colors")
@@ -656,13 +781,17 @@ def main():
     with open(args.config_file, "r") as f:
         config = json.load(f)
 
+    # PASO 3: Pre-computar paleta dinámica basada en el JSON
+    palette_size = precompute_global_color_palette(config)
+    print(f"\nDynamic palette ready with {palette_size} colors from your features.json")
+
     geojson_tmp = os.path.abspath("tmp_extract.geojson")
     total_features_to_merge = extract_geojson_from_pbf(args.pbf_file, geojson_tmp, config)
 
-    print("Reading features and assigning to tiles with SET_COLOR optimization...")
+    print("Reading features and assigning to tiles with Dynamic Palette optimization...")
     summary_stats = []
     streaming_assign_features_to_tiles_by_zoom(geojson_tmp, config, args.output_dir, zoom_levels, max_file_size, total_features=total_features_to_merge, summary_stats=summary_stats)
-    print("Process completed successfully with SET_COLOR optimization.")
+    print("Process completed successfully with Dynamic Palette optimization.")
 
     print("\nProcessing completed. Summary:")
     print_summary_table(summary_stats)
