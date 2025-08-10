@@ -1613,6 +1613,15 @@ def print_summary_table(summary_stats):
         ))
     print('+' + '-'*12 + '+' + '-'*21 + '+' + '-'*20 + '+' + '-'*21 + '+' + '-'*70 + '+')
 
+def write_palette_bin(output_dir):
+    palette_path = os.path.join(output_dir, "palette.bin")
+    print(f"Writing palette to {palette_path} ({len(GLOBAL_INDEX_TO_RGB332)} colors)...")
+    with open(palette_path, "wb") as fp:
+        for idx in range(len(GLOBAL_INDEX_TO_RGB332)):
+            rgb332_val = GLOBAL_INDEX_TO_RGB332[idx]
+            fp.write(bytes([rgb332_val]))
+    print("Palette written OK.")
+
 def main():
     parser = argparse.ArgumentParser(description="OSM vector tile generator with COMPLETE optimization pipeline (Steps 1-6)")
     parser.add_argument("pbf_file", help="Path to .pbf file")
@@ -1637,6 +1646,8 @@ def main():
     palette_size = precompute_global_color_palette(config)
     print(f"\nDynamic palette ready with {palette_size} colors from your features.json")
 
+    write_palette_bin(args.output_dir)
+    
     # Detect feature types for specific optimizations
     feature_types = detect_feature_types(config)
     print(f"Ready for feature-specific optimizations: {', '.join(sorted(feature_types)) if feature_types else 'general optimization only'}")
