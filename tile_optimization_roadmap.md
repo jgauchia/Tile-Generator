@@ -224,8 +224,8 @@ def quantize_coordinates_by_zoom(coords, zoom):
 - [x] **Paso 3: Paleta Dinámica** ✅ COMPLETADO
 
 ### 🔄 PRÓXIMAS OPORTUNIDADES OPCIONALES
-- [ ] **Paso 4**: Feature-specific optimizations (highways, buildings, nature)
-- [ ] **Paso 5**: Performance micro-optimizations
+- [x] **Paso 4**: Feature-specific optimizations (highways, buildings, nature)
+- [x] **Paso 5**: Performance micro-optimizations
 - [ ] **Paso 6**: Advanced compression techniques (experimental)
 
 ### 📊 Métricas de Éxito Alcanzadas

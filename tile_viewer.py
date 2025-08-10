@@ -26,12 +26,23 @@ DRAW_COMMANDS = {
     0x82: "RECTANGLE",        # Optimized rectangle for buildings
     0x83: "STRAIGHT_LINE",    # Optimized straight line for highways
     0x84: "HIGHWAY_SEGMENT",  # Highway segment with continuity
+    # Step 6: Advanced compression commands
+    0x85: "GRID_PATTERN",     # Urban grid pattern
+    0x86: "BLOCK_PATTERN",    # City block pattern
+    0x87: "CIRCLE",           # Circle/roundabout
+    0x88: "RELATIVE_MOVE",    # Relative coordinate movement
+    0x89: "PREDICTED_LINE",   # Predictive line based on pattern
+    0x8A: "COMPRESSED_POLYLINE",  # Huffman-compressed polyline
 }
 
 UINT16_TILE_SIZE = 65536
 
 # Global variables for palette (can be loaded dynamically)
 GLOBAL_PALETTE = {}  # Loaded from configuration file or deduced
+
+# Step 6: Global variables for advanced rendering
+CURRENT_POSITION = (0, 0)  # For relative moves and predictions
+MOVEMENT_VECTOR = (0, 0)   # For predictive rendering
 
 def load_global_palette_from_config(config_file):
     """
@@ -225,6 +236,11 @@ def render_tile_surface(tile, bg_color, fill_mode):
     offset = 0
     current_color = None  # Current color state
     
+    # Step 6: Advanced rendering state
+    global CURRENT_POSITION, MOVEMENT_VECTOR
+    CURRENT_POSITION = (0, 0)
+    MOVEMENT_VECTOR = (0, 0)
+    
     try:
         num_cmds, offset = read_varint(data, offset)
         
@@ -268,6 +284,10 @@ def render_tile_surface(tile, bg_color, fill_mode):
                 y2 = y1 + dy
                 pygame.draw.line(surface, rgb, (uint16_to_tile_pixel(x1), uint16_to_tile_pixel(y1)),
                                  (uint16_to_tile_pixel(x2), uint16_to_tile_pixel(y2)), 1)
+                # Update position and movement for predictions
+                CURRENT_POSITION = (x2, y2)
+                MOVEMENT_VECTOR = (dx, dy)
+                
             elif cmd_type == 2:  # POLYLINE
                 n_pts, offset = read_varint(data, offset)
                 pts = []
@@ -284,6 +304,8 @@ def render_tile_surface(tile, bg_color, fill_mode):
                     pts.append((uint16_to_tile_pixel(x), uint16_to_tile_pixel(y)))
                 if len(pts) >= 2:
                     pygame.draw.lines(surface, rgb, False, pts, 1)
+                    CURRENT_POSITION = (x, y)
+                    
             elif cmd_type == 3:  # STROKE_POLYGON
                 n_pts, offset = read_varint(data, offset)
                 pts = []
@@ -331,6 +353,7 @@ def render_tile_surface(tile, bg_color, fill_mode):
                         p2 = pts[0]
                         if not (not fill_mode and is_tile_border_point(p1) and is_tile_border_point(p2)):
                             pygame.draw.line(surface, rgb, p1, p2, 1)
+                            
             elif cmd_type == 5:  # HORIZONTAL_LINE
                 x1, offset = read_zigzag(data, offset)
                 dx, offset = read_zigzag(data, offset)
@@ -338,6 +361,8 @@ def render_tile_surface(tile, bg_color, fill_mode):
                 x2 = x1 + dx
                 pygame.draw.line(surface, rgb, (uint16_to_tile_pixel(x1), uint16_to_tile_pixel(y)),
                                  (uint16_to_tile_pixel(x2), uint16_to_tile_pixel(y)), 1)
+                CURRENT_POSITION = (x2, y)
+                
             elif cmd_type == 6:  # VERTICAL_LINE
                 x, offset = read_zigzag(data, offset)
                 y1, offset = read_zigzag(data, offset)
@@ -345,6 +370,8 @@ def render_tile_surface(tile, bg_color, fill_mode):
                 y2 = y1 + dy
                 pygame.draw.line(surface, rgb, (uint16_to_tile_pixel(x), uint16_to_tile_pixel(y1)),
                                  (uint16_to_tile_pixel(x), uint16_to_tile_pixel(y2)), 1)
+                CURRENT_POSITION = (x, y2)
+                
             elif cmd_type == 0x82:  # RECTANGLE (feature-specific optimized)
                 x1, offset = read_zigzag(data, offset)
                 y1, offset = read_zigzag(data, offset)
@@ -381,6 +408,8 @@ def render_tile_surface(tile, bg_color, fill_mode):
                 pygame.draw.line(surface, rgb, 
                                (uint16_to_tile_pixel(x1), uint16_to_tile_pixel(y1)),
                                (uint16_to_tile_pixel(x2), uint16_to_tile_pixel(y2)), 2)  # Thicker for highways
+                CURRENT_POSITION = (x2, y2)
+                MOVEMENT_VECTOR = (dx, dy)
                                
             elif cmd_type == 0x84:  # HIGHWAY_SEGMENT (reserved for future use)
                 # Currently same as STRAIGHT_LINE, but reserved for highway-specific optimizations
@@ -394,6 +423,84 @@ def render_tile_surface(tile, bg_color, fill_mode):
                 pygame.draw.line(surface, rgb, 
                                (uint16_to_tile_pixel(x1), uint16_to_tile_pixel(y1)),
                                (uint16_to_tile_pixel(x2), uint16_to_tile_pixel(y2)), 2)
+                CURRENT_POSITION = (x2, y2)
+                MOVEMENT_VECTOR = (dx, dy)
+                
+            # Step 6: Advanced compression commands
+            elif cmd_type == 0x85:  # GRID_PATTERN
+                x, offset = read_zigzag(data, offset)
+                y, offset = read_zigzag(data, offset)
+                width, offset = read_zigzag(data, offset)
+                spacing, offset = read_zigzag(data, offset)
+                count, offset = read_varint(data, offset)
+                direction, offset = data[offset], offset + 1
+                
+                # Render grid pattern
+                px = uint16_to_tile_pixel(x)
+                py = uint16_to_tile_pixel(y)
+                pwidth = uint16_to_tile_pixel(width)
+                pspacing = uint16_to_tile_pixel(spacing)
+                
+                if direction == 1:  # Horizontal
+                    for i in range(count):
+                        line_y = py + i * pspacing
+                        if 0 <= line_y < TILE_SIZE:
+                            pygame.draw.line(surface, rgb, (px, line_y), 
+                                           (px + pwidth, line_y), 1)
+                else:  # Vertical
+                    for i in range(count):
+                        line_x = px + i * pspacing
+                        if 0 <= line_x < TILE_SIZE:
+                            pygame.draw.line(surface, rgb, (line_x, py), 
+                                           (line_x, py + pwidth), 1)
+                            
+            elif cmd_type == 0x87:  # CIRCLE
+                center_x, offset = read_zigzag(data, offset)
+                center_y, offset = read_zigzag(data, offset)
+                radius, offset = read_zigzag(data, offset)
+                
+                # Render circle
+                pcenter_x = uint16_to_tile_pixel(center_x)
+                pcenter_y = uint16_to_tile_pixel(center_y)
+                pradius = uint16_to_tile_pixel(radius)
+                
+                if pradius > 0:
+                    if fill_mode:
+                        pygame.draw.circle(surface, rgb, (pcenter_x, pcenter_y), pradius, 0)
+                        pygame.draw.circle(surface, darken_color(rgb), (pcenter_x, pcenter_y), pradius, 1)
+                    else:
+                        pygame.draw.circle(surface, rgb, (pcenter_x, pcenter_y), pradius, 1)
+                        
+            elif cmd_type == 0x89:  # PREDICTED_LINE
+                end_x, offset = read_zigzag(data, offset)
+                end_y, offset = read_zigzag(data, offset)
+                
+                # Use current position and movement vector for prediction
+                start_x = CURRENT_POSITION[0] + MOVEMENT_VECTOR[0]
+                start_y = CURRENT_POSITION[1] + MOVEMENT_VECTOR[1]
+                
+                # Draw predicted line
+                pygame.draw.line(surface, rgb,
+                               (uint16_to_tile_pixel(start_x), uint16_to_tile_pixel(start_y)),
+                               (uint16_to_tile_pixel(end_x), uint16_to_tile_pixel(end_y)), 1)
+                
+                # Update state
+                CURRENT_POSITION = (end_x, end_y)
+                MOVEMENT_VECTOR = (end_x - start_x, end_y - start_y)
+                
+            # Placeholder for other Step 6 commands
+            elif cmd_type == 0x86:  # BLOCK_PATTERN (not implemented yet)
+                # Skip for now - would need specific parameters
+                print(f"[VIEWER] BLOCK_PATTERN command not implemented yet")
+                
+            elif cmd_type == 0x88:  # RELATIVE_MOVE (not implemented yet)
+                # Skip for now - would need specific parameters  
+                print(f"[VIEWER] RELATIVE_MOVE command not implemented yet")
+                
+            elif cmd_type == 0x8A:  # COMPRESSED_POLYLINE (not implemented yet)
+                # Skip for now - would need Huffman decompression
+                print(f"[VIEWER] COMPRESSED_POLYLINE command not implemented yet")
+                
             else:
                 print(f"[VIEWER] Unknown command type: {cmd_type} (0x{cmd_type:02x})")
                                  
@@ -605,7 +712,7 @@ def main(base_dir):
 
     pygame.init()
     screen = pygame.display.set_mode((WINDOW_WIDTH, WINDOW_HEIGHT))
-    pygame.display.set_caption(f"Map: {base_dir} - Feature-Specific Optimizations Support")
+    pygame.display.set_caption(f"Map: {base_dir} - Step 6 Advanced Compression Support")
     font = pygame.font.SysFont(None, 16)
     font_main = pygame.font.SysFont(None, 18)
     font_b = pygame.font.SysFont(None, 16)
@@ -962,5 +1069,6 @@ if __name__ == "__main__":
         print("Mouse: drag to pan, buttons for background, tile labels, GPS cursor, fill polygons. [l] toggle labels")
         print("Example: python tile_viewer.py VECTORMAP")
         print("Note: Place features.json in current directory for dynamic palette support")
+        print("Step 6 Support: GRID_PATTERN, CIRCLE, PREDICTED_LINE commands")
         sys.exit(1)
     main(sys.argv[1])
