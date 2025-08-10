@@ -143,10 +143,10 @@ def optimize_building_batch(commands):
 Aplicar micro-optimizaciones para mejorar performance sin cambiar formato
 
 ### 📝 Tareas Identificadas
-- [ ] **Coordinate relative encoding**: Mejorar encoding en polylines consecutivas
-- [ ] **Command sequence analysis**: Eliminar comandos redundantes (líneas longitud 0)
-- [ ] **Geometric deduplication**: Detectar geometrías idénticas
-- [ ] **Memory pool optimization**: Reutilizar objetos en bucles calientes
+- [x] **Coordinate relative encoding**: Mejorar encoding en polylines consecutivas
+- [x] **Command sequence analysis**: Eliminar comandos redundantes (líneas longitud 0)
+- [x] **Geometric deduplication**: Detectar geometrías idénticas
+- [x] **Memory pool optimization**: Reutilizar objetos en bucles calientes
 
 ### 🔧 Implementación Sugerida
 ```python

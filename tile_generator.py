@@ -51,6 +51,11 @@ GLOBAL_INDEX_TO_RGB332 = {}  # index -> rgb332_value
 # Global variables for feature detection
 DETECTED_FEATURE_TYPES = set()  # highway, building, waterway, etc.
 
+# Global pools for performance optimization
+COMMAND_POOL = []
+POINT_POOL = []
+GEOMETRY_CACHE = {}
+
 def extract_layer_to_tmpfile(args):
     layer, i, layers, geojson_file, pbf_file, config, LAYER_FIELDS, config_fields = args
     logs = []
@@ -108,7 +113,9 @@ def deg2pixel(lat_deg, lon_deg, zoom):
     return x, y
 
 def coords_to_pixel_coords_uint16(coords, zoom, tile_x, tile_y):
-    pixel_coords = []
+    global POINT_POOL
+    POINT_POOL.clear()  # Reuse pool instead of creating new list
+    
     for lon, lat in coords:
         px_global, py_global = deg2pixel(lat, lon, zoom)
         x = (px_global - tile_x * TILE_SIZE) * (UINT16_TILE_SIZE - 1) / (TILE_SIZE - 1)
@@ -117,8 +124,9 @@ def coords_to_pixel_coords_uint16(coords, zoom, tile_x, tile_y):
         y = int(round(y))
         x = max(0, min(UINT16_TILE_SIZE - 1, x))
         y = max(0, min(UINT16_TILE_SIZE - 1, y))
-        pixel_coords.append((x, y))
-    return pixel_coords
+        POINT_POOL.append((x, y))
+    
+    return list(POINT_POOL)  # Return copy to avoid pool contamination
 
 def remove_duplicate_points(points):
     if len(points) <= 1:
@@ -128,6 +136,107 @@ def remove_duplicate_points(points):
         if pt != result[-1]:
             result.append(pt)
     return result
+
+def optimize_coordinate_precision(points, zoom_level):
+    """
+    Performance optimization: reduce coordinate precision based on zoom level.
+    Lower zoom levels don't need pixel-perfect precision.
+    """
+    if zoom_level <= 10:
+        # Low zoom: quantize coordinates to reduce data
+        quantization = 4
+        return [(x//quantization*quantization, y//quantization*quantization) 
+                for x, y in points]
+    elif zoom_level <= 12:
+        # Medium zoom: small quantization
+        quantization = 2
+        return [(x//quantization*quantization, y//quantization*quantization) 
+                for x, y in points]
+    else:
+        # High zoom: maintain full precision
+        return points
+
+def eliminate_micro_movements(points, threshold=2):
+    """
+    Performance optimization: eliminate micro-movements that are not visually significant.
+    Reduces number of points in polylines and polygons.
+    """
+    if len(points) < 3:
+        return points
+    
+    result = [points[0]]
+    for point in points[1:]:
+        distance = math.sqrt((point[0] - result[-1][0])**2 + 
+                           (point[1] - result[-1][1])**2)
+        if distance >= threshold:
+            result.append(point)
+    
+    # Ensure we keep the last point if it's different
+    if len(result) > 1 and result[-1] != points[-1]:
+        result.append(points[-1])
+    
+    return result
+
+def validate_and_clean_commands(commands):
+    """
+    Performance optimization: remove geometrically invalid or redundant commands.
+    This reduces tile size and improves rendering performance.
+    """
+    clean_commands = []
+    for cmd in commands:
+        # Skip invalid commands
+        if cmd['type'] == DRAW_COMMANDS['LINE']:
+            # Remove zero-length lines
+            if cmd['x1'] == cmd['x2'] and cmd['y1'] == cmd['y2']:
+                continue
+        elif cmd['type'] == DRAW_COMMANDS['POLYLINE']:
+            # Remove polylines with insufficient points
+            points = cmd.get('points', [])
+            if len(points) < 2:
+                continue
+        elif cmd['type'] == DRAW_COMMANDS['STROKE_POLYGON']:
+            # Remove degenerate polygons
+            points = cmd.get('points', [])
+            unique_points = []
+            for p in points:
+                if p not in unique_points:
+                    unique_points.append(p)
+            if len(unique_points) < 3:
+                continue
+        elif cmd['type'] == DRAW_COMMANDS['HORIZONTAL_LINE']:
+            # Remove zero-length horizontal lines
+            if cmd['x1'] == cmd['x2']:
+                continue
+        elif cmd['type'] == DRAW_COMMANDS['VERTICAL_LINE']:
+            # Remove zero-length vertical lines
+            if cmd['y1'] == cmd['y2']:
+                continue
+        elif cmd['type'] == DRAW_COMMANDS['RECTANGLE']:
+            # Remove zero-area rectangles
+            if cmd['x1'] == cmd['x2'] or cmd['y1'] == cmd['y2']:
+                continue
+        elif cmd['type'] == DRAW_COMMANDS['STRAIGHT_LINE']:
+            # Remove zero-length straight lines
+            if cmd['x1'] == cmd['x2'] and cmd['y1'] == cmd['y2']:
+                continue
+        
+        clean_commands.append(cmd)
+    
+    return clean_commands
+
+def geometry_hash(geom_data):
+    """
+    Create a hash for geometry deduplication.
+    This allows us to reuse processing results for identical geometries.
+    """
+    if isinstance(geom_data, list):
+        # For point lists (polylines, polygons)
+        return hash(tuple(tuple(p) for p in geom_data))
+    elif isinstance(geom_data, tuple):
+        # For simple geometries (lines, rectangles)
+        return hash(geom_data)
+    else:
+        return hash(str(geom_data))
 
 def precompute_global_color_palette(config):
     """
@@ -397,6 +506,25 @@ def apply_feature_specific_optimizations(commands):
     
     return optimized_commands, total_optimizations
 
+def apply_performance_optimizations(commands, zoom_level):
+    """
+    Performance optimization: applies micro-optimizations to improve speed and reduce memory usage.
+    This is the main function for Step 5 optimizations.
+    """
+    if not commands:
+        return commands
+    
+    # Optimize coordinate precision based on zoom level
+    for cmd in commands:
+        if 'points' in cmd:
+            cmd['points'] = optimize_coordinate_precision(cmd['points'], zoom_level)
+            cmd['points'] = eliminate_micro_movements(cmd['points'])
+    
+    # Clean and validate commands
+    commands = validate_and_clean_commands(commands)
+    
+    return commands
+
 def hex_to_rgb332_direct(hex_color):
     """Direct hex to RGB332 conversion without using palette"""
     try:
@@ -621,11 +749,26 @@ def ensure_closed_ring(ring):
     return ring
 
 def geometry_to_draw_commands(geom, color, tags, zoom, tile_x, tile_y, simplify_tolerance=None, hex_color=None):
-    commands = []
+    global COMMAND_POOL, GEOMETRY_CACHE
+    
+    # Try geometry deduplication for performance
+    geom_key = None
+    if hasattr(geom, 'wkt'):
+        geom_key = hash(geom.wkt)
+        if geom_key in GEOMETRY_CACHE:
+            cached_commands = GEOMETRY_CACHE[geom_key].copy()
+            # Update colors for cached commands
+            for cmd in cached_commands:
+                cmd['color'] = color
+                if hex_color:
+                    cmd['color_hex'] = hex_color
+            return cached_commands
+    
+    COMMAND_POOL.clear()  # Reuse command pool
+    
     def process_geom(g):
-        local_cmds = []
         if g.is_empty:
-            return local_cmds
+            return
         if g.geom_type == "Polygon":
             exterior = remove_duplicate_points(list(g.exterior.coords))
             exterior_pixels = coords_to_pixel_coords_uint16(exterior, zoom, tile_x, tile_y)
@@ -638,7 +781,7 @@ def geometry_to_draw_commands(geom, color, tags, zoom, tile_x, tile_y, simplify_
                 }
                 if hex_color:
                     cmd['color_hex'] = hex_color
-                local_cmds.append(cmd)
+                COMMAND_POOL.append(cmd)
         elif g.geom_type == "MultiPolygon":
             for poly in g.geoms:
                 exterior = remove_duplicate_points(list(poly.exterior.coords))
@@ -652,14 +795,14 @@ def geometry_to_draw_commands(geom, color, tags, zoom, tile_x, tile_y, simplify_
                     }
                     if hex_color:
                         cmd['color_hex'] = hex_color
-                    local_cmds.append(cmd)
+                    COMMAND_POOL.append(cmd)
         elif g.geom_type == "LineString":
             coords = remove_duplicate_points(list(g.coords))
             if len(coords) < 2:
-                return local_cmds
+                return
             pixel_coords = remove_duplicate_points(coords_to_pixel_coords_uint16(coords, zoom, tile_x, tile_y))
             if len(pixel_coords) < 2:
-                return local_cmds
+                return
             is_closed = coords[0] == coords[-1]
             if is_closed and is_area(tags):
                 if len(set(pixel_coords)) >= 3:
@@ -670,7 +813,7 @@ def geometry_to_draw_commands(geom, color, tags, zoom, tile_x, tile_y, simplify_
                     }
                     if hex_color:
                         cmd['color_hex'] = hex_color
-                    local_cmds.append(cmd)
+                    COMMAND_POOL.append(cmd)
             else:
                 if len(pixel_coords) == 2:
                     x1, y1 = pixel_coords[0]
@@ -684,19 +827,19 @@ def geometry_to_draw_commands(geom, color, tags, zoom, tile_x, tile_y, simplify_
                             'type': DRAW_COMMANDS['HORIZONTAL_LINE'], 
                             'x1': x1, 'x2': x2, 'y': y1
                         })
-                        local_cmds.append(cmd_data)
+                        COMMAND_POOL.append(cmd_data)
                     elif x1 == x2:
                         cmd_data.update({
                             'type': DRAW_COMMANDS['VERTICAL_LINE'], 
                             'x': x1, 'y1': y1, 'y2': y2
                         })
-                        local_cmds.append(cmd_data)
+                        COMMAND_POOL.append(cmd_data)
                     else:
                         cmd_data.update({
                             'type': DRAW_COMMANDS['LINE'], 
                             'x1': x1, 'y1': y1, 'x2': x2, 'y2': y2
                         })
-                        local_cmds.append(cmd_data)
+                        COMMAND_POOL.append(cmd_data)
                 else:
                     cmd = {
                         'type': DRAW_COMMANDS['POLYLINE'], 
@@ -705,19 +848,35 @@ def geometry_to_draw_commands(geom, color, tags, zoom, tile_x, tile_y, simplify_
                     }
                     if hex_color:
                         cmd['color_hex'] = hex_color
-                    local_cmds.append(cmd)
+                    COMMAND_POOL.append(cmd)
                 if 'natural' in tags and tags['natural'] == 'coastline':
                     print("COASTLINE CMD:", pixel_coords)
         elif g.geom_type == "MultiLineString":
             for linestring in g.geoms:
-                local_cmds.extend(process_geom(linestring))
+                process_geom(linestring)
         elif g.geom_type == "GeometryCollection":
             for subgeom in g.geoms:
-                local_cmds.extend(process_geom(subgeom))
-        return local_cmds
+                process_geom(subgeom)
+    
     if hasattr(geom, "is_valid") and not geom.is_empty:
-        commands.extend(process_geom(geom))
-    return commands
+        process_geom(geom)
+    
+    # Cache the result for deduplication (without colors)
+    if geom_key and len(COMMAND_POOL) > 0:
+        cache_commands = []
+        for cmd in COMMAND_POOL:
+            cache_cmd = {k: v for k, v in cmd.items() if k not in ['color', 'color_hex']}
+            cache_commands.append(cache_cmd)
+        GEOMETRY_CACHE[geom_key] = cache_commands
+        
+        # Limit cache size to prevent memory bloat
+        if len(GEOMETRY_CACHE) > 1000:
+            # Remove oldest entries (simple FIFO)
+            keys_to_remove = list(GEOMETRY_CACHE.keys())[:100]
+            for key in keys_to_remove:
+                del GEOMETRY_CACHE[key]
+    
+    return list(COMMAND_POOL)  # Return copy
 
 def get_layer_fields_from_pbf(pbf_file, layer):
     try:
@@ -856,6 +1015,10 @@ def streaming_assign_features_to_tiles_by_zoom(geojson_file, config, output_dir,
         print(f"\n========== Processing zoom level {zoom} ==========")
         print(f"[Zoom {zoom}] Reading relevant features from GeoJSON...")
 
+        # Clear geometry cache between zoom levels to manage memory
+        global GEOMETRY_CACHE
+        GEOMETRY_CACHE.clear()
+
         # Assign valid tags for this zoom
         valid_tags = zoom_to_valid_tags[zoom]
 
@@ -930,7 +1093,7 @@ def streaming_assign_features_to_tiles_by_zoom(geojson_file, config, output_dir,
                 pbar_read.update(1)
         print(f"[Zoom {zoom}] Assigned features: {assigned_features}")
 
-        print(f"[Zoom {zoom}] Optimizing with feature-specific optimizations...")
+        print(f"[Zoom {zoom}] Optimizing with performance + feature-specific optimizations...")
         total_bytes_saved = 0
         tiles_optimized = 0
         total_tiles_processed = 0
@@ -945,11 +1108,14 @@ def streaming_assign_features_to_tiles_by_zoom(geojson_file, config, output_dir,
                 # Sort by priority and color
                 cmds_sorted = sorted(cmds, key=lambda c: (c['priority'], c['color']))
                 
-                # Apply feature-specific optimizations
-                cmds_feature_optimized, feature_optimizations = apply_feature_specific_optimizations(cmds_sorted)
+                # Apply performance optimizations (Step 5)
+                cmds_performance_optimized = apply_performance_optimizations(cmds_sorted, zoom)
+                
+                # Apply feature-specific optimizations (Step 4)
+                cmds_feature_optimized, feature_optimizations = apply_feature_specific_optimizations(cmds_performance_optimized)
                 total_feature_optimizations += feature_optimizations
                 
-                # Insert optimized palette commands
+                # Insert optimized palette commands (Step 3)
                 cmds_optimized, bytes_saved = insert_palette_commands(cmds_feature_optimized)
                 
                 # Pack optimized commands
@@ -971,12 +1137,14 @@ def streaming_assign_features_to_tiles_by_zoom(geojson_file, config, output_dir,
         avg_savings_per_tile = total_bytes_saved / max(total_tiles_processed, 1)
         optimization_ratio = (tiles_optimized / max(total_tiles_processed, 1)) * 100
         
-        print(f"[Zoom {zoom}] Feature-Specific Optimization results:")
+        print(f"[Zoom {zoom}] Performance + Feature-Specific Optimization results:")
         print(f"  - Feature types detected: {', '.join(sorted(DETECTED_FEATURE_TYPES)) if DETECTED_FEATURE_TYPES else 'none'}")
         print(f"  - Feature optimizations applied: {total_feature_optimizations}")
+        print(f"  - Performance optimizations: coordinate quantization, micro-movement elimination, validation")
         print(f"  - Tiles with palette optimization: {tiles_optimized}/{total_tiles_processed} ({optimization_ratio:.1f}%)")
         print(f"  - Total bytes saved (palette): {total_bytes_saved} bytes")
         print(f"  - Average savings per tile: {avg_savings_per_tile:.1f} bytes")
+        print(f"  - Geometry cache entries: {len(GEOMETRY_CACHE)}")
         
         tile_buffers.clear()
         gc.collect()
@@ -984,7 +1152,7 @@ def streaming_assign_features_to_tiles_by_zoom(geojson_file, config, output_dir,
         mem_end = process.memory_info().rss / 1024 / 1024
 
         if summary_stats is not None:
-            notes = f"FEATURES: {', '.join(sorted(DETECTED_FEATURE_TYPES)) if DETECTED_FEATURE_TYPES else 'general'}"
+            notes = f"PERF+FEATURES: {', '.join(sorted(DETECTED_FEATURE_TYPES)) if DETECTED_FEATURE_TYPES else 'general'}"
             notes += f" | PALETTE: {tiles_optimized}/{total_tiles_processed} tiles"
             notes += f" | {total_bytes_saved}B saved | {len(GLOBAL_COLOR_PALETTE)} colors"
             
@@ -996,7 +1164,7 @@ def streaming_assign_features_to_tiles_by_zoom(geojson_file, config, output_dir,
                 "Notes": notes[:68]  # Truncate for table display
             })
 
-        print(f"[Zoom {zoom}] Tiles written with feature-specific + dynamic palette optimization.")
+        print(f"[Zoom {zoom}] Tiles written with performance + feature-specific + dynamic palette optimization.")
 
 def print_summary_table(summary_stats):
     print('\n' + '+' + '-'*12 + '+' + '-'*21 + '+' + '-'*20 + '+' + '-'*21 + '+' + '-'*70 + '+')
@@ -1015,7 +1183,7 @@ def print_summary_table(summary_stats):
     print('+' + '-'*12 + '+' + '-'*21 + '+' + '-'*20 + '+' + '-'*21 + '+' + '-'*70 + '+')
 
 def main():
-    parser = argparse.ArgumentParser(description="OSM vector tile generator with feature-specific optimizations")
+    parser = argparse.ArgumentParser(description="OSM vector tile generator with performance + feature-specific optimizations")
     parser.add_argument("pbf_file", help="Path to .pbf file")
     parser.add_argument("output_dir", help="Output directory")
     parser.add_argument("config_file", help="JSON config with features/colors")
@@ -1042,13 +1210,20 @@ def main():
     feature_types = detect_feature_types(config)
     print(f"Ready for feature-specific optimizations: {', '.join(sorted(feature_types)) if feature_types else 'general optimization only'}")
 
+    # Initialize performance optimization pools
+    global COMMAND_POOL, POINT_POOL, GEOMETRY_CACHE
+    COMMAND_POOL = []
+    POINT_POOL = []
+    GEOMETRY_CACHE = {}
+    print("Performance optimization pools initialized")
+
     geojson_tmp = os.path.abspath("tmp_extract.geojson")
     total_features_to_merge = extract_geojson_from_pbf(args.pbf_file, geojson_tmp, config)
 
-    print("Reading features and assigning to tiles with feature-specific + dynamic palette optimization...")
+    print("Reading features and assigning to tiles with performance + feature-specific + dynamic palette optimization...")
     summary_stats = []
     streaming_assign_features_to_tiles_by_zoom(geojson_tmp, config, args.output_dir, zoom_levels, max_file_size, total_features=total_features_to_merge, summary_stats=summary_stats)
-    print("Process completed successfully with feature-specific + dynamic palette optimization.")
+    print("Process completed successfully with performance + feature-specific + dynamic palette optimization.")
 
     print("\nProcessing completed. Summary:")
     print_summary_table(summary_stats)
