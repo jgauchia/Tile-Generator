@@ -79,9 +79,3 @@ python tile_viewer.py tiles/
 - You can visualize both vector tiles (`.bin`) and raster tiles (`.png`) in the same directory.
 
 ---
-
-## License
-
-MIT License
-
----

@@ -302,9 +302,3 @@ Each `.bin` file contains highly optimized drawing commands with full 6-step com
 - **Cache-friendly layout**: Data structures optimized for CPU cache efficiency
 
 ---
-
-## License
-
-This project is released under the MIT License.
-
----
