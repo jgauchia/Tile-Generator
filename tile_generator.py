@@ -999,10 +999,12 @@ def is_area(tags):
     return False
 
 def get_simplify_tolerance_for_zoom(zoom):
-    if zoom <= 10:
-        return 0.05
+    if zoom <= 8:
+        return 0.0008 
+    elif zoom <= 12:
+        return 0.0003  
     else:
-        return None
+        return 0.0     
 
 def clamp_uint16(x):
     return max(0, min(UINT16_TILE_SIZE - 1, int(x)))
