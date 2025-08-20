@@ -1626,6 +1626,7 @@ def print_summary_table(summary_stats):
     print('+' + '-'*12 + '+' + '-'*21 + '+' + '-'*20 + '+' + '-'*21 + '+' + '-'*70 + '+')
 
 def write_palette_bin(output_dir):
+    os.makedirs(output_dir, exist_ok=True)
     palette_path = os.path.join(output_dir, "palette.bin")
     print(f"Writing palette to {palette_path} ({len(GLOBAL_INDEX_TO_RGB332)} colors)...")
     with open(palette_path, "wb") as fp:
