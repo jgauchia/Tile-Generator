@@ -1349,7 +1349,7 @@ def count_features(tmp_files, config_fields):
                 total += 1
     return total
 
-def extract_geojson_from_pbf(pbf_file, geojson_file, config):
+def extract_geojson_from_pbf(pbf_file, geojson_file, config, zoom_levels):
     print("Extracting PBF with ogr2ogr using SQL filter and minimal fields based on style...")
     if os.path.exists(geojson_file):
         os.remove(geojson_file)
@@ -1361,11 +1361,23 @@ def extract_geojson_from_pbf(pbf_file, geojson_file, config):
         "other_relations": {"place", "natural"}
     }
     layers = ["points", "lines", "multilinestrings", "multipolygons", "other_relations"]
-    config_fields = get_config_fields(config)
+
+    # NUEVO: filtrar el config por el rango de zoom seleccionado
+    max_zoom = max(zoom_levels)
+    filtered_config = {}
+    for k, v in config.items():
+        # Si el campo "zoom" está en el dict, y es <= max_zoom, mantenerlo
+        if isinstance(v, dict) and "zoom" in v and v["zoom"] <= max_zoom:
+            filtered_config[k] = v
+        # Si no tiene campo zoom, incluirlo por defecto
+        elif isinstance(v, dict) and "zoom" not in v:
+            filtered_config[k] = v
+
+    config_fields = get_config_fields(filtered_config)
 
     print("Extracting layers ...")
     extract_args = [
-        (layer, i, layers, geojson_file, pbf_file, config, LAYER_FIELDS, config_fields)
+        (layer, i, layers, geojson_file, pbf_file, filtered_config, LAYER_FIELDS, config_fields)
         for i, layer in enumerate(layers)
     ]
     tmp_files = []
@@ -1666,7 +1678,7 @@ def main():
     print("Performance optimization pools initialized")
 
     geojson_tmp = os.path.abspath("tmp_extract.geojson")
-    total_features_to_merge = extract_geojson_from_pbf(args.pbf_file, geojson_tmp, config)
+    total_features_to_merge = extract_geojson_from_pbf(args.pbf_file, geojson_tmp, config, zoom_levels)
 
     print("Reading features and assigning to tiles with optimization pipeline ...")
     summary_stats = []
