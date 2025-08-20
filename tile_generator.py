@@ -1426,9 +1426,9 @@ def extract_geojson_from_pbf(pbf_file, geojson_file, config, zoom_levels):
     return total_features_to_merge
 
 def streaming_assign_features_to_tiles_by_zoom(geojson_file, config, output_dir, zoom_levels, max_file_size=65536, total_features=None, summary_stats=None):
+    import psutil
+    process = psutil.Process(os.getpid())
     config_fields = get_config_fields(config)
-
-    # Prepare a mapping: zoom -> set(tags) that should be visible in that zoom
     zoom_to_valid_tags = {}
     for zoom in zoom_levels:
         valid_tags = set()
@@ -1437,31 +1437,22 @@ def streaming_assign_features_to_tiles_by_zoom(geojson_file, config, output_dir,
                 valid_tags.add(k)
         zoom_to_valid_tags[zoom] = valid_tags
 
-    # For total features progress bar
     total_features_count = total_features if total_features is not None else None
-
-    import psutil
-    process = psutil.Process(os.getpid())
 
     for zoom in zoom_levels:
         print(f"\n========== Processing zoom level {zoom} ==========")
         print(f"[Zoom {zoom}] Reading relevant features from GeoJSON...")
 
-        # Clear geometry cache between zoom levels to manage memory
         global GEOMETRY_CACHE
         GEOMETRY_CACHE.clear()
 
-        # Assign valid tags for this zoom
         valid_tags = zoom_to_valid_tags[zoom]
-
-        # tile_buffers: {(xt, yt): [list of commands]}
         tile_buffers = defaultdict(list)
         assigned_features = 0
 
         mem_start = process.memory_info().rss / 1024 / 1024
         t0 = time.time()
 
-        # Reading and assignment (streaming, only relevant features)
         with open(geojson_file, "r", encoding="utf-8") as f, tqdm(desc=f"[Zoom {zoom}] Reading & assignment", total=total_features_count) as pbar_read:
             for feat in ijson.items(f, "features.item"):
                 tags = {k: v for k, v in feat['properties'].items() if k in config_fields}
@@ -1469,7 +1460,6 @@ def streaming_assign_features_to_tiles_by_zoom(geojson_file, config, output_dir,
                 if not style:
                     pbar_read.update(1)
                     continue
-                # Does this feature apply to the current zoom?
                 if stylekey not in valid_tags:
                     pbar_read.update(1)
                     continue
@@ -1515,7 +1505,7 @@ def streaming_assign_features_to_tiles_by_zoom(geojson_file, config, output_dir,
                             continue
                         if not clipped_geom.is_empty:
                             cmds = geometry_to_draw_commands(
-                                clipped_geom, color, tags, zoom, xt, yt, 
+                                clipped_geom, color, tags, zoom, xt, yt,
                                 simplify_tolerance=simplify_tolerance, hex_color=hex_color
                             )
                             for cmd in cmds:
@@ -1531,50 +1521,54 @@ def streaming_assign_features_to_tiles_by_zoom(geojson_file, config, output_dir,
         total_tiles_processed = 0
         total_feature_optimizations = 0
         total_advanced_optimizations = {}
-        
+
+        tile_bin_sizes = []  # <-- Añadido: lista para los tamaños de los bin
         with tqdm(total=len(tile_buffers), desc=f"[Zoom {zoom}] Creating optimized tiles") as pbar_tiles:
             for (xt, yt), cmds in tile_buffers.items():
                 tile_dir = os.path.join(output_dir, str(zoom), str(xt))
                 os.makedirs(tile_dir, exist_ok=True)
                 filename = os.path.join(tile_dir, f"{yt}.bin")
-                
-                # Sort by priority and color
+
                 cmds_sorted = sorted(cmds, key=lambda c: (c['priority'], c['color']))
-                
-                # Apply performance optimizations (Step 5)
                 cmds_performance_optimized = apply_performance_optimizations(cmds_sorted, zoom)
-                
-                # Apply feature-specific optimizations (Step 4)
                 cmds_feature_optimized, feature_optimizations = apply_feature_specific_optimizations(cmds_performance_optimized)
                 total_feature_optimizations += feature_optimizations
-                
-                # Apply advanced compression techniques (Step 6)
                 cmds_advanced_optimized, advanced_stats = apply_advanced_compression_techniques(cmds_feature_optimized, xt, yt, zoom)
                 for key, value in advanced_stats.items():
                     total_advanced_optimizations[key] = total_advanced_optimizations.get(key, 0) + value
-                
-                # Insert optimized palette commands (Step 3)
                 cmds_optimized, bytes_saved = insert_palette_commands(cmds_advanced_optimized)
-                
-                # Pack optimized commands
                 buffer = pack_draw_commands(cmds_optimized)
-                
-                # Write file
                 with open(filename, "wb") as fbin:
                     fbin.write(buffer)
-                
-                # Optimization statistics
+                size_bin = os.path.getsize(filename)
+                tile_bin_sizes.append(size_bin)  # <-- Guardamos tamaño del bin
                 if bytes_saved > 0:
                     tiles_optimized += 1
                     total_bytes_saved += bytes_saved
-                
                 total_tiles_processed += 1
                 pbar_tiles.update(1)
-        
-        # Calculate optimization statistics
+
+        # Cálculo de tamaños y estadísticas del directorio de ese zoom
+        dir_zoom = os.path.join(output_dir, str(zoom))
+        total_dir_size = 0
+        for dirpath, dirnames, filenames in os.walk(dir_zoom):
+            for f in filenames:
+                fp = os.path.join(dirpath, f)
+                if os.path.isfile(fp):
+                    total_dir_size += os.path.getsize(fp)
+
+        if tile_bin_sizes:
+            min_bin_size = min(tile_bin_sizes)
+            max_bin_size = max(tile_bin_sizes)
+            avg_bin_size = sum(tile_bin_sizes) / len(tile_bin_sizes)
+        else:
+            min_bin_size = 0
+            max_bin_size = 0
+            avg_bin_size = 0
+
         avg_savings_per_tile = total_bytes_saved / max(total_tiles_processed, 1)
         optimization_ratio = (tiles_optimized / max(total_tiles_processed, 1)) * 100
-        
+
         print(f"[Zoom {zoom}] ALL Optimization Layers Applied (Steps 1-6):")
         print(f"  - Feature types detected: {', '.join(sorted(DETECTED_FEATURE_TYPES)) if DETECTED_FEATURE_TYPES else 'none'}")
         print(f"  - Feature optimizations applied: {total_feature_optimizations}")
@@ -1587,7 +1581,11 @@ def streaming_assign_features_to_tiles_by_zoom(geojson_file, config, output_dir,
         print(f"  - Total bytes saved (palette): {total_bytes_saved} bytes")
         print(f"  - Average savings per tile: {avg_savings_per_tile:.1f} bytes")
         print(f"  - Geometry cache entries: {len(GEOMETRY_CACHE)}")
-        
+        print(f"  - Total directory size: {total_dir_size} bytes")
+        print(f"  - Min bin size: {min_bin_size} bytes")
+        print(f"  - Max bin size: {max_bin_size} bytes")
+        print(f"  - Avg bin size: {avg_bin_size:.1f} bytes")
+
         tile_buffers.clear()
         gc.collect()
         t1 = time.time()
@@ -1598,32 +1596,40 @@ def streaming_assign_features_to_tiles_by_zoom(geojson_file, config, output_dir,
             notes += f" | ADV: {total_advanced_optimizations.get('total_optimizations', 0)}"
             notes += f" | PAL: {tiles_optimized}/{total_tiles_processed}"
             notes += f" | {total_bytes_saved}B | {len(GLOBAL_COLOR_PALETTE)} colors"
-            
+
             summary_stats.append({
                 "Zoom level": zoom,
                 "Number of elements": assigned_features,
                 "Memory usage (MB)": int(mem_end),
+                "Total dir size (B)": total_dir_size,
+                "Min bin size (B)": min_bin_size,
+                "Max bin size (B)": max_bin_size,
+                "Avg bin size (B)": round(avg_bin_size, 1),
                 "Processing time (s)": round(t1 - t0, 2),
-                "Notes": notes[:68]  # Truncate for table display
+                "Notes": notes[:68]
             })
 
         print(f"[Zoom {zoom}] Tiles written with optimization pipeline .")
 
 def print_summary_table(summary_stats):
-    print('\n' + '+' + '-'*12 + '+' + '-'*21 + '+' + '-'*20 + '+' + '-'*21 + '+' + '-'*70 + '+')
-    print('| {:<10} | {:<19} | {:<18} | {:<19} | {:<68} |'.format(
-        "Zoom level", "Number of elements", "Memory usage (MB)", "Processing time (s)", "Notes"))
-    print('+' + '-'*12 + '+' + '-'*21 + '+' + '-'*20 + '+' + '-'*21 + '+' + '-'*70 + '+')
+    print('\n' + '+' + '-'*12 + '+' + '-'*21 + '+' + '-'*20 + '+' + '-'*17 + '+' + '-'*16 + '+' + '-'*16 + '+' + '-'*16 + '+' + '-'*19 + '+' + '-'*70 + '+')
+    print('| {:<10} | {:<19} | {:<18} | {:<15} | {:<14} | {:<14} | {:<14} | {:<17} | {:<68} |'.format(
+        "Zoom level", "Number of elements", "Memory usage (MB)", "Total dir size", "Min bin size", "Max bin size", "Avg bin size", "Processing time (s)", "Notes"))
+    print('+' + '-'*12 + '+' + '-'*21 + '+' + '-'*20 + '+' + '-'*17 + '+' + '-'*16 + '+' + '-'*16 + '+' + '-'*16 + '+' + '-'*19 + '+' + '-'*70 + '+')
 
     for entry in summary_stats:
-        print('| {:<10} | {:<19} | {:<18} | {:<19} | {:<68} |'.format(
+        print('| {:<10} | {:<19} | {:<18} | {:<15} | {:<14} | {:<14} | {:<14} | {:<17} | {:<68} |'.format(
             entry["Zoom level"],
             entry["Number of elements"],
             entry["Memory usage (MB)"],
+            entry["Total dir size (B)"],
+            entry["Min bin size (B)"],
+            entry["Max bin size (B)"],
+            entry["Avg bin size (B)"],
             entry["Processing time (s)"],
-            entry["Notes"][:68]  # Truncate long notes
+            entry["Notes"][:68]
         ))
-    print('+' + '-'*12 + '+' + '-'*21 + '+' + '-'*20 + '+' + '-'*21 + '+' + '-'*70 + '+')
+    print('+' + '-'*12 + '+' + '-'*21 + '+' + '-'*20 + '+' + '-'*17 + '+' + '-'*16 + '+' + '-'*16 + '+' + '-'*16 + '+' + '-'*19 + '+' + '-'*70 + '+')
 
 def write_palette_bin(output_dir):
     os.makedirs(output_dir, exist_ok=True)
