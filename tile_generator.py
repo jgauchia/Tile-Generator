@@ -36,11 +36,9 @@ DRAW_COMMANDS = {
     'VERTICAL_LINE': 6,
     'SET_COLOR': 0x80,  # State command for direct RGB332 color
     'SET_COLOR_INDEX': 0x81,  # State command for palette index
-    # Feature-specific optimized commands
     'RECTANGLE': 0x82,  # Optimized rectangle for buildings
     'STRAIGHT_LINE': 0x83,  # Optimized straight line for highways
     'HIGHWAY_SEGMENT': 0x84,  # Highway segment with continuity
-    # Step 6: Advanced compression commands
     'GRID_PATTERN': 0x85,  # Urban grid pattern
     'BLOCK_PATTERN': 0x86,  # City block pattern
     'CIRCLE': 0x87,  # Circle/roundabout
@@ -127,8 +125,7 @@ def deg2pixel(lat_deg, lon_deg, zoom):
 
 def coords_to_pixel_coords_uint16(coords, zoom, tile_x, tile_y):
     global POINT_POOL
-    POINT_POOL.clear()  # Reuse pool instead of creating new list
-    
+    POINT_POOL.clear()      
     for lon, lat in coords:
         px_global, py_global = deg2pixel(lat, lon, zoom)
         x = (px_global - tile_x * TILE_SIZE) * (UINT16_TILE_SIZE - 1) / (TILE_SIZE - 1)
@@ -139,7 +136,7 @@ def coords_to_pixel_coords_uint16(coords, zoom, tile_x, tile_y):
         y = max(0, min(UINT16_TILE_SIZE - 1, y))
         POINT_POOL.append((x, y))
     
-    return list(POINT_POOL)  # Return copy to avoid pool contamination
+    return list(POINT_POOL)  
 
 def remove_duplicate_points(points):
     if len(points) <= 1:
@@ -151,29 +148,18 @@ def remove_duplicate_points(points):
     return result
 
 def optimize_coordinate_precision(points, zoom_level):
-    """
-    Performance optimization: reduce coordinate precision based on zoom level.
-    Lower zoom levels don't need pixel-perfect precision.
-    """
     if zoom_level <= 10:
-        # Low zoom: quantize coordinates to reduce data
         quantization = 4
         return [(x//quantization*quantization, y//quantization*quantization) 
                 for x, y in points]
     elif zoom_level <= 12:
-        # Medium zoom: small quantization
         quantization = 2
         return [(x//quantization*quantization, y//quantization*quantization) 
                 for x, y in points]
     else:
-        # High zoom: maintain full precision
         return points
 
 def eliminate_micro_movements(points, threshold=2):
-    """
-    Performance optimization: eliminate micro-movements that are not visually significant.
-    Reduces number of points in polylines and polygons.
-    """
     if len(points) < 3:
         return points
     
@@ -184,20 +170,14 @@ def eliminate_micro_movements(points, threshold=2):
         if distance >= threshold:
             result.append(point)
     
-    # Ensure we keep the last point if it's different
     if len(result) > 1 and result[-1] != points[-1]:
         result.append(points[-1])
     
     return result
 
 def validate_and_clean_commands(commands):
-    """
-    Performance optimization: remove geometrically invalid or redundant commands.
-    This reduces tile size and improves rendering performance.
-    """
     clean_commands = []
     for cmd in commands:
-        # Skip invalid commands
         if cmd['type'] == DRAW_COMMANDS['LINE']:
             # Remove zero-length lines
             if cmd['x1'] == cmd['x2'] and cmd['y1'] == cmd['y2']:
@@ -238,10 +218,6 @@ def validate_and_clean_commands(commands):
     return clean_commands
 
 def geometry_hash(geom_data):
-    """
-    Create a hash for geometry deduplication.
-    This allows us to reuse processing results for identical geometries.
-    """
     if isinstance(geom_data, list):
         # For point lists (polylines, polygons)
         return hash(tuple(tuple(p) for p in geom_data))
@@ -251,13 +227,7 @@ def geometry_hash(geom_data):
     else:
         return hash(str(geom_data))
 
-# Step 6: Advanced Compression Functions
-
 def detect_urban_grid_pattern(commands, tolerance=10):
-    """
-    Detects urban grid patterns (perpendicular streets).
-    Returns optimized GRID_PATTERN commands when detected.
-    """
     if not commands:
         return commands, 0
     
@@ -333,10 +303,6 @@ def detect_urban_grid_pattern(commands, tolerance=10):
     return optimized_commands, grid_patterns_detected
 
 def detect_circular_features(commands, tolerance=5):
-    """
-    Detects circular or near-circular polygons (roundabouts, plazas).
-    Converts them to optimized CIRCLE commands.
-    """
     if not commands:
         return commands, 0
     
@@ -379,10 +345,6 @@ def detect_circular_features(commands, tolerance=5):
     return optimized_commands, circles_detected
 
 def is_approximately_circular(points, tolerance):
-    """
-    Determines if a polygon is approximately circular.
-    Returns (is_circle, center, radius).
-    """
     if len(points) < 6:
         return False, None, None
     
@@ -412,10 +374,6 @@ def is_approximately_circular(points, tolerance):
     return is_circular, center, int(avg_radius) if is_circular else None
 
 def apply_coordinate_prediction(commands):
-    """
-    Applies coordinate prediction to reduce coordinate data.
-    Uses patterns in previous coordinates to predict next ones.
-    """
     if not commands:
         return commands, 0
     
@@ -468,48 +426,7 @@ def apply_coordinate_prediction(commands):
     
     return optimized_commands, predictions_applied
 
-def build_huffman_encoding_table(commands):
-    """
-    Builds Huffman encoding table based on command frequency.
-    This is called once during initialization to analyze command patterns.
-    """
-    global COMMAND_FREQUENCY, HUFFMAN_CODES
-    
-    # Count command frequencies
-    for cmd in commands:
-        cmd_type = cmd['type']
-        COMMAND_FREQUENCY[cmd_type] += 1
-    
-    # Build Huffman tree (simplified implementation)
-    # In a full implementation, you'd use proper Huffman tree construction
-    # For now, we'll use frequency-based bit length assignment
-    
-    sorted_commands = sorted(COMMAND_FREQUENCY.items(), key=lambda x: x[1], reverse=True)
-    
-    # Assign shorter codes to more frequent commands
-    for i, (cmd_type, frequency) in enumerate(sorted_commands):
-        if i < 4:  # Most frequent: 2 bits
-            HUFFMAN_CODES[cmd_type] = i  # 0, 1, 2, 3 (2 bits each)
-        elif i < 12:  # Medium frequent: 3 bits  
-            HUFFMAN_CODES[cmd_type] = 16 + (i - 4)  # 16-23 (need 3+ bits)
-        else:  # Less frequent: 4+ bits
-            HUFFMAN_CODES[cmd_type] = 32 + (i - 12)  # 32+ (need 4+ bits)
-    
-    return len(HUFFMAN_CODES)
-
-def apply_variable_length_encoding(commands):
-    """
-    Applies variable-length integer encoding to coordinates.
-    Smaller coordinates use fewer bytes.
-    """
-    # This is already implemented in pack_varint() and pack_zigzag()
-    # The optimization is in the packing phase
-    return commands, 0
-
 def detect_geometric_primitives(commands):
-    """
-    Detects simple geometric primitives and optimizes them.
-    """
     if not commands:
         return commands, 0
     
@@ -554,10 +471,6 @@ def detect_geometric_primitives(commands):
     return optimized_commands, primitives_detected
 
 def apply_tile_boundary_optimization(commands, tile_x, tile_y, zoom):
-    """
-    Optimizes geometries that cross tile boundaries.
-    Reduces duplication in adjacent tiles.
-    """
     # This is a complex optimization that would require coordination
     # between adjacent tiles. For now, we implement a simpler version
     # that optimizes geometries near tile edges.
@@ -591,9 +504,6 @@ def apply_tile_boundary_optimization(commands, tile_x, tile_y, zoom):
     return optimized_commands, boundary_optimizations
 
 def apply_advanced_compression_techniques(commands, tile_x=0, tile_y=0, zoom=12):
-    """
-    Applies all Step 6 advanced compression techniques.
-    """
     if not commands:
         return commands, {}
     
@@ -638,10 +548,6 @@ def apply_advanced_compression_techniques(commands, tile_x=0, tile_y=0, zoom=12)
     return optimized_commands, optimization_stats
 
 def precompute_global_color_palette(config):
-    """
-    Analyzes the configuration JSON and pre-computes a global color palette.
-    This is executed once at the beginning of the program.
-    """
     global GLOBAL_COLOR_PALETTE, GLOBAL_INDEX_TO_RGB332
     
     print("Analyzing colors from features.json to build dynamic palette...")
@@ -684,9 +590,6 @@ def precompute_global_color_palette(config):
     return len(unique_colors)
 
 def detect_feature_types(config):
-    """
-    Detects what types of OSM features are configured to apply specific optimizations.
-    """
     global DETECTED_FEATURE_TYPES
     
     print("\nAnalyzing features.json for feature-specific optimizations...")
@@ -723,9 +626,6 @@ def detect_feature_types(config):
     return feature_types
 
 def is_rectangle(points, tolerance=5):
-    """
-    Detects if a polygon is approximately rectangular.
-    """
     if len(points) < 4:
         return False, None
     
@@ -759,9 +659,6 @@ def is_rectangle(points, tolerance=5):
     return False, None
 
 def is_straight_line(points, tolerance=3):
-    """
-    Detects if a line is approximately straight.
-    """
     if len(points) < 3:
         return True  # 2 points always form a straight line
     
@@ -779,9 +676,6 @@ def is_straight_line(points, tolerance=3):
     return True
 
 def point_to_line_distance(point, line_start, line_end):
-    """
-    Calculates the distance from a point to a line.
-    """
     x0, y0 = point
     x1, y1 = line_start
     x2, y2 = line_end
@@ -797,10 +691,6 @@ def point_to_line_distance(point, line_start, line_end):
     return numerator / denominator if denominator > 0 else 0
 
 def optimize_buildings(commands):
-    """
-    Optimizes commands specific to buildings.
-    Converts rectangular polygons to more efficient RECTANGLE commands.
-    """
     if 'building' not in DETECTED_FEATURE_TYPES:
         return commands, 0
     
@@ -841,10 +731,6 @@ def optimize_buildings(commands):
     return optimized_commands, rectangles_optimized
 
 def optimize_highways(commands):
-    """
-    Optimizes commands specific to highways.
-    Detects straight lines and converts them to more efficient commands.
-    """
     if 'highway' not in DETECTED_FEATURE_TYPES:
         return commands, 0
     
@@ -885,9 +771,6 @@ def optimize_highways(commands):
     return optimized_commands, straight_lines_optimized
 
 def apply_feature_specific_optimizations(commands):
-    """
-    Applies all feature-specific optimizations.
-    """
     if not DETECTED_FEATURE_TYPES:
         return commands, 0
     
@@ -906,10 +789,6 @@ def apply_feature_specific_optimizations(commands):
     return optimized_commands, total_optimizations
 
 def apply_performance_optimizations(commands, zoom_level):
-    """
-    Performance optimization: applies micro-optimizations to improve speed and reduce memory usage.
-    This is the main function for Step 5 optimizations.
-    """
     if not commands:
         return commands
     
@@ -925,7 +804,6 @@ def apply_performance_optimizations(commands, zoom_level):
     return commands
 
 def hex_to_rgb332_direct(hex_color):
-    """Direct hex to RGB332 conversion without using palette"""
     try:
         if not hex_color or not isinstance(hex_color, str) or not hex_color.startswith("#"):
             return 0xFF
@@ -937,10 +815,6 @@ def hex_to_rgb332_direct(hex_color):
         return 0xFF
 
 def hex_to_color_index(hex_color):
-    """
-    Converts a hex color to its index in the global palette.
-    Returns the index if the color is in the palette, otherwise None.
-    """
     global GLOBAL_COLOR_PALETTE
     return GLOBAL_COLOR_PALETTE.get(hex_color, None)
 
@@ -1025,10 +899,6 @@ def pack_zigzag(n):
     return pack_varint((n << 1) ^ (n >> 31))
 
 def insert_palette_commands(commands):
-    """
-    Inserts optimized SET_COLOR_INDEX commands using the global palette.
-    This function maximizes compression.
-    """
     if not commands:
         return commands, 0
     
@@ -1076,10 +946,6 @@ def insert_palette_commands(commands):
     return result, net_savings
 
 def pack_draw_commands(commands):
-    """
-    Packs drawing commands into optimized binary format.
-    Adds support for Step 6 advanced compression commands.
-    """
     out = bytearray()
     out += pack_varint(len(commands))
     
@@ -1364,14 +1230,11 @@ def extract_geojson_from_pbf(pbf_file, geojson_file, config, zoom_levels):
     }
     layers = ["points", "lines", "multilinestrings", "multipolygons", "other_relations"]
 
-    # NUEVO: filtrar el config por el rango de zoom seleccionado
     max_zoom = max(zoom_levels)
     filtered_config = {}
     for k, v in config.items():
-        # Si el campo "zoom" está en el dict, y es <= max_zoom, mantenerlo
         if isinstance(v, dict) and "zoom" in v and v["zoom"] <= max_zoom:
             filtered_config[k] = v
-        # Si no tiene campo zoom, incluirlo por defecto
         elif isinstance(v, dict) and "zoom" not in v:
             filtered_config[k] = v
 
@@ -1571,11 +1434,11 @@ def streaming_assign_features_to_tiles_by_zoom(geojson_file, config, output_dir,
         avg_savings_per_tile = total_bytes_saved / max(total_tiles_processed, 1)
         optimization_ratio = (tiles_optimized / max(total_tiles_processed, 1)) * 100
 
-        print(f"[Zoom {zoom}] ALL Optimization Layers Applied (Steps 1-6):")
+        print(f"[Zoom {zoom}] ALL Optimization Layers Applied:")
         print(f"  - Feature types detected: {', '.join(sorted(DETECTED_FEATURE_TYPES)) if DETECTED_FEATURE_TYPES else 'none'}")
         print(f"  - Feature optimizations applied: {total_feature_optimizations}")
         print(f"  - Performance optimizations: coordinate quantization, micro-movement elimination, validation")
-        print(f"  - Advanced compression (Step 6):")
+        print(f"  - Advanced compression:")
         for key, value in total_advanced_optimizations.items():
             if value > 0:
                 print(f"    • {key}: {value}")
@@ -1594,7 +1457,7 @@ def streaming_assign_features_to_tiles_by_zoom(geojson_file, config, output_dir,
         mem_end = process.memory_info().rss / 1024 / 1024
 
         if summary_stats is not None:
-            notes = f"STEP6: {', '.join(sorted(DETECTED_FEATURE_TYPES)) if DETECTED_FEATURE_TYPES else 'general'}"
+            notes = f"{', '.join(sorted(DETECTED_FEATURE_TYPES)) if DETECTED_FEATURE_TYPES else 'general'}"
             notes += f" | ADV: {total_advanced_optimizations.get('total_optimizations', 0)}"
             notes += f" | PAL: {tiles_optimized}/{total_tiles_processed}"
             notes += f" | {total_bytes_saved}B | {len(GLOBAL_COLOR_PALETTE)} colors"
@@ -1644,7 +1507,7 @@ def write_palette_bin(output_dir):
     print("Palette written OK.")
 
 def main():
-    parser = argparse.ArgumentParser(description="OSM vector tile generator with COMPLETE optimization pipeline (Steps 1-6)")
+    parser = argparse.ArgumentParser(description="OSM vector tile generator with COMPLETE optimization pipeline")
     parser.add_argument("pbf_file", help="Path to .pbf file")
     parser.add_argument("output_dir", help="Output directory")
     parser.add_argument("config_file", help="JSON config with features/colors")
