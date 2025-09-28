@@ -23,6 +23,14 @@ import time
 import ijson
 import decimal
 
+import gc
+import psutil
+import threading
+from collections import OrderedDict
+from threading import RLock
+import sys
+import weakref
+
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 max_workers = os.cpu_count()
@@ -56,16 +64,539 @@ GLOBAL_INDEX_TO_RGB332 = {}  # index -> rgb332_value
 # Global variables for feature detection
 DETECTED_FEATURE_TYPES = set()  # highway, building, waterway, etc.
 
-# Global pools for performance optimization
-COMMAND_POOL = []
-POINT_POOL = []
-GEOMETRY_CACHE = {}
-
 # Step 6: Advanced compression globals
 COMMAND_FREQUENCY = Counter()  # For Huffman encoding
 HUFFMAN_CODES = {}  # command_type -> encoded_bits
 COORDINATE_PREDICTORS = {}  # For coordinate prediction
 PATTERN_CACHE = {}  # For pattern detection cache
+
+
+class LRUCache:
+   
+    def __init__(self, capacity=1000, memory_limit_mb=100):
+        """
+            Args:
+                capacity: Maximum number of elements
+                memory_limit_mb: Memory limit in MB
+        """
+        self.capacity = capacity
+        self.memory_limit_bytes = memory_limit_mb * 1024 * 1024
+        self.cache = OrderedDict()
+        self.lock = RLock()
+        self._memory_usage = 0
+        self._total_hits = 0
+        self._total_misses = 0
+        self._session_hits = 0   
+        self._session_misses = 0  
+        
+    def _estimate_size(self, value):
+        """Estimates the memory usage of a cached value"""
+        if isinstance(value, list):
+            return len(value) * 200  
+        elif isinstance(value, dict):
+            return sys.getsizeof(value)
+        else:
+            return 100 
+    
+    def get(self, key):
+        """Retrieves a value from the cache and marks it as recently used"""
+        with self.lock:
+            if key in self.cache:
+                value = self.cache.pop(key)
+                self.cache[key] = value
+                self._total_hits += 1
+                self._session_hits += 1
+                return value
+            else:
+                self._total_misses += 1
+                self._session_misses += 1
+                return None
+    
+    def put(self, key, value):
+        """Stores a value in the cache"""
+        with self.lock:
+            value_size = self._estimate_size(value)
+            
+            if key in self.cache:
+                old_value = self.cache.pop(key)
+                self._memory_usage -= self._estimate_size(old_value)
+            
+            while (len(self.cache) >= self.capacity or 
+                   self._memory_usage + value_size > self.memory_limit_bytes):
+                if not self.cache:
+                    break
+                oldest_key, oldest_value = self.cache.popitem(last=False)
+                self._memory_usage -= self._estimate_size(oldest_value)
+            
+            self.cache[key] = value
+            self._memory_usage += value_size
+    
+    def clear(self):
+        """Completely clears the cache"""
+        with self.lock:
+            self.cache.clear()
+            self._memory_usage = 0
+            self._session_hits = 0
+            self._session_misses = 0
+    
+    def stats(self):
+        """Returns cache statistics"""
+        with self.lock:
+            total_requests = self._total_hits + self._total_misses
+            if total_requests > 0:
+                total_hit_rate = (self._total_hits / total_requests) * 100
+            else:
+                total_hit_rate = 0
+            
+            session_requests = self._session_hits + self._session_misses
+            if session_requests > 0:
+                session_hit_rate = (self._session_hits / session_requests) * 100
+            else:
+                session_hit_rate = 0
+            
+            return {
+                'size': len(self.cache),
+                'capacity': self.capacity,
+                'memory_mb': round(self._memory_usage / (1024 * 1024), 2),
+                'memory_limit_mb': self.memory_limit_bytes / (1024 * 1024),
+                'total_hit_rate_percent': round(total_hit_rate, 1),
+                'session_hit_rate_percent': round(session_hit_rate, 1),
+                'total_hits': self._total_hits,
+                'total_misses': self._total_misses,
+                'session_hits': self._session_hits,
+                'session_misses': self._session_misses
+            }
+
+    def reset_session_stats(self):
+        """Resets only session statistics"""
+        with self.lock:
+            self._session_hits = 0
+            self._session_misses = 0
+
+class ObjectPool:
+    """
+    Object pool for efficient reuse.
+    Replaces frequent creation/destruction of small objects.
+    """
+   
+    def __init__(self, factory, reset_func, initial_size=100, max_size=1000):
+        """
+            Args:
+                factory: Function that creates new objects
+                reset_func: Function that resets objects for reuse
+                initial_size: Initial size of the pool
+                max_size: Maximum size of the pool
+        """
+        self.factory = factory
+        self.reset_func = reset_func
+        self.max_size = max_size
+        self.lock = RLock()
+
+        self.pool = []
+        for _ in range(min(initial_size, max_size)):
+            try:
+                obj = factory()
+                self.pool.append(obj)
+            except Exception:
+                break
+        
+        self._objects_requested = 0     
+        self._objects_from_pool = 0     
+        self._objects_created_new = 0    
+        self._objects_returned = 0       
+
+    def get(self):
+        """Gets an object from the pool or creates a new one"""
+        with self.lock:
+            self._objects_requested += 1
+            
+            if self.pool:
+                obj = self.pool.pop()
+                self._objects_from_pool += 1
+                return obj
+            else:
+                self._objects_created_new += 1
+                return self.factory()
+    
+    def release(self, obj):
+        """Returns an object to the pool after resetting it"""
+        if obj is None:
+            return
+        
+        try:
+            self.reset_func(obj)
+            
+            with self.lock:
+                self._objects_returned += 1
+                if len(self.pool) < self.max_size:
+                    self.pool.append(obj)
+        except Exception:
+            pass
+    
+    def clear(self):
+        """Clears the pool"""
+        with self.lock:
+            self.pool.clear()
+    
+    def stats(self):
+        """Returns pool statistics"""
+        with self.lock:
+            if self._objects_requested > 0:
+                reuse_rate = (self._objects_from_pool / self._objects_requested) * 100
+            else:
+                reuse_rate = 0
+            
+            if self._objects_requested > 0:
+                return_rate = (self._objects_returned / self._objects_requested) * 100
+            else:
+                return_rate = 0
+            
+            return {
+                'available': len(self.pool),
+                'max_size': self.max_size,
+                'total_requested': self._objects_requested,
+                'from_pool': self._objects_from_pool,
+                'created_new': self._objects_created_new,
+                'returned': self._objects_returned,
+                'reuse_rate_percent': round(reuse_rate, 1),
+                'return_rate_percent': round(return_rate, 1)
+            }
+
+    def reset_stats(self):
+        """Resets statistics without resetting the pool"""
+        with self.lock:
+            self._objects_requested = 0
+            self._objects_from_pool = 0
+            self._objects_created_new = 0
+            self._objects_returned = 0
+
+class MemoryManager:
+    
+    def __init__(self, config=None):
+        if config is None:
+            config = {}
+        
+        available_memory = psutil.virtual_memory().available
+        safe_memory_limit = available_memory * 0.6 
+        
+        geometry_cache_mb = min(200, int(safe_memory_limit / (1024 * 1024 * 20)))
+        geometry_cache_size = min(2000, geometry_cache_mb * 5)  # ~5 items por MB
+        
+        print(f"Initializing MemoryManager:")
+        print(f"  - Available memory: {available_memory / (1024*1024*1024):.1f} GB")
+        print(f"  - Safe limit: {safe_memory_limit / (1024*1024*1024):.1f} GB")
+        print(f"  - Geometry cache: {geometry_cache_mb} MB, {geometry_cache_size} items")
+        
+        self.geometry_cache = LRUCache(
+            capacity=geometry_cache_size,
+            memory_limit_mb=geometry_cache_mb
+        )
+        
+        self.color_cache = LRUCache(
+            capacity=config.get('color_cache_size', 500),
+            memory_limit_mb=config.get('color_cache_mb', 20)
+        )
+        
+        self.command_pool = ObjectPool(
+            factory=dict,
+            reset_func=lambda d: d.clear(),
+            initial_size=config.get('command_pool_initial', 500),
+            max_size=config.get('command_pool_max', 2000)
+        )
+        
+        self.point_pool = ObjectPool(
+            factory=list,
+            reset_func=lambda l: l.clear(),
+            initial_size=config.get('point_pool_initial', 300),
+            max_size=config.get('point_pool_max', 1000)
+        )
+
+        self.coord_pool = ObjectPool(
+            factory=lambda: [],
+            reset_func=lambda l: l.clear(),
+            initial_size=100,
+            max_size=500
+        )
+        
+        self._start_memory = psutil.Process().memory_info().rss
+    
+    def get_geometry_from_cache(self, key):
+        """Wrapper for accessing the geometry cache"""
+        return self.geometry_cache.get(key)
+    
+    def put_geometry_in_cache(self, key, value):
+        """Wrapper for storing in the geometry cache"""
+        self.geometry_cache.put(key, value)
+    
+    def get_command(self):
+        """Gets a reusable dictionary for commands"""
+        return self.command_pool.get()
+    
+    def release_command(self, cmd):
+        """Returns a command to the pool"""
+        self.command_pool.release(cmd)
+    
+    def get_point_list(self):
+        """Gets a reusable list for points"""
+        return self.point_pool.get()
+    
+    def release_point_list(self, points):
+        """Returns a list of points to the pool"""
+        self.point_pool.release(points)
+    
+    def get_coord_list(self):
+        """Gets a reusable list for coordinates"""
+        return self.coord_pool.get()
+    
+    def release_coord_list(self, coords):
+        """Returns a list of coordinates to the pool"""
+        self.coord_pool.release(coords)
+    
+    def cleanup(self):
+        """Clears all caches and pools"""
+        self.geometry_cache.clear()
+        self.color_cache.clear()
+        self.command_pool.clear()
+        self.point_pool.clear()
+        self.coord_pool.clear()
+        gc.collect()
+    
+    def get_memory_stats(self):
+        """Returns full memory statistics"""
+        current_memory = psutil.Process().memory_info().rss
+        memory_growth = current_memory - self._start_memory
+        
+        return {
+            'current_memory_mb': round(current_memory / (1024*1024), 2),
+            'memory_growth_mb': round(memory_growth / (1024*1024), 2),
+            'geometry_cache': self.geometry_cache.stats(),
+            'color_cache': self.color_cache.stats(),
+            'command_pool': self.command_pool.stats(),
+            'point_pool': self.point_pool.stats(),
+            'coord_pool': self.coord_pool.stats()
+        }
+    
+    def print_stats(self):
+        """Prints memory statistics in a readable format"""
+        stats = self.get_memory_stats()
+
+        print("\n=== MEMORY STATISTICS ===")
+        print(f"Current memory: {stats['current_memory_mb']} MB")
+        print(f"Memory growth: {stats['memory_growth_mb']} MB")
+
+        print(f"\nGeometry Cache:")
+        gc = stats['geometry_cache']
+        print(f"  - Items: {gc['size']}/{gc['capacity']}")
+        print(f"  - Memory: {gc['memory_mb']}/{gc['memory_limit_mb']} MB")
+        print(f"  - Total hit rate: {gc['total_hit_rate_percent']}% ({gc['total_hits']} hits, {gc['total_misses']} misses)")
+        print(f"  - Session hit rate: {gc['session_hit_rate_percent']}% (current zoom level)")
+
+        print(f"\nCommand Pool:")
+        cp = stats['command_pool']
+        print(f"  - Available: {cp['available']}/{cp['max_size']}")
+        print(f"  - Requests: {cp['total_requested']} (from pool: {cp['from_pool']}, new: {cp['created_new']})")
+        print(f"  - Reuse rate: {cp['reuse_rate_percent']}%")
+        print(f"  - Return rate: {cp['return_rate_percent']}%")
+
+        print(f"\nPoint Pool:")
+        pp = stats['point_pool']
+        print(f"  - Available: {pp['available']}/{pp['max_size']}")
+        print(f"  - Requests: {pp['total_requested']} (from pool: {pp['from_pool']}, new: {pp['created_new']})")
+        print(f"  - Reuse rate: {pp['reuse_rate_percent']}%")
+        print(f"  - Return rate: {pp['return_rate_percent']}%")
+
+memory_manager = None
+
+def initialize_memory_manager(config=None):
+    """Initializes the global memory manager"""
+    global memory_manager
+    memory_manager = MemoryManager(config)
+    return memory_manager
+
+def get_memory_manager():
+    """Gets the instance of the memory manager"""
+    global memory_manager
+    if memory_manager is None:
+        memory_manager = MemoryManager()
+    return memory_manager
+
+def optimized_geometry_hash(geom):
+    """
+    Fast hash for geometries based on bounds and type.
+    Replaces the expensive hash(geom.wkt).
+    """
+    try:
+        bounds = geom.bounds  
+        geom_type = geom.geom_type
+        
+        if hasattr(geom, 'coords'):
+            coord_count = len(list(geom.coords))
+        else:
+            coord_count = 0
+            
+        return hash((bounds, geom_type, coord_count))
+    except Exception:
+        if hasattr(geom, 'wkt'):
+            return hash(geom.wkt)
+        else:
+            return hash(str(geom))
+
+def geometry_to_draw_commands_optimized(geom, color, tags, zoom, tile_x, tile_y, 
+                                       simplify_tolerance=None, hex_color=None):
+
+    mm = get_memory_manager()
+    
+    geom_key = optimized_geometry_hash(geom)
+    
+    cached_commands = mm.get_geometry_from_cache(geom_key)
+    if cached_commands is not None:
+        result_commands = []
+        for cached_cmd in cached_commands:
+            cmd = mm.get_command()
+            cmd.update(cached_cmd)  
+            cmd['color'] = color
+            if hex_color:
+                cmd['color_hex'] = hex_color
+            result_commands.append(cmd)
+        return result_commands
+    
+    result_commands = []
+    
+    def process_geom(g):
+        if g.is_empty:
+            return
+            
+        if g.geom_type == "Polygon":
+            coord_list = mm.get_coord_list()
+            try:
+                exterior = list(g.exterior.coords)
+                exterior = remove_duplicate_points(exterior)
+                exterior_pixels = coords_to_pixel_coords_uint16_optimized(exterior, zoom, tile_x, tile_y)
+                exterior_pixels = ensure_closed_ring(exterior_pixels)
+                
+                if len(set(exterior_pixels)) >= 3:
+                    cmd = mm.get_command()
+                    cmd.update({
+                        'type': DRAW_COMMANDS['STROKE_POLYGON'], 
+                        'points': exterior_pixels, 
+                        'color': color
+                    })
+                    if hex_color:
+                        cmd['color_hex'] = hex_color
+                    result_commands.append(cmd)
+            finally:
+                mm.release_coord_list(coord_list)
+                
+        elif g.geom_type == "MultiPolygon":
+            for poly in g.geoms:
+                process_geom(poly)
+                
+        elif g.geom_type == "LineString":
+            coord_list = mm.get_coord_list()
+            try:
+                coords = remove_duplicate_points(list(g.coords))
+                if len(coords) < 2:
+                    return
+                    
+                pixel_coords = remove_duplicate_points(
+                    coords_to_pixel_coords_uint16(coords, zoom, tile_x, tile_y)
+                )
+                if len(pixel_coords) < 2:
+                    return
+                    
+                is_closed = coords[0] == coords[-1]
+                if is_closed and is_area(tags):
+                    if len(set(pixel_coords)) >= 3:
+                        cmd = mm.get_command()
+                        cmd.update({
+                            'type': DRAW_COMMANDS['STROKE_POLYGON'], 
+                            'points': pixel_coords, 
+                            'color': color
+                        })
+                        if hex_color:
+                            cmd['color_hex'] = hex_color
+                        result_commands.append(cmd)
+                else:
+                    if len(pixel_coords) == 2:
+                        x1, y1 = pixel_coords[0]
+                        x2, y2 = pixel_coords[1]
+                        cmd = mm.get_command()
+                        cmd['color'] = color
+                        if hex_color:
+                            cmd['color_hex'] = hex_color
+                        
+                        if y1 == y2:
+                            cmd.update({
+                                'type': DRAW_COMMANDS['HORIZONTAL_LINE'], 
+                                'x1': x1, 'x2': x2, 'y': y1
+                            })
+                        elif x1 == x2:
+                            cmd.update({
+                                'type': DRAW_COMMANDS['VERTICAL_LINE'], 
+                                'x': x1, 'y1': y1, 'y2': y2
+                            })
+                        else:
+                            cmd.update({
+                                'type': DRAW_COMMANDS['LINE'], 
+                                'x1': x1, 'y1': y1, 'x2': x2, 'y2': y2
+                            })
+                        result_commands.append(cmd)
+                    else:
+                        cmd = mm.get_command()
+                        cmd.update({
+                            'type': DRAW_COMMANDS['POLYLINE'], 
+                            'points': pixel_coords, 
+                            'color': color
+                        })
+                        if hex_color:
+                            cmd['color_hex'] = hex_color
+                        result_commands.append(cmd)
+            finally:
+                mm.release_coord_list(coord_list)
+                
+        elif g.geom_type == "MultiLineString":
+            for linestring in g.geoms:
+                process_geom(linestring)
+        elif g.geom_type == "GeometryCollection":
+            for subgeom in g.geoms:
+                process_geom(subgeom)
+    
+    if hasattr(geom, "is_valid") and not geom.is_empty:
+        process_geom(geom)
+    
+    if result_commands:
+        cache_commands = []
+        for cmd in result_commands:
+            cache_cmd = {k: v for k, v in cmd.items() if k not in ['color', 'color_hex']}
+            cache_commands.append(cache_cmd)
+        mm.put_geometry_in_cache(geom_key, cache_commands)
+    
+    return result_commands
+
+def coords_to_pixel_coords_uint16_optimized(coords, zoom, tile_x, tile_y):
+
+    mm = get_memory_manager()
+    point_list = mm.get_point_list()
+    
+    try:
+        for lon, lat in coords:
+            px_global, py_global = deg2pixel(lat, lon, zoom)
+            x = (px_global - tile_x * TILE_SIZE) * (UINT16_TILE_SIZE - 1) / (TILE_SIZE - 1)
+            y = ((py_global - tile_y * TILE_SIZE) * (UINT16_TILE_SIZE - 1) / (TILE_SIZE - 1))
+            x = int(round(x))
+            y = int(round(y))
+            x = max(0, min(UINT16_TILE_SIZE - 1, x))
+            y = max(0, min(UINT16_TILE_SIZE - 1, y))
+            point_list.append((x, y))
+        
+        result = list(point_list)
+        return result
+    finally:
+        mm.release_point_list(point_list)
+
+
+
+
 
 def extract_layer_to_tmpfile(args):
     layer, i, layers, geojson_file, pbf_file, config, LAYER_FIELDS, config_fields = args
@@ -1037,108 +1568,122 @@ def ensure_closed_ring(ring):
     return ring
 
 def geometry_to_draw_commands(geom, color, tags, zoom, tile_x, tile_y, simplify_tolerance=None, hex_color=None):
-    global COMMAND_POOL, GEOMETRY_CACHE
+
+    mm = get_memory_manager()
     
-    # Try geometry deduplication for performance
-    geom_key = None
-    if hasattr(geom, 'wkt'):
-        geom_key = hash(geom.wkt)
-        if geom_key in GEOMETRY_CACHE:
-            cached_commands = GEOMETRY_CACHE[geom_key].copy()
-            # Update colors for cached commands
-            for cmd in cached_commands:
-                cmd['color'] = color
-                if hex_color:
-                    cmd['color_hex'] = hex_color
-            return cached_commands
+    geom_key = optimized_geometry_hash(geom)
     
-    COMMAND_POOL.clear()  # Reuse command pool
+    cached_commands = mm.get_geometry_from_cache(geom_key)
+    if cached_commands is not None:
+        result_commands = []
+        for cached_cmd in cached_commands:
+            cmd = mm.get_command()
+            cmd.update(cached_cmd)  
+            cmd['color'] = color
+            if hex_color:
+                cmd['color_hex'] = hex_color
+            result_commands.append(cmd)
+        return result_commands
+    
+    result_commands = [] 
     
     def process_geom(g):
         if g.is_empty:
             return
+            
         if g.geom_type == "Polygon":
             exterior = remove_duplicate_points(list(g.exterior.coords))
-            exterior_pixels = coords_to_pixel_coords_uint16(exterior, zoom, tile_x, tile_y)
+            exterior_pixels = coords_to_pixel_coords_uint16_optimized(exterior, zoom, tile_x, tile_y)
             exterior_pixels = ensure_closed_ring(exterior_pixels)
             if len(set(exterior_pixels)) >= 3:
-                cmd = {
+                cmd = mm.get_command() 
+                cmd.update({
                     'type': DRAW_COMMANDS['STROKE_POLYGON'], 
                     'points': exterior_pixels, 
                     'color': color
-                }
+                })
                 if hex_color:
                     cmd['color_hex'] = hex_color
-                COMMAND_POOL.append(cmd)
+                result_commands.append(cmd)  
+                
         elif g.geom_type == "MultiPolygon":
             for poly in g.geoms:
                 exterior = remove_duplicate_points(list(poly.exterior.coords))
-                exterior_pixels = coords_to_pixel_coords_uint16(exterior, zoom, tile_x, tile_y)
+                exterior_pixels = coords_to_pixel_coords_uint16_optimized(exterior, zoom, tile_x, tile_y)
                 exterior_pixels = ensure_closed_ring(exterior_pixels)
                 if len(set(exterior_pixels)) >= 3:
-                    cmd = {
+                    cmd = mm.get_command() 
+                    cmd.update({
                         'type': DRAW_COMMANDS['STROKE_POLYGON'], 
                         'points': exterior_pixels, 
                         'color': color
-                    }
+                    })
                     if hex_color:
                         cmd['color_hex'] = hex_color
-                    COMMAND_POOL.append(cmd)
+                    result_commands.append(cmd)
+                    
         elif g.geom_type == "LineString":
             coords = remove_duplicate_points(list(g.coords))
             if len(coords) < 2:
                 return
-            pixel_coords = remove_duplicate_points(coords_to_pixel_coords_uint16(coords, zoom, tile_x, tile_y))
+                
+            pixel_coords = remove_duplicate_points(
+                coords_to_pixel_coords_uint16_optimized(coords, zoom, tile_x, tile_y)
+            )
             if len(pixel_coords) < 2:
                 return
+                
             is_closed = coords[0] == coords[-1]
             if is_closed and is_area(tags):
                 if len(set(pixel_coords)) >= 3:
-                    cmd = {
+                    cmd = mm.get_command() 
+                    cmd.update({
                         'type': DRAW_COMMANDS['STROKE_POLYGON'], 
                         'points': pixel_coords, 
                         'color': color
-                    }
+                    })
                     if hex_color:
                         cmd['color_hex'] = hex_color
-                    COMMAND_POOL.append(cmd)
+                    result_commands.append(cmd)
             else:
                 if len(pixel_coords) == 2:
                     x1, y1 = pixel_coords[0]
                     x2, y2 = pixel_coords[1]
-                    cmd_data = {'color': color}
+                    cmd = mm.get_command()  
+                    cmd['color'] = color
                     if hex_color:
-                        cmd_data['color_hex'] = hex_color
+                        cmd['color_hex'] = hex_color
                     
                     if y1 == y2:
-                        cmd_data.update({
+                        cmd.update({
                             'type': DRAW_COMMANDS['HORIZONTAL_LINE'], 
                             'x1': x1, 'x2': x2, 'y': y1
                         })
-                        COMMAND_POOL.append(cmd_data)
                     elif x1 == x2:
-                        cmd_data.update({
+                        cmd.update({
                             'type': DRAW_COMMANDS['VERTICAL_LINE'], 
                             'x': x1, 'y1': y1, 'y2': y2
                         })
-                        COMMAND_POOL.append(cmd_data)
                     else:
-                        cmd_data.update({
+                        cmd.update({
                             'type': DRAW_COMMANDS['LINE'], 
                             'x1': x1, 'y1': y1, 'x2': x2, 'y2': y2
                         })
-                        COMMAND_POOL.append(cmd_data)
+                    result_commands.append(cmd)
                 else:
-                    cmd = {
+                    cmd = mm.get_command()  # Usar pool
+                    cmd.update({
                         'type': DRAW_COMMANDS['POLYLINE'], 
                         'points': pixel_coords, 
                         'color': color
-                    }
+                    })
                     if hex_color:
                         cmd['color_hex'] = hex_color
-                    COMMAND_POOL.append(cmd)
+                    result_commands.append(cmd)
+                    
                 if 'natural' in tags and tags['natural'] == 'coastline':
                     print("COASTLINE CMD:", pixel_coords)
+                    
         elif g.geom_type == "MultiLineString":
             for linestring in g.geoms:
                 process_geom(linestring)
@@ -1149,22 +1694,15 @@ def geometry_to_draw_commands(geom, color, tags, zoom, tile_x, tile_y, simplify_
     if hasattr(geom, "is_valid") and not geom.is_empty:
         process_geom(geom)
     
-    # Cache the result for deduplication (without colors)
-    if geom_key and len(COMMAND_POOL) > 0:
+    if result_commands:
         cache_commands = []
-        for cmd in COMMAND_POOL:
+        for cmd in result_commands:
             cache_cmd = {k: v for k, v in cmd.items() if k not in ['color', 'color_hex']}
             cache_commands.append(cache_cmd)
-        GEOMETRY_CACHE[geom_key] = cache_commands
         
-        # Limit cache size to prevent memory bloat
-        if len(GEOMETRY_CACHE) > 1000:
-            # Remove oldest entries (simple FIFO)
-            keys_to_remove = list(GEOMETRY_CACHE.keys())[:100]
-            for key in keys_to_remove:
-                del GEOMETRY_CACHE[key]
+        mm.put_geometry_in_cache(geom_key, cache_commands)
     
-    return list(COMMAND_POOL)  # Return copy
+    return result_commands  
 
 def get_layer_fields_from_pbf(pbf_file, layer):
     try:
@@ -1308,8 +1846,8 @@ def streaming_assign_features_to_tiles_by_zoom(geojson_file, config, output_dir,
         print(f"\n========== Processing zoom level {zoom} ==========")
         print(f"[Zoom {zoom}] Reading relevant features from GeoJSON...")
 
-        global GEOMETRY_CACHE
-        GEOMETRY_CACHE.clear()
+        mm = get_memory_manager()
+        mm.geometry_cache.reset_session_stats()
 
         valid_tags = zoom_to_valid_tags[zoom]
         tile_buffers = defaultdict(list)
@@ -1369,6 +1907,7 @@ def streaming_assign_features_to_tiles_by_zoom(geojson_file, config, output_dir,
                         except Exception:
                             continue
                         if not clipped_geom.is_empty:
+                            # CORREGIDO: Usar nombre de función original
                             cmds = geometry_to_draw_commands(
                                 clipped_geom, color, tags, zoom, xt, yt,
                                 simplify_tolerance=simplify_tolerance, hex_color=hex_color
@@ -1387,7 +1926,7 @@ def streaming_assign_features_to_tiles_by_zoom(geojson_file, config, output_dir,
         total_feature_optimizations = 0
         total_advanced_optimizations = {}
 
-        tile_bin_sizes = []  # <-- Añadido: lista para los tamaños de los bin
+        tile_bin_sizes = []
         with tqdm(total=len(tile_buffers), desc=f"[Zoom {zoom}] Creating optimized tiles") as pbar_tiles:
             for (xt, yt), cmds in tile_buffers.items():
                 tile_dir = os.path.join(output_dir, str(zoom), str(xt))
@@ -1406,14 +1945,13 @@ def streaming_assign_features_to_tiles_by_zoom(geojson_file, config, output_dir,
                 with open(filename, "wb") as fbin:
                     fbin.write(buffer)
                 size_bin = os.path.getsize(filename)
-                tile_bin_sizes.append(size_bin)  # <-- Guardamos tamaño del bin
+                tile_bin_sizes.append(size_bin)
                 if bytes_saved > 0:
                     tiles_optimized += 1
                     total_bytes_saved += bytes_saved
                 total_tiles_processed += 1
                 pbar_tiles.update(1)
 
-        # Cálculo de tamaños y estadísticas del directorio de ese zoom
         dir_zoom = os.path.join(output_dir, str(zoom))
         total_dir_size = 0
         for dirpath, dirnames, filenames in os.walk(dir_zoom):
@@ -1445,7 +1983,10 @@ def streaming_assign_features_to_tiles_by_zoom(geojson_file, config, output_dir,
         print(f"  - Tiles with palette optimization: {tiles_optimized}/{total_tiles_processed} ({optimization_ratio:.1f}%)")
         print(f"  - Total bytes saved (palette): {total_bytes_saved} bytes")
         print(f"  - Average savings per tile: {avg_savings_per_tile:.1f} bytes")
-        print(f"  - Geometry cache entries: {len(GEOMETRY_CACHE)}")
+        
+        cache_stats = mm.geometry_cache.stats()
+        print(f"  - Geometry cache entries: {cache_stats['size']}/{cache_stats['capacity']}")
+        
         print(f"  - Total directory size: {total_dir_size} bytes")
         print(f"  - Min bin size: {min_bin_size} bytes")
         print(f"  - Max bin size: {max_bin_size} bytes")
@@ -1474,7 +2015,15 @@ def streaming_assign_features_to_tiles_by_zoom(geojson_file, config, output_dir,
                 "Notes": notes[:68]
             })
 
-        print(f"[Zoom {zoom}] Tiles written with optimization pipeline .")
+        print(f"[Zoom {zoom}] Tiles written with optimization pipeline.")
+        
+        print(f"[Zoom {zoom}] Memory statistics:")
+        mm.print_stats()
+
+        if zoom < max(zoom_levels):
+            mm.command_pool.reset_stats()
+            mm.point_pool.reset_stats()
+            print(f"[Zoom {zoom}] Cache cleared for next zoom level\n")
 
 def print_summary_table(summary_stats):
     print('\n' + '+' + '-'*12 + '+' + '-'*21 + '+' + '-'*20 + '+' + '-'*17 + '+' + '-'*16 + '+' + '-'*16 + '+' + '-'*16 + '+' + '-'*19 + '+' + '-'*70 + '+')
@@ -1543,11 +2092,7 @@ def main():
     print("  - Tile boundary optimization")
 
     # Initialize performance optimization pools
-    global COMMAND_POOL, POINT_POOL, GEOMETRY_CACHE
-    COMMAND_POOL = []
-    POINT_POOL = []
-    GEOMETRY_CACHE = {}
-    print("Performance optimization pools initialized")
+    initialize_memory_manager()
 
     geojson_tmp = os.path.abspath("tmp_extract.geojson")
     total_features_to_merge = extract_geojson_from_pbf(args.pbf_file, geojson_tmp, config, zoom_levels)
@@ -1563,6 +2108,8 @@ def main():
     if os.path.exists(geojson_tmp):
         os.remove(geojson_tmp)
     gc.collect()
+
+    memory_manager.cleanup()
 
 if __name__ == "__main__":
     main()
