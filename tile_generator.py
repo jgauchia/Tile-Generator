@@ -22,6 +22,7 @@ import signal
 import atexit
 
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from typing import List, Dict, Tuple, Optional, Union, Set, Any, Iterator
 
 # Configure logging
 logging.basicConfig(
@@ -248,21 +249,21 @@ class FeatureDatabase:
         self.conn.commit()
 
 
-def deg2num(lat_deg, lon_deg, zoom):
+def deg2num(lat_deg: float, lon_deg: float, zoom: int) -> Tuple[int, int]:
     lat_rad = math.radians(lat_deg)
     n = 2.0 ** zoom
     xtile = int((lon_deg + 180.0) / 360.0 * n)
     ytile = int((1.0 - math.log(math.tan(lat_rad) + 1 / math.cos(lat_rad)) / math.pi) / 2.0 * n)
     return xtile, ytile
 
-def deg2pixel(lat_deg, lon_deg, zoom):
+def deg2pixel(lat_deg: float, lon_deg: float, zoom: int) -> Tuple[float, float]:
     lat_rad = math.radians(lat_deg)
     n = 2.0 ** zoom
     x = ((lon_deg + 180.0) / 360.0 * n * Config.TILE_SIZE)
     y = ((1.0 - math.log(math.tan(lat_rad) + 1 / math.cos(lat_rad)) / math.pi) / 2.0 * n * Config.TILE_SIZE)
     return x, y
 
-def coords_to_pixel_coords_uint16(coords, zoom, tile_x, tile_y):
+def coords_to_pixel_coords_uint16(coords: List[Tuple[float, float]], zoom: int, tile_x: int, tile_y: int) -> List[Tuple[int, int]]:
     pixel_coords = []
     for lon, lat in coords:
         px_global, py_global = deg2pixel(lat, lon, zoom)
@@ -275,7 +276,7 @@ def coords_to_pixel_coords_uint16(coords, zoom, tile_x, tile_y):
         pixel_coords.append((x, y))
     return pixel_coords
 
-def remove_duplicate_points(points):
+def remove_duplicate_points(points: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
     if len(points) <= 1:
         return points
     result = [points[0]]
@@ -284,7 +285,7 @@ def remove_duplicate_points(points):
             result.append(pt)
     return result
 
-def hex_to_rgb332_direct(hex_color):
+def hex_to_rgb332_direct(hex_color: str) -> int:
     try:
         if not hex_color or not isinstance(hex_color, str) or not hex_color.startswith("#"):
             return 0xFF
@@ -296,11 +297,11 @@ def hex_to_rgb332_direct(hex_color):
         # Invalid color format - use default white color
         return 0xFF
 
-def hex_to_color_index(hex_color):
+def hex_to_color_index(hex_color: str) -> Optional[int]:
     global GLOBAL_COLOR_PALETTE
     return GLOBAL_COLOR_PALETTE.get(hex_color, None)
 
-def get_style_for_tags(tags, config):
+def get_style_for_tags(tags: Dict[str, str], config: Dict[str, Any]) -> Tuple[Dict[str, Any], Optional[str]]:
     for k, v in tags.items():
         keyval = f"{k}={v}"
         if keyval in config:
@@ -310,7 +311,7 @@ def get_style_for_tags(tags, config):
             return config[k], k
     return {}, None
 
-def tile_latlon_bounds(tile_x, tile_y, zoom, pixel_margin=0):
+def tile_latlon_bounds(tile_x: int, tile_y: int, zoom: int, pixel_margin: int = 0) -> Tuple[float, float, float, float]:
     n = 2.0 ** zoom
     lon_min = tile_x / n * 360.0 - 180.0
     lat_rad1 = math.atan(math.sinh(math.pi * (1 - 2 * tile_y / n)))
@@ -628,7 +629,7 @@ def get_config_fields(config):
             fields.add(k)
     return fields
 
-def validate_pbf_file(pbf_file):
+def validate_pbf_file(pbf_file: str) -> None:
     """Validate PBF file exists and is readable"""
     if not os.path.exists(pbf_file):
         raise FileNotFoundError(f"PBF file not found: {pbf_file}")
@@ -649,7 +650,7 @@ def validate_pbf_file(pbf_file):
     
     logger.debug(f"PBF file validation passed: {pbf_file} ({file_size} bytes)")
 
-def validate_config_file(config_file):
+def validate_config_file(config_file: str) -> Dict[str, Any]:
     """Validate configuration file exists and is valid JSON"""
     if not os.path.exists(config_file):
         raise FileNotFoundError(f"Config file not found: {config_file}")
@@ -680,7 +681,7 @@ def validate_config_file(config_file):
     except json.JSONDecodeError as e:
         raise ValueError(f"Invalid JSON in config file {config_file}: {e}")
 
-def validate_output_dir(output_dir):
+def validate_output_dir(output_dir: str) -> None:
     """Validate output directory exists or can be created"""
     if os.path.exists(output_dir):
         if not os.path.isdir(output_dir):
@@ -697,7 +698,7 @@ def validate_output_dir(output_dir):
     
     logger.debug(f"Output directory validation passed: {output_dir}")
 
-def validate_zoom_range(zoom_str):
+def validate_zoom_range(zoom_str: str) -> List[int]:
     """Validate zoom range string and return zoom levels"""
     if not zoom_str:
         raise ValueError("Zoom range cannot be empty")
@@ -730,7 +731,7 @@ def validate_zoom_range(zoom_str):
     logger.debug(f"Zoom range validation passed: {zoom_levels}")
     return zoom_levels
 
-def validate_max_file_size(max_file_size_kb):
+def validate_max_file_size(max_file_size_kb: int) -> None:
     """Validate maximum file size parameter"""
     if not isinstance(max_file_size_kb, int):
         raise ValueError("Max file size must be an integer")
@@ -743,7 +744,7 @@ def validate_max_file_size(max_file_size_kb):
     
     logger.debug(f"Max file size validation passed: {max_file_size_kb} KB")
 
-def validate_db_path(db_path):
+def validate_db_path(db_path: str) -> None:
     """Validate database path"""
     if not db_path:
         raise ValueError("Database path cannot be empty")
@@ -761,7 +762,7 @@ def validate_db_path(db_path):
     
     logger.debug(f"Database path validation passed: {db_path}")
 
-def extract_layer_to_temp_file(pbf_file, layer, where_clause, select_fields):
+def extract_layer_to_temp_file(pbf_file: str, layer: str, where_clause: str, select_fields: str) -> str:
     """Extract layer data from PBF to temporary GeoJSON file"""
     tmp_filename = f"tmp_{layer}_{os.getpid()}{Config.GEOJSON_EXTENSION}"
     
@@ -791,7 +792,7 @@ def extract_layer_to_temp_file(pbf_file, layer, where_clause, select_fields):
     
     return tmp_filename
 
-def process_feature_for_zoom_levels(feat, config, config_fields, zoom_levels, db, batch_features):
+def process_feature_for_zoom_levels(feat: Dict[str, Any], config: Dict[str, Any], config_fields: Set[str], zoom_levels: List[int], db: 'FeatureDatabase', batch_features: List[Tuple[int, int, int, Dict[str, Any], int]]) -> int:
     """Process a single feature for all relevant zoom levels"""
     feat['properties'] = {k: v for k, v in feat['properties'].items() if k in config_fields}
     
@@ -873,7 +874,7 @@ def process_feature_for_zoom_levels(feat, config, config_fields, zoom_levels, db
     
     return features_added
 
-def process_layer_directly_to_database(pbf_file, layer, config, db, zoom_levels, config_fields, LAYER_FIELDS):
+def process_layer_directly_to_database(pbf_file: str, layer: str, config: Dict[str, Any], db: 'FeatureDatabase', zoom_levels: List[int], config_fields: Set[str], LAYER_FIELDS: Dict[str, Set[str]]) -> int:
     """Process a single layer directly from PBF to database"""
     possible = LAYER_FIELDS[layer]
     available = get_layer_fields_from_pbf(pbf_file, layer)
@@ -1050,7 +1051,7 @@ def write_tile_batch(batch, output_dir, zoom, max_file_size, simplify_tolerance)
     
     return tile_sizes
 
-def generate_tiles_from_database(db_path, output_dir, zoom, max_file_size=65536):
+def generate_tiles_from_database(db_path: str, output_dir: str, zoom: int, max_file_size: int = 65536) -> None:
     """Generate tiles for a specific zoom level from the database"""
     logger.info(f"Processing zoom level {zoom} from database")
     
@@ -1093,7 +1094,7 @@ def generate_tiles_from_database(db_path, output_dir, zoom, max_file_size=65536)
     db.close()
     gc.collect()
 
-def precompute_global_color_palette(config):
+def precompute_global_color_palette(config: Dict[str, Any]) -> int:
     global GLOBAL_COLOR_PALETTE, GLOBAL_INDEX_TO_RGB332
     
     logger.info("Analyzing colors from features.json to build dynamic palette")
@@ -1148,7 +1149,7 @@ def write_palette_bin(output_dir):
             fp.write(bytes([rgb332_val]))
     logger.info("Palette written successfully")
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(description="OSM vector tile generator (direct processing with database)")
     parser.add_argument("pbf_file", help="Path to .pbf file")
     parser.add_argument("output_dir", help="Output directory")
