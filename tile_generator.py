@@ -562,6 +562,139 @@ def get_config_fields(config):
             fields.add(k)
     return fields
 
+def validate_pbf_file(pbf_file):
+    """Validate PBF file exists and is readable"""
+    if not os.path.exists(pbf_file):
+        raise FileNotFoundError(f"PBF file not found: {pbf_file}")
+    
+    if not os.path.isfile(pbf_file):
+        raise ValueError(f"Path is not a file: {pbf_file}")
+    
+    if not pbf_file.lower().endswith('.pbf'):
+        raise ValueError(f"File must have .pbf extension: {pbf_file}")
+    
+    if not os.access(pbf_file, os.R_OK):
+        raise PermissionError(f"Cannot read PBF file: {pbf_file}")
+    
+    # Check file size (should not be empty)
+    file_size = os.path.getsize(pbf_file)
+    if file_size == 0:
+        raise ValueError(f"PBF file is empty: {pbf_file}")
+    
+    logger.debug(f"PBF file validation passed: {pbf_file} ({file_size} bytes)")
+
+def validate_config_file(config_file):
+    """Validate configuration file exists and is valid JSON"""
+    if not os.path.exists(config_file):
+        raise FileNotFoundError(f"Config file not found: {config_file}")
+    
+    if not os.path.isfile(config_file):
+        raise ValueError(f"Path is not a file: {config_file}")
+    
+    if not config_file.lower().endswith('.json'):
+        raise ValueError(f"Config file must have .json extension: {config_file}")
+    
+    if not os.access(config_file, os.R_OK):
+        raise PermissionError(f"Cannot read config file: {config_file}")
+    
+    # Try to parse JSON to validate format
+    try:
+        with open(config_file, 'r', encoding='utf-8') as f:
+            config = json.load(f)
+        
+        if not isinstance(config, dict):
+            raise ValueError("Config file must contain a JSON object")
+        
+        if not config:
+            raise ValueError("Config file cannot be empty")
+        
+        logger.debug(f"Config file validation passed: {config_file}")
+        return config
+        
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Invalid JSON in config file {config_file}: {e}")
+
+def validate_output_dir(output_dir):
+    """Validate output directory exists or can be created"""
+    if os.path.exists(output_dir):
+        if not os.path.isdir(output_dir):
+            raise ValueError(f"Output path exists but is not a directory: {output_dir}")
+        
+        if not os.access(output_dir, os.W_OK):
+            raise PermissionError(f"Cannot write to output directory: {output_dir}")
+    else:
+        try:
+            os.makedirs(output_dir, exist_ok=True)
+            logger.debug(f"Created output directory: {output_dir}")
+        except Exception as e:
+            raise PermissionError(f"Cannot create output directory {output_dir}: {e}")
+    
+    logger.debug(f"Output directory validation passed: {output_dir}")
+
+def validate_zoom_range(zoom_str):
+    """Validate zoom range string and return zoom levels"""
+    if not zoom_str:
+        raise ValueError("Zoom range cannot be empty")
+    
+    if "-" in zoom_str:
+        try:
+            start, end = map(int, zoom_str.split("-"))
+            if start < 0 or end < 0:
+                raise ValueError("Zoom levels cannot be negative")
+            if start > end:
+                raise ValueError("Start zoom level cannot be greater than end zoom level")
+            if end > 20:
+                raise ValueError("Zoom level cannot exceed 20")
+            zoom_levels = list(range(start, end + 1))
+        except ValueError as e:
+            if "invalid literal" in str(e):
+                raise ValueError(f"Invalid zoom range format: {zoom_str}. Use format like '6-17' or '12'")
+            raise
+    else:
+        try:
+            zoom = int(zoom_str)
+            if zoom < 0:
+                raise ValueError("Zoom level cannot be negative")
+            if zoom > 20:
+                raise ValueError("Zoom level cannot exceed 20")
+            zoom_levels = [zoom]
+        except ValueError:
+            raise ValueError(f"Invalid zoom level: {zoom_str}. Must be a number or range like '6-17'")
+    
+    logger.debug(f"Zoom range validation passed: {zoom_levels}")
+    return zoom_levels
+
+def validate_max_file_size(max_file_size_kb):
+    """Validate maximum file size parameter"""
+    if not isinstance(max_file_size_kb, int):
+        raise ValueError("Max file size must be an integer")
+    
+    if max_file_size_kb <= 0:
+        raise ValueError("Max file size must be positive")
+    
+    if max_file_size_kb > 10240:  # 10MB limit
+        raise ValueError("Max file size cannot exceed 10240 KB (10MB)")
+    
+    logger.debug(f"Max file size validation passed: {max_file_size_kb} KB")
+
+def validate_db_path(db_path):
+    """Validate database path"""
+    if not db_path:
+        raise ValueError("Database path cannot be empty")
+    
+    # Check if parent directory exists and is writable
+    parent_dir = os.path.dirname(os.path.abspath(db_path))
+    if parent_dir and not os.path.exists(parent_dir):
+        try:
+            os.makedirs(parent_dir, exist_ok=True)
+        except Exception as e:
+            raise PermissionError(f"Cannot create database directory {parent_dir}: {e}")
+    
+    if parent_dir and not os.access(parent_dir, os.W_OK):
+        raise PermissionError(f"Cannot write to database directory: {parent_dir}")
+    
+    logger.debug(f"Database path validation passed: {db_path}")
+
 def extract_layer_to_temp_file(pbf_file, layer, where_clause, select_fields):
     """Extract layer data from PBF to temporary GeoJSON file"""
     tmp_filename = f"tmp_{layer}_{os.getpid()}.geojson"
@@ -960,6 +1093,22 @@ def main():
     parser.add_argument("--db-path", help="Path for temporary database", default="features.db")
     args = parser.parse_args()
     
+    try:
+        # Validate all input parameters
+        logger.info("Validating input parameters...")
+        validate_pbf_file(args.pbf_file)
+        validate_output_dir(args.output_dir)
+        validate_db_path(args.db_path)
+        validate_max_file_size(args.max_file_size)
+        zoom_levels = validate_zoom_range(args.zoom)
+        config = validate_config_file(args.config_file)
+        
+        logger.info("All input parameters validated successfully")
+        
+    except (FileNotFoundError, ValueError, PermissionError) as e:
+        logger.error(f"Validation error: {e}")
+        sys.exit(1)
+    
     # Clean up any existing database file from previous runs
     if os.path.exists(args.db_path):
         try:
@@ -978,15 +1127,7 @@ def main():
         except Exception as e:
             logger.debug(f"Could not remove existing temporary file {temp_file}: {e}")
     
-    if "-" in args.zoom:
-        start, end = map(int, args.zoom.split("-"))
-        zoom_levels = list(range(start, end + 1))
-    else:
-        zoom_levels = [int(args.zoom)]
     max_file_size = args.max_file_size * 1024
-
-    with open(args.config_file, "r") as f:
-        config = json.load(f)
 
     # Pre-compute dynamic palette based on JSON
     palette_size = precompute_global_color_palette(config)
