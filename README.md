@@ -10,8 +10,7 @@ The generated tiles are extremely compact and optimized for fast rendering in cu
 
 - Extracts relevant geometries and attributes from OSM PBF files using `ogr2ogr` with parallel processing
 - Filters and merges data into simplified GeoJSON with streaming processing
-- **Builds dynamic color palette** automatically from `features.json` configuration  
-- **Detects feature types** for highway, building, waterway, and natural features
+- **Builds dynamic color palette** automatically from `features.json` configuration
 - **Memory-optimized processing** with single-pass feature reading for all zoom levels
 - **SQLite database storage** for efficient feature management and retrieval
 - Assigns features to tiles for zoom levels with boundary optimization
@@ -76,14 +75,13 @@ The script implements a set of drawing commands for efficient tile generation:
 - **Batch processing**: Configurable batch sizes to control memory usage
 - **Automatic cleanup**: Garbage collection and memory management
 
-### Intelligent Feature Detection
+### Dynamic Color Palette
 ```
-Analyzing features.json for feature-specific optimizations...
-Feature types detected for optimization:
-  ✓ highway
-  ✓ building  
-  ✓ waterway
-  ✓ natural
+Analyzing colors from features.json to build dynamic palette...
+Dynamic color palette created:
+  - Total unique colors: 24
+  - Palette indices: 0-23
+  - Memory saving potential: 24 colors -> compact indices
 ```
 
 ### Comprehensive Statistics
@@ -170,7 +168,6 @@ The script automatically detects feature types from your configuration:
 
 **Configuration Features:**
 - Colors automatically indexed into optimal palette
-- Feature types detected for processing
 - Zoom-based filtering reduces processing overhead
 - Priority-based rendering order optimization
 
@@ -180,12 +177,9 @@ The script automatically detects feature types from your configuration:
 
 ### Required Packages
 ```
-osmium
 shapely  
-fiona
 ijson
 tqdm
-psutil
 ```
 
 ### System Requirements
@@ -196,7 +190,7 @@ psutil
 ### Installation
 ```bash
 # Python packages
-pip install osmium shapely fiona ijson tqdm psutil
+pip install shapely ijson tqdm
 
 # GDAL (Ubuntu/Debian)
 sudo apt-get install gdal-bin
@@ -218,8 +212,7 @@ python tile_generator.py region.osm.pbf tiles/ features.json --zoom 13-17
 ```
 
 ### Custom Optimization Tuning
-- **Feature detection**: Script automatically detects optimization opportunities from your `features.json`
-- **Pattern recognition**: Advanced algorithms detect urban grids, circular features, and geometric patterns
+- **Color palette optimization**: Script automatically creates optimal color palette from your `features.json`
 - **Memory optimization**: Object pools and caches automatically managed for optimal performance
 - **Boundary optimization**: Cross-tile geometries automatically optimized to reduce duplication
 
