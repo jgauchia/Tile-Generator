@@ -174,7 +174,8 @@ def hex_to_rgb332_direct(hex_color):
         g = int(hex_color[3:5], 16)
         b = int(hex_color[5:7], 16)
         return ((r & 0xE0) | ((g & 0xE0) >> 3) | (b >> 6))
-    except Exception:
+    except (ValueError, TypeError) as e:
+        # Invalid color format - use default white color
         return 0xFF
 
 def hex_to_color_index(hex_color):
@@ -538,6 +539,7 @@ def process_layer_directly_to_database(pbf_file, layer, config, db, zoom_levels,
         
         result = subprocess.run(cmd, capture_output=True)
         if result.returncode != 0:
+            # ogr2ogr command failed - layer might be empty or invalid
             return 0
         
         # Process the temporary file immediately and delete it
@@ -558,7 +560,8 @@ def process_layer_directly_to_database(pbf_file, layer, config, db, zoom_levels,
                 
                 try:
                     geom = shape(feat['geometry'])
-                except Exception:
+                except (ValueError, TypeError) as e:
+                    # Invalid geometry data - skip this feature
                     continue
                     
                 if not geom.is_valid or geom.is_empty:
@@ -580,7 +583,8 @@ def process_layer_directly_to_database(pbf_file, layer, config, db, zoom_levels,
                     if simplify_tolerance is not None and geom.geom_type in ("LineString", "MultiLineString"):
                         try:
                             feature_geom = feature_geom.simplify(simplify_tolerance, preserve_topology=True)
-                        except Exception:
+                        except (ValueError, TypeError) as e:
+                            # Geometry simplification failed - use original geometry
                             pass
                     
                     if feature_geom.is_empty or not feature_geom.is_valid:
@@ -599,7 +603,8 @@ def process_layer_directly_to_database(pbf_file, layer, config, db, zoom_levels,
                             
                             try:
                                 clipped_geom = feature_geom.intersection(tile_bbox)
-                            except Exception:
+                            except (ValueError, TypeError) as e:
+                                # Geometry intersection failed - skip this tile
                                 continue
                             
                             if not clipped_geom.is_empty:
