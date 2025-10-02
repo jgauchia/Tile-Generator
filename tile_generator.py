@@ -1,6 +1,4 @@
 #!/usr/bin/env python3
-import osmium
-import shapely.wkb as wkblib
 from shapely.geometry import (
     LineString, MultiLineString, Polygon, MultiPolygon, GeometryCollection, box, shape
 )
@@ -8,31 +6,18 @@ import math
 import struct
 import json
 import os
-import shutil
-from collections import defaultdict, Counter
+from collections import Counter
 from tqdm import tqdm
 import argparse
-import tempfile
 import subprocess
 import sys
-import fiona
 import gc
-import threading
 import time
 import sqlite3
 import pickle
-import hashlib
 
 import ijson
-import decimal
 
-import gc
-import psutil
-import threading
-from collections import OrderedDict
-from threading import RLock
-import sys
-import weakref
 
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
@@ -64,14 +49,6 @@ UINT16_TILE_SIZE = 65536
 GLOBAL_COLOR_PALETTE = {}  # hex_color -> index
 GLOBAL_INDEX_TO_RGB332 = {}  # index -> rgb332_value
 
-# Global variables for feature detection
-DETECTED_FEATURE_TYPES = set()  # highway, building, waterway, etc.
-
-# Step 6: Advanced compression globals
-COMMAND_FREQUENCY = Counter()  # For Huffman encoding
-HUFFMAN_CODES = {}  # command_type -> encoded_bits
-COORDINATE_PREDICTORS = {}  # For coordinate prediction
-PATTERN_CACHE = {}  # For pattern detection cache
 
 # Database configuration for feature storage
 DB_BATCH_SIZE = 10000
@@ -152,10 +129,6 @@ class FeatureDatabase:
         """Commit pending transactions"""
         self.conn.commit()
 
-def decimal_default(obj):
-    if isinstance(obj, decimal.Decimal):
-        return float(obj)
-    raise TypeError
 
 def deg2num(lat_deg, lon_deg, zoom):
     lat_rad = math.radians(lat_deg)
@@ -878,41 +851,6 @@ def precompute_global_color_palette(config):
     
     return len(unique_colors)
 
-def detect_feature_types(config):
-    global DETECTED_FEATURE_TYPES
-    
-    print("\nAnalyzing features.json for feature-specific optimizations...")
-    
-    feature_types = set()
-    
-    for feature_key, feature_config in config.items():
-        if isinstance(feature_config, dict):
-            # Detect highways/roads
-            if any(keyword in feature_key.lower() for keyword in ['highway', 'road', 'street', 'primary', 'secondary', 'trunk', 'motorway']):
-                feature_types.add('highway')
-            
-            # Detect buildings
-            if any(keyword in feature_key.lower() for keyword in ['building', 'residential', 'commercial', 'industrial']):
-                feature_types.add('building')
-            
-            # Detect waterways
-            if any(keyword in feature_key.lower() for keyword in ['waterway', 'river', 'stream', 'canal']):
-                feature_types.add('waterway')
-            
-            # Detect natural features
-            if any(keyword in feature_key.lower() for keyword in ['natural', 'landuse', 'forest', 'park']):
-                feature_types.add('natural')
-    
-    DETECTED_FEATURE_TYPES = feature_types
-    
-    print(f"Feature types detected for optimization:")
-    for ftype in sorted(feature_types):
-        print(f"  ✓ {ftype}")
-    
-    if not feature_types:
-        print("  → No specific feature types detected, using general optimizations")
-    
-    return feature_types
 
 def write_palette_bin(output_dir):
     os.makedirs(output_dir, exist_ok=True)
@@ -949,10 +887,6 @@ def main():
     print(f"\nDynamic palette ready with {palette_size} colors from your features.json")
 
     write_palette_bin(args.output_dir)
-    
-    # Detect feature types for specific optimizations
-    feature_types = detect_feature_types(config)
-    print(f"Ready for feature-specific optimizations: {', '.join(sorted(feature_types)) if feature_types else 'general optimization only'}")
 
     # Process features directly from PBF to database (no intermediate GeoJSON)
     process_pbf_directly_to_database(args.pbf_file, config, args.db_path, zoom_levels)
