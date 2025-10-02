@@ -17,9 +17,61 @@ import sqlite3
 import pickle
 
 import ijson
-
+import logging
+import signal
+import atexit
 
 from concurrent.futures import ProcessPoolExecutor, as_completed
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(message)s'
+)
+logger = logging.getLogger(__name__)
+
+
+# Global variables to track files for cleanup
+_db_file_to_cleanup = None
+_temp_files_to_cleanup = set()
+
+def cleanup_database():
+    """Clean up database file if it exists"""
+    global _db_file_to_cleanup
+    if _db_file_to_cleanup and os.path.exists(_db_file_to_cleanup):
+        try:
+            os.remove(_db_file_to_cleanup)
+            logger.debug(f"Cleaned up database file: {_db_file_to_cleanup}")
+        except Exception as e:
+            logger.debug(f"Could not remove database file {_db_file_to_cleanup}: {e}")
+
+def cleanup_temp_files():
+    """Clean up temporary files if they exist"""
+    global _temp_files_to_cleanup
+    for temp_file in list(_temp_files_to_cleanup):
+        if os.path.exists(temp_file):
+            try:
+                os.remove(temp_file)
+                logger.debug(f"Cleaned up temporary file: {temp_file}")
+            except Exception as e:
+                logger.debug(f"Could not remove temporary file {temp_file}: {e}")
+    _temp_files_to_cleanup.clear()
+
+def cleanup_all():
+    """Clean up all tracked files"""
+    cleanup_database()
+    cleanup_temp_files()
+
+def signal_handler(signum, frame):
+    """Handle interrupt signals to ensure cleanup"""
+    logger.info("Script interrupted - cleaning up...")
+    cleanup_all()
+    sys.exit(1)
+
+# Register cleanup functions
+atexit.register(cleanup_all)
+signal.signal(signal.SIGINT, signal_handler)   # Ctrl+C
+signal.signal(signal.SIGTERM, signal_handler) # Termination signal
 
 max_workers = min(os.cpu_count() or 4, 4)
 
@@ -525,6 +577,10 @@ def process_layer_directly_to_database(pbf_file, layer, config, db, zoom_levels,
     # Create temporary file in current working directory
     tmp_filename = f"tmp_{layer}_{os.getpid()}.geojson"
     
+    # Register temporary file for cleanup
+    global _temp_files_to_cleanup
+    _temp_files_to_cleanup.add(tmp_filename)
+    
     try:
         cmd = [
             "ogr2ogr",
@@ -642,10 +698,15 @@ def process_layer_directly_to_database(pbf_file, layer, config, db, zoom_levels,
         # Always clean up the temporary file
         if os.path.exists(tmp_filename):
             os.remove(tmp_filename)
+        # Remove from tracking set since we cleaned it up manually
+        _temp_files_to_cleanup.discard(tmp_filename)
 
 def process_pbf_directly_to_database(pbf_file, config, db_path, zoom_levels):
     """Process PBF directly to database with minimal temporary files"""
-    print("Processing PBF directly to database (minimal temporary files)...")
+    global _db_file_to_cleanup
+    _db_file_to_cleanup = db_path  # Register for cleanup
+    
+    logger.info("Processing PBF directly to database (minimal temporary files)")
     
     db = FeatureDatabase(db_path)
     config_fields = get_config_fields(config)
@@ -667,30 +728,30 @@ def process_pbf_directly_to_database(pbf_file, config, db_path, zoom_levels):
     }
     
     layers = ["points", "lines", "multilinestrings", "multipolygons", "other_relations"]
-    print(f"Config requires these fields: {', '.join(sorted(config_fields))}")
+    logger.info(f"Config requires these fields: {', '.join(sorted(config_fields))}")
     
     total_features_processed = 0
     
     # Process each layer separately and immediately clean up
     for i, layer in enumerate(layers):
-        print(f"[{i+1}/{len(layers)}] Processing layer: {layer} directly to database...")
+        logger.info(f"[{i+1}/{len(layers)}] Processing layer: {layer} directly to database")
         
         layer_features = process_layer_directly_to_database(
             pbf_file, layer, config, db, zoom_levels, config_fields, LAYER_FIELDS
         )
         
         total_features_processed += layer_features
-        print(f"Layer {layer}: {layer_features} features processed")
+        logger.info(f"Layer {layer}: {layer_features} features processed")
         
         # Force garbage collection after each layer
         gc.collect()
     
-    print(f"Total processed: {total_features_processed} features directly from PBF")
+    logger.info(f"Total processed: {total_features_processed} features directly from PBF")
     
     # Print statistics for each zoom level
     for zoom in zoom_levels:
         count = db.count_features_for_zoom(zoom)
-        print(f"Zoom {zoom}: {count} features stored")
+        logger.info(f"Zoom {zoom}: {count} features stored")
     
     db.close()
     gc.collect()
@@ -772,18 +833,18 @@ def write_tile_batch(batch, output_dir, zoom, max_file_size, simplify_tolerance)
 
 def generate_tiles_from_database(db_path, output_dir, zoom, max_file_size=65536):
     """Generate tiles for a specific zoom level from the database"""
-    print(f"\n=== Processing zoom level {zoom} from database ===")
+    logger.info(f"Processing zoom level {zoom} from database")
     
     db = FeatureDatabase(db_path)
     
     # Get all tiles for this zoom level
     tiles = db.get_tiles_for_zoom(zoom)
     if not tiles:
-        print(f"No tiles found for zoom {zoom}")
+        logger.warning(f"No tiles found for zoom {zoom}")
         db.close()
         return
     
-    print(f"Found {len(tiles)} tiles for zoom {zoom}")
+    logger.info(f"Found {len(tiles)} tiles for zoom {zoom}")
     
     # Process tiles in batches
     all_tile_sizes = []
@@ -817,7 +878,7 @@ def generate_tiles_from_database(db_path, output_dir, zoom, max_file_size=65536)
 def precompute_global_color_palette(config):
     global GLOBAL_COLOR_PALETTE, GLOBAL_INDEX_TO_RGB332
     
-    print("Analyzing colors from features.json to build dynamic palette...")
+    logger.info("Analyzing colors from features.json to build dynamic palette")
     
     # Extract all unique colors from JSON
     unique_colors = set()
@@ -839,20 +900,22 @@ def precompute_global_color_palette(config):
         GLOBAL_COLOR_PALETTE[hex_color] = index
         GLOBAL_INDEX_TO_RGB332[index] = rgb332_value
     
-    print(f"Dynamic color palette created:")
-    print(f"  - Total unique colors: {len(unique_colors)}")
-    print(f"  - Palette indices: 0-{len(unique_colors)-1}")
-    print(f"  - Memory saving potential: {len(unique_colors)} colors -> compact indices")
+    logger.info(f"Dynamic color palette created:")
+    logger.info(f"  - Total unique colors: {len(unique_colors)}")
+    logger.info(f"  - Palette indices: 0-{len(unique_colors)-1}")
+    logger.info(f"  - Memory saving potential: {len(unique_colors)} colors -> compact indices")
     
     # Show some examples
     examples = list(sorted_colors)[:5]
     for hex_color in examples:
         index = GLOBAL_COLOR_PALETTE[hex_color]
         rgb332 = GLOBAL_INDEX_TO_RGB332[index]
-        print(f"    {hex_color} -> index {index} -> RGB332 {rgb332}")
+        # Color mapping details (debug level)
+        pass
     
     if len(unique_colors) > 5:
-        print(f"    ... and {len(unique_colors) - 5} more colors")
+        # Additional colors info (debug level)
+        pass
     
     return len(unique_colors)
 
@@ -860,12 +923,12 @@ def precompute_global_color_palette(config):
 def write_palette_bin(output_dir):
     os.makedirs(output_dir, exist_ok=True)
     palette_path = os.path.join(output_dir, "palette.bin")
-    print(f"Writing palette to {palette_path} ({len(GLOBAL_INDEX_TO_RGB332)} colors)...")
+    logger.info(f"Writing palette to {palette_path} ({len(GLOBAL_INDEX_TO_RGB332)} colors)")
     with open(palette_path, "wb") as fp:
         for idx in range(len(GLOBAL_INDEX_TO_RGB332)):
             rgb332_val = GLOBAL_INDEX_TO_RGB332[idx]
             fp.write(bytes([rgb332_val]))
-    print("Palette written OK.")
+    logger.info("Palette written successfully")
 
 def main():
     parser = argparse.ArgumentParser(description="OSM vector tile generator (direct processing with database)")
@@ -876,6 +939,24 @@ def main():
     parser.add_argument("--max-file-size", help="Maximum file size in KB", type=int, default=128)
     parser.add_argument("--db-path", help="Path for temporary database", default="features.db")
     args = parser.parse_args()
+    
+    # Clean up any existing database file from previous runs
+    if os.path.exists(args.db_path):
+        try:
+            os.remove(args.db_path)
+            logger.debug(f"Removed existing database file: {args.db_path}")
+        except Exception as e:
+            logger.debug(f"Could not remove existing database file {args.db_path}: {e}")
+    
+    # Clean up any existing temporary files from previous runs
+    import glob
+    existing_temp_files = glob.glob("tmp_*.geojson")
+    for temp_file in existing_temp_files:
+        try:
+            os.remove(temp_file)
+            logger.debug(f"Removed existing temporary file: {temp_file}")
+        except Exception as e:
+            logger.debug(f"Could not remove existing temporary file {temp_file}: {e}")
     
     if "-" in args.zoom:
         start, end = map(int, args.zoom.split("-"))
@@ -889,7 +970,7 @@ def main():
 
     # Pre-compute dynamic palette based on JSON
     palette_size = precompute_global_color_palette(config)
-    print(f"\nDynamic palette ready with {palette_size} colors from your features.json")
+    logger.info(f"Dynamic palette ready with {palette_size} colors from your features.json")
 
     write_palette_bin(args.output_dir)
 
@@ -901,11 +982,10 @@ def main():
         generate_tiles_from_database(args.db_path, args.output_dir, zoom, max_file_size)
         gc.collect()
     
-    print("\nProcess completed successfully.")
+    logger.info("Process completed successfully")
 
-    # Cleanup
-    if os.path.exists(args.db_path):
-        os.remove(args.db_path)
+    # File cleanup is handled automatically by atexit and signal handlers
+    cleanup_all()
     
     del config
     gc.collect()
