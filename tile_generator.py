@@ -152,49 +152,10 @@ class FeatureDatabase:
         """Commit pending transactions"""
         self.conn.commit()
 
-def extract_layer_to_tmpfile(args):
-    layer, i, layers, geojson_file, pbf_file, config, LAYER_FIELDS, config_fields = args
-    logs = []
-    possible = LAYER_FIELDS[layer]
-    available = get_layer_fields_from_pbf(pbf_file, layer)
-    allowed = possible & available & config_fields
-    where_clause = build_ogr2ogr_where_clause_from_config(config, allowed)
-    if not where_clause:
-        logs.append(f"Skipping layer {layer}: no matching fields in config/PBF.")
-        return None, logs
-    logs.append(f"[{i+1}/{len(layers)}] Extracted layer: {layer} (fields: {', '.join(sorted(allowed))})")
-    tmp_layer_file = f"{geojson_file}_{layer}.tmp"
-    if os.path.exists(tmp_layer_file):
-        os.remove(tmp_layer_file)
-    select_fields = ",".join(sorted(allowed))
-    cmd = [
-        "ogr2ogr",
-        "-f", "GeoJSON",
-        "-nlt", "PROMOTE_TO_MULTI",
-        "-where", where_clause,
-        "-select", select_fields,
-        tmp_layer_file,
-        pbf_file,
-        layer
-    ]
-    result = subprocess.run(cmd, capture_output=True)
-    if result.returncode != 0:
-        logs.append(f"Error running ogr2ogr for layer {layer}: {result.stderr.decode()}")
-        return None, logs
-    
-    gc.collect()
-    return tmp_layer_file, logs
-
 def decimal_default(obj):
     if isinstance(obj, decimal.Decimal):
         return float(obj)
     raise TypeError
-
-def read_tmp_geojson_features_stream(tmp_file, config_fields):
-    with open(tmp_file, "r", encoding="utf-8") as f:
-        for feat in ijson.items(f, "features.item"):
-            feat['properties'] = {k: v for k, v in feat['properties'].items() if k in config_fields}
-            yield feat
 
 def deg2num(lat_deg, lon_deg, zoom):
     lat_rad = math.radians(lat_deg)
@@ -246,53 +207,6 @@ def hex_to_rgb332_direct(hex_color):
 def hex_to_color_index(hex_color):
     global GLOBAL_COLOR_PALETTE
     return GLOBAL_COLOR_PALETTE.get(hex_color, None)
-
-def insert_palette_commands(commands):
-    if not commands:
-        return commands, 0
-    
-    result = []
-    current_color_index = None
-    color_commands_inserted = 0
-    
-    for cmd in commands:
-        cmd_color_hex = cmd.get('color_hex')  # We need the original hex
-        cmd_color_rgb332 = cmd.get('color')   # RGB332 for fallback
-        
-        # Try using palette first
-        color_index = hex_to_color_index(cmd_color_hex) if cmd_color_hex else None
-        
-        if color_index is not None:
-            # Use optimized palette
-            if color_index != current_color_index:
-                result.append({
-                    'type': DRAW_COMMANDS['SET_COLOR_INDEX'], 
-                    'color_index': color_index
-                })
-                current_color_index = color_index
-                color_commands_inserted += 1
-        else:
-            # Fallback to direct SET_COLOR
-            if cmd_color_rgb332 != current_color_index:  # Reset current_color_index
-                result.append({
-                    'type': DRAW_COMMANDS['SET_COLOR'], 
-                    'color': cmd_color_rgb332
-                })
-                current_color_index = cmd_color_rgb332
-                color_commands_inserted += 1
-        
-        # Add command without color fields
-        cmd_copy = {k: v for k, v in cmd.items() if k not in ['color', 'color_hex']}
-        result.append(cmd_copy)
-    
-    # Calculate real savings
-    original_commands = len(commands)
-    optimized_commands = len(result)
-    colors_removed = original_commands  # Each original command had a color
-    colors_added = color_commands_inserted  # SET_COLOR* commands added
-    net_savings = colors_removed - colors_added  # Net savings in bytes
-    
-    return result, net_savings
 
 def get_style_for_tags(tags, config):
     for k, v in tags.items():
@@ -371,6 +285,53 @@ def pack_varint(n):
 
 def pack_zigzag(n):
     return pack_varint((n << 1) ^ (n >> 31))
+
+def insert_palette_commands(commands):
+    if not commands:
+        return commands, 0
+    
+    result = []
+    current_color_index = None
+    color_commands_inserted = 0
+    
+    for cmd in commands:
+        cmd_color_hex = cmd.get('color_hex')  # We need the original hex
+        cmd_color_rgb332 = cmd.get('color')   # RGB332 for fallback
+        
+        # Try using palette first
+        color_index = hex_to_color_index(cmd_color_hex) if cmd_color_hex else None
+        
+        if color_index is not None:
+            # Use optimized palette
+            if color_index != current_color_index:
+                result.append({
+                    'type': DRAW_COMMANDS['SET_COLOR_INDEX'], 
+                    'color_index': color_index
+                })
+                current_color_index = color_index
+                color_commands_inserted += 1
+        else:
+            # Fallback to direct SET_COLOR
+            if cmd_color_rgb332 != current_color_index:  # Reset current_color_index
+                result.append({
+                    'type': DRAW_COMMANDS['SET_COLOR'], 
+                    'color': cmd_color_rgb332
+                })
+                current_color_index = cmd_color_rgb332
+                color_commands_inserted += 1
+        
+        # Add command without color fields
+        cmd_copy = {k: v for k, v in cmd.items() if k not in ['color', 'color_hex']}
+        result.append(cmd_copy)
+    
+    # Calculate real savings
+    original_commands = len(commands)
+    optimized_commands = len(result)
+    colors_removed = original_commands  # Each original command had a color
+    colors_added = color_commands_inserted  # SET_COLOR* commands added
+    net_savings = colors_removed - colors_added  # Net savings in bytes
+    
+    return result, net_savings
 
 def pack_draw_commands(commands):
     out = bytearray()
@@ -542,20 +503,14 @@ def get_layer_fields_from_pbf(pbf_file, layer):
             return set()
         lines = result.stdout.splitlines()
         fields = set()
-        in_field_section = False
         for line in lines:
             line = line.strip()
-            # Check if we're in the fields section
-            if line.startswith("Layer name:") or line.startswith("Geometry:") or line.startswith("Feature Count:"):
-                continue
-            if ":" in line and not line.startswith("  "):
-                # This is a field definition like "highway: String (0.0)"
-                field_name = line.split(":")[0].strip()
-                if field_name and not field_name.startswith("OGR"):
-                    fields.add(field_name)
+            if ":" in line:
+                field = line.split(":", 1)[0].strip().replace('"', '')
+                if field:
+                    fields.add(field)
         return fields
-    except Exception as e:
-        print(f"Error getting fields for layer {layer}: {e}")
+    except Exception:
         return set()
 
 def build_ogr2ogr_where_clause_from_config(config, allowed_fields):
@@ -581,20 +536,143 @@ def get_config_fields(config):
             fields.add(k)
     return fields
 
-def count_features(tmp_files, config_fields):
-    total = 0
-    for tmp_file in tmp_files:
-        with open(tmp_file, "r", encoding="utf-8") as f:
-            for _ in ijson.items(f, "features.item"):
-                total += 1
-    return total
-
-def extract_geojson_from_pbf(pbf_file, geojson_file, config):
-    print("Extracting PBF with ogr2ogr using SQL filter and minimal fields based on style...")
-    if os.path.exists(geojson_file):
-        os.remove(geojson_file)
+def process_layer_directly_to_database(pbf_file, layer, config, db, zoom_levels, config_fields, LAYER_FIELDS):
+    """Process a single layer directly from PBF to database"""
+    possible = LAYER_FIELDS[layer]
+    available = get_layer_fields_from_pbf(pbf_file, layer)
+    allowed = possible & available & config_fields
+    where_clause = build_ogr2ogr_where_clause_from_config(config, allowed)
     
-    # All OSM fields that might be needed - each layer can have any of these
+    if not where_clause:
+        return 0
+    
+    select_fields = ",".join(sorted(allowed))
+    
+    # Create temporary file in current working directory
+    tmp_filename = f"tmp_{layer}_{os.getpid()}.geojson"
+    
+    try:
+        cmd = [
+            "ogr2ogr",
+            "-f", "GeoJSON",
+            "-nlt", "PROMOTE_TO_MULTI",
+            "-where", where_clause,
+            "-select", select_fields,
+            tmp_filename,
+            pbf_file,
+            layer
+        ]
+        
+        result = subprocess.run(cmd, capture_output=True)
+        if result.returncode != 0:
+            return 0
+        
+        # Process the temporary file immediately and delete it
+        features_processed = 0
+        batch_features = []
+        
+        # Check if file was created and has content
+        if not os.path.exists(tmp_filename) or os.path.getsize(tmp_filename) == 0:
+            return 0
+        with open(tmp_filename, "r", encoding="utf-8") as f:
+            for feat in ijson.items(f, "features.item"):
+                feat['properties'] = {k: v for k, v in feat['properties'].items() if k in config_fields}
+                
+                tags = feat['properties']
+                style, stylekey = get_style_for_tags(tags, config)
+                if not style:
+                    continue
+                
+                try:
+                    geom = shape(feat['geometry'])
+                except Exception:
+                    continue
+                    
+                if not geom.is_valid or geom.is_empty:
+                    continue
+                
+                zoom_filter = style.get("zoom", 6)
+                priority = style.get("priority", 5)
+                hex_color = style.get("color", "#FFFFFF")
+                color = hex_to_rgb332_direct(hex_color)
+                
+                # Process this feature for all relevant zoom levels
+                for zoom in zoom_levels:
+                    if zoom < zoom_filter:
+                        continue
+                    
+                    simplify_tolerance = get_simplify_tolerance_for_zoom(zoom)
+                    feature_geom = geom
+                    
+                    if simplify_tolerance is not None and geom.geom_type in ("LineString", "MultiLineString"):
+                        try:
+                            feature_geom = feature_geom.simplify(simplify_tolerance, preserve_topology=True)
+                        except Exception:
+                            pass
+                    
+                    if feature_geom.is_empty or not feature_geom.is_valid:
+                        continue
+                    
+                    # Calculate tile bounds for this zoom level
+                    minx, miny, maxx, maxy = feature_geom.bounds
+                    xtile_min, ytile_min = deg2num(miny, minx, zoom)
+                    xtile_max, ytile_max = deg2num(maxy, maxx, zoom)
+                    
+                    # Store feature for each tile it intersects
+                    for xt in range(min(xtile_min, xtile_max), max(xtile_min, xtile_max) + 1):
+                        for yt in range(min(ytile_min, ytile_max), max(ytile_min, ytile_max) + 1):
+                            t_lon_min, t_lat_min, t_lon_max, t_lat_max = tile_latlon_bounds(xt, yt, zoom)
+                            tile_bbox = box(t_lon_min, t_lat_min, t_lon_max, t_lat_max)
+                            
+                            try:
+                                clipped_geom = feature_geom.intersection(tile_bbox)
+                            except Exception:
+                                continue
+                            
+                            if not clipped_geom.is_empty:
+                                feature_data = {
+                                    "geom": clipped_geom,
+                                    "color": color,
+                                    "color_hex": hex_color,
+                                    "tags": tags,
+                                    "priority": priority
+                                }
+                                
+                                batch_features.append((zoom, xt, yt, feature_data, priority))
+                                
+                                # Batch insert to avoid memory buildup
+                                if len(batch_features) >= DB_BATCH_SIZE:
+                                    for zoom_batch, x_batch, y_batch, feat_data, prio in batch_features:
+                                        db.insert_feature(zoom_batch, x_batch, y_batch, feat_data, prio)
+                                    db.commit()
+                                    batch_features.clear()
+                                    gc.collect()
+                
+                features_processed += 1
+                if features_processed % 1000 == 0:
+                    gc.collect()
+        
+        # Insert remaining features for this layer
+        if batch_features:
+            for zoom_batch, x_batch, y_batch, feat_data, prio in batch_features:
+                db.insert_feature(zoom_batch, x_batch, y_batch, feat_data, prio)
+            db.commit()
+        
+        return features_processed
+        
+    finally:
+        # Always clean up the temporary file
+        if os.path.exists(tmp_filename):
+            os.remove(tmp_filename)
+
+def process_pbf_directly_to_database(pbf_file, config, db_path, zoom_levels):
+    """Process PBF directly to database with minimal temporary files"""
+    print("Processing PBF directly to database (minimal temporary files)...")
+    
+    db = FeatureDatabase(db_path)
+    config_fields = get_config_fields(config)
+    
+    # All OSM fields that might be needed
     ALL_OSM_FIELDS = {
         "highway", "waterway", "railway", "natural", "place", "boundary", "power", 
         "man_made", "barrier", "aeroway", "route", "building", "landuse", "leisure", 
@@ -602,7 +680,6 @@ def extract_geojson_from_pbf(pbf_file, geojson_file, config):
         "military", "sport", "water"
     }
     
-    # For simplicity, allow all fields in all layers
     LAYER_FIELDS = {
         "points": ALL_OSM_FIELDS,
         "lines": ALL_OSM_FIELDS,
@@ -612,61 +689,151 @@ def extract_geojson_from_pbf(pbf_file, geojson_file, config):
     }
     
     layers = ["points", "lines", "multilinestrings", "multipolygons", "other_relations"]
-    config_fields = get_config_fields(config)
-    
     print(f"Config requires these fields: {', '.join(sorted(config_fields))}")
+    
+    total_features_processed = 0
+    
+    # Process each layer separately and immediately clean up
+    for i, layer in enumerate(layers):
+        print(f"[{i+1}/{len(layers)}] Processing layer: {layer} directly to database...")
+        
+        layer_features = process_layer_directly_to_database(
+            pbf_file, layer, config, db, zoom_levels, config_fields, LAYER_FIELDS
+        )
+        
+        total_features_processed += layer_features
+        print(f"Layer {layer}: {layer_features} features processed")
+        
+        # Force garbage collection after each layer
+        gc.collect()
+    
+    print(f"Total processed: {total_features_processed} features directly from PBF")
+    
+    # Print statistics for each zoom level
+    for zoom in zoom_levels:
+        count = db.count_features_for_zoom(zoom)
+        print(f"Zoom {zoom}: {count} features stored")
+    
+    db.close()
+    gc.collect()
+    
+    return total_features_processed
 
-    print("Extracting layers ...")
-    extract_args = [
-        (layer, i, layers, geojson_file, pbf_file, config, LAYER_FIELDS, config_fields)
-        for i, layer in enumerate(layers)
-    ]
-    tmp_files = []
-    all_logs = []
-    with ProcessPoolExecutor(max_workers=max_workers) as executor:
-        futures = [executor.submit(extract_layer_to_tmpfile, arg) for arg in extract_args]
+def tile_worker(args):
+    start_time = time.time()
+    x, y, feats, zoom, output_dir, max_file_size, simplify_tolerance = args
+
+    ordered_feats = sorted(feats, key=lambda f: f.get("priority", 5))
+
+    all_commands = []
+    for feat in ordered_feats:
+        # Get hex color if available
+        hex_color = feat.get("color_hex")
+        cmds = geometry_to_draw_commands(
+            feat["geom"], feat["color"], feat["tags"], zoom, x, y, 
+            simplify_tolerance=simplify_tolerance, hex_color=hex_color
+        )
+        all_commands.extend(cmds)
+
+    # Apply palette optimization to all commands
+    optimized_commands, bytes_saved = insert_palette_commands(all_commands)
+
+    tile_dir = os.path.join(output_dir, str(zoom), str(x))
+    os.makedirs(tile_dir, exist_ok=True)
+    filename = os.path.join(tile_dir, f"{y}.bin")
+
+    # Pack all optimized commands at once
+    buffer = pack_draw_commands(optimized_commands)
+    
+    # Check if buffer exceeds max file size
+    if len(buffer) > max_file_size:
+        # If too large, fall back to individual command packing with size limit
+        buffer = bytearray()
+        num_cmds_written = 0
+        header = pack_varint(0)
+        buffer += header
+
+        for cmd in optimized_commands:
+            cmd_bytes = pack_draw_commands([cmd])[len(pack_varint(1)):]
+            tmp_num_cmds = num_cmds_written + 1
+            tmp_header = pack_varint(tmp_num_cmds)
+            tmp_buffer_size = len(tmp_header) + len(buffer[len(header):]) + len(cmd_bytes)
+            if tmp_buffer_size > max_file_size:
+                break
+            buffer = tmp_header + buffer[len(header):] + cmd_bytes
+            header = tmp_header
+            num_cmds_written += 1
+
+        if num_cmds_written == 0:
+            buffer = pack_varint(0)
+
+    with open(filename, "wb") as f:
+        f.write(buffer)
+
+    tile_size = len(buffer)
+    
+    del all_commands, optimized_commands, ordered_feats, buffer, feats
+    gc.collect()
+    
+    elapsed = time.time() - start_time
+    return tile_size, elapsed
+
+def write_tile_batch(batch, output_dir, zoom, max_file_size, simplify_tolerance):
+    """Write a batch of tiles and return statistics"""
+    tile_sizes = []
+    
+    # Use fewer workers for tile batches to control memory
+    batch_workers = min(max_workers, 2)
+    with ProcessPoolExecutor(max_workers=batch_workers) as executor:
+        futures = [executor.submit(tile_worker, job) for job in batch]
         for future in as_completed(futures):
-            tmp_file, logs = future.result()
-            all_logs.extend(logs)
-            if tmp_file:
-                tmp_files.append(tmp_file)
-    for log in all_logs:
-        print(log)
-    if not tmp_files:
-        print("Could not extract any layer from OSM PBF.")
-        print("This might mean:")
-        print("1. The PBF file doesn't contain the fields required by your config")
-        print("2. The config.json might be incorrectly formatted")
-        print("3. Try running: ogrinfo -so your.pbf lines | head -30")
-        sys.exit(1)
+            tile_size, _ = future.result()
+            tile_sizes.append(tile_size)
+    
+    return tile_sizes
 
-    print("Counting total features ...")
-    total_features_to_merge = count_features(tmp_files, config_fields)
-    print(f"Total features to merge: {total_features_to_merge}")
-
-    print("Merging and writing temporary GeoJSONs ...")
-    total_features = 0
-    with open(geojson_file, "w", encoding="utf-8") as out, tqdm(total=total_features_to_merge, desc="Merging features") as pbar:
-        out.write('{"type": "FeatureCollection", "features": [\n')
-        first = True
-        counter = 0
-        for tmp_file in tmp_files:
-            for feat in read_tmp_geojson_features_stream(tmp_file, config_fields):
-                if not first:
-                    out.write(',\n')
-                json.dump(feat, out, default=decimal_default)
-                first = False
-                total_features += 1
-                counter += 1
-                pbar.update(1)
-                if counter % 5000 == 0:
-                    gc.collect()
-        out.write('\n]}\n')
-
-    for tmp_file in tmp_files:
-        os.remove(tmp_file)
-    print(f"Total merged features: {total_features}")
-    print(f"GeoJSON file generated successfully at {geojson_file}")
+def generate_tiles_from_database(db_path, output_dir, zoom, max_file_size=65536):
+    """Generate tiles for a specific zoom level from the database"""
+    print(f"\n=== Processing zoom level {zoom} from database ===")
+    
+    db = FeatureDatabase(db_path)
+    
+    # Get all tiles for this zoom level
+    tiles = db.get_tiles_for_zoom(zoom)
+    if not tiles:
+        print(f"No tiles found for zoom {zoom}")
+        db.close()
+        return
+    
+    print(f"Found {len(tiles)} tiles for zoom {zoom}")
+    
+    # Process tiles in batches
+    all_tile_sizes = []
+    TILE_BATCH_SIZE = 5000
+    total_batches = (len(tiles) + TILE_BATCH_SIZE - 1) // TILE_BATCH_SIZE
+    
+    with tqdm(total=len(tiles), desc=f"Writing tiles (zoom {zoom})") as pbar:
+        for batch_idx in range(0, len(tiles), TILE_BATCH_SIZE):
+            batch_tiles = tiles[batch_idx:batch_idx + TILE_BATCH_SIZE]
+            batch_jobs = []
+            
+            for (tile_x, tile_y) in batch_tiles:
+                features = db.get_features_for_tile(zoom, tile_x, tile_y)
+                if features:
+                    batch_jobs.append((tile_x, tile_y, features, zoom, output_dir, max_file_size, None))
+            
+            if batch_jobs:
+                # Write this batch
+                batch_sizes = write_tile_batch(batch_jobs, output_dir, zoom, max_file_size, None)
+                all_tile_sizes.extend(batch_sizes)
+            
+            pbar.update(len(batch_tiles))
+            gc.collect()
+    
+    avg_tile_size = sum(all_tile_sizes) / len(all_tile_sizes) if all_tile_sizes else 0
+    print(f"Zoom {zoom}: {len(all_tile_sizes)} tiles, average size = {avg_tile_size:.2f} bytes")
+    
+    db.close()
     gc.collect()
 
 def precompute_global_color_palette(config):
@@ -757,230 +924,8 @@ def write_palette_bin(output_dir):
             fp.write(bytes([rgb332_val]))
     print("Palette written OK.")
 
-def process_features_to_database(geojson_file, config, db_path, zoom_levels):
-    """Process all features once and store them in database by zoom level and tile"""
-    print("Processing features and storing in database...")
-    
-    db = FeatureDatabase(db_path)
-    config_fields = get_config_fields(config)
-    
-    # Get total feature count for progress tracking
-    total_features = 0
-    with fiona.open(geojson_file) as src:
-        total_features = len(src)
-    
-    print(f"Processing {total_features} features for {len(zoom_levels)} zoom levels...")
-    
-    feature_count = 0
-    batch_features = []
-    
-    with fiona.open(geojson_file) as src:
-        for feat in tqdm(src, total=total_features, desc="Processing features"):
-            tags = {k: v for k, v in feat['properties'].items() if k in config_fields}
-            style, stylekey = get_style_for_tags(tags, config)
-            if not style:
-                continue
-            
-            geom = shape(feat['geometry'])
-            if not geom.is_valid or geom.is_empty:
-                continue
-            
-            zoom_filter = style.get("zoom", 6)
-            priority = style.get("priority", 5)
-            hex_color = style.get("color", "#FFFFFF")
-            color = hex_to_rgb332_direct(hex_color)
-            
-            # Process this feature for all relevant zoom levels
-            for zoom in zoom_levels:
-                if zoom < zoom_filter:
-                    continue
-                
-                simplify_tolerance = get_simplify_tolerance_for_zoom(zoom)
-                feature_geom = geom
-                
-                if simplify_tolerance is not None and geom.geom_type in ("LineString", "MultiLineString"):
-                    try:
-                        feature_geom = feature_geom.simplify(simplify_tolerance, preserve_topology=True)
-                    except Exception:
-                        pass
-                
-                if feature_geom.is_empty or not feature_geom.is_valid:
-                    continue
-                
-                # Calculate tile bounds for this zoom level
-                minx, miny, maxx, maxy = feature_geom.bounds
-                xtile_min, ytile_min = deg2num(miny, minx, zoom)
-                xtile_max, ytile_max = deg2num(maxy, maxx, zoom)
-                
-                # Store feature for each tile it intersects
-                for xt in range(min(xtile_min, xtile_max), max(xtile_min, xtile_max) + 1):
-                    for yt in range(min(ytile_min, ytile_max), max(ytile_min, ytile_max) + 1):
-                        t_lon_min, t_lat_min, t_lon_max, t_lat_max = tile_latlon_bounds(xt, yt, zoom)
-                        tile_bbox = box(t_lon_min, t_lat_min, t_lon_max, t_lat_max)
-                        
-                        try:
-                            clipped_geom = feature_geom.intersection(tile_bbox)
-                        except Exception:
-                            continue
-                        
-                        if not clipped_geom.is_empty:
-                            feature_data = {
-                                "geom": clipped_geom,
-                                "color": color,
-                                "color_hex": hex_color,
-                                "tags": tags,
-                                "priority": priority
-                            }
-                            
-                            batch_features.append((zoom, xt, yt, feature_data, priority))
-                            
-                            # Batch insert to avoid memory buildup
-                            if len(batch_features) >= DB_BATCH_SIZE:
-                                for zoom_batch, x_batch, y_batch, feat_data, prio in batch_features:
-                                    db.insert_feature(zoom_batch, x_batch, y_batch, feat_data, prio)
-                                db.commit()
-                                batch_features.clear()
-                                gc.collect()
-            
-            feature_count += 1
-            if feature_count % 1000 == 0:
-                gc.collect()
-    
-    # Insert remaining features
-    if batch_features:
-        for zoom_batch, x_batch, y_batch, feat_data, prio in batch_features:
-            db.insert_feature(zoom_batch, x_batch, y_batch, feat_data, prio)
-        db.commit()
-    
-    print(f"Processed {feature_count} features and stored in database")
-    
-    # Print statistics for each zoom level
-    for zoom in zoom_levels:
-        count = db.count_features_for_zoom(zoom)
-        print(f"Zoom {zoom}: {count} features stored")
-    
-    db.close()
-    gc.collect()
-
-def write_tile_batch(batch, output_dir, zoom, max_file_size, simplify_tolerance):
-    """Write a batch of tiles and return statistics"""
-    tile_sizes = []
-    
-    # Use fewer workers for tile batches to control memory
-    batch_workers = min(max_workers, 2)
-    with ProcessPoolExecutor(max_workers=batch_workers) as executor:
-        futures = [executor.submit(tile_worker, job) for job in batch]
-        for future in as_completed(futures):
-            tile_size, _ = future.result()
-            tile_sizes.append(tile_size)
-    
-    return tile_sizes
-
-def generate_tiles_from_database(db_path, output_dir, zoom, max_file_size=65536):
-    """Generate tiles for a specific zoom level from the database"""
-    print(f"\n=== Processing zoom level {zoom} from database ===")
-    
-    db = FeatureDatabase(db_path)
-    
-    # Get all tiles for this zoom level
-    tiles = db.get_tiles_for_zoom(zoom)
-    if not tiles:
-        print(f"No tiles found for zoom {zoom}")
-        db.close()
-        return
-    
-    print(f"Found {len(tiles)} tiles for zoom {zoom}")
-    
-    # Process tiles in batches
-    all_tile_sizes = []
-    TILE_BATCH_SIZE = 5000
-    total_batches = (len(tiles) + TILE_BATCH_SIZE - 1) // TILE_BATCH_SIZE
-    
-    with tqdm(total=len(tiles), desc=f"Writing tiles (zoom {zoom})") as pbar:
-        for batch_idx in range(0, len(tiles), TILE_BATCH_SIZE):
-            batch_tiles = tiles[batch_idx:batch_idx + TILE_BATCH_SIZE]
-            batch_jobs = []
-            
-            for (tile_x, tile_y) in batch_tiles:
-                features = db.get_features_for_tile(zoom, tile_x, tile_y)
-                if features:
-                    batch_jobs.append((tile_x, tile_y, features, zoom, output_dir, max_file_size, None))
-            
-            if batch_jobs:
-                # Write this batch
-                batch_sizes = write_tile_batch(batch_jobs, output_dir, zoom, max_file_size, None)
-                all_tile_sizes.extend(batch_sizes)
-            
-            pbar.update(len(batch_tiles))
-            gc.collect()
-    
-    avg_tile_size = sum(all_tile_sizes) / len(all_tile_sizes) if all_tile_sizes else 0
-    print(f"Zoom {zoom}: {len(all_tile_sizes)} tiles, average size = {avg_tile_size:.2f} bytes")
-    
-    db.close()
-    gc.collect()
-
-def tile_worker(args):
-    start_time = time.time()
-    x, y, feats, zoom, output_dir, max_file_size, simplify_tolerance = args
-
-    ordered_feats = sorted(feats, key=lambda f: f.get("priority", 5))
-
-    all_commands = []
-    for feat in ordered_feats:
-        # Get hex color if available
-        hex_color = feat.get("color_hex")
-        cmds = geometry_to_draw_commands(
-            feat["geom"], feat["color"], feat["tags"], zoom, x, y, 
-            simplify_tolerance=simplify_tolerance, hex_color=hex_color
-        )
-        all_commands.extend(cmds)
-
-    # Apply palette optimization to all commands
-    optimized_commands, bytes_saved = insert_palette_commands(all_commands)
-
-    tile_dir = os.path.join(output_dir, str(zoom), str(x))
-    os.makedirs(tile_dir, exist_ok=True)
-    filename = os.path.join(tile_dir, f"{y}.bin")
-
-    # Pack all optimized commands at once
-    buffer = pack_draw_commands(optimized_commands)
-    
-    # Check if buffer exceeds max file size
-    if len(buffer) > max_file_size:
-        # If too large, fall back to individual command packing with size limit
-        buffer = bytearray()
-        num_cmds_written = 0
-        header = pack_varint(0)
-        buffer += header
-
-        for cmd in optimized_commands:
-            cmd_bytes = pack_draw_commands([cmd])[len(pack_varint(1)):]
-            tmp_num_cmds = num_cmds_written + 1
-            tmp_header = pack_varint(tmp_num_cmds)
-            tmp_buffer_size = len(tmp_header) + len(buffer[len(header):]) + len(cmd_bytes)
-            if tmp_buffer_size > max_file_size:
-                break
-            buffer = tmp_header + buffer[len(header):] + cmd_bytes
-            header = tmp_header
-            num_cmds_written += 1
-
-        if num_cmds_written == 0:
-            buffer = pack_varint(0)
-
-    with open(filename, "wb") as f:
-        f.write(buffer)
-
-    tile_size = len(buffer)
-    
-    del all_commands, optimized_commands, ordered_feats, buffer, feats
-    gc.collect()
-    
-    elapsed = time.time() - start_time
-    return tile_size, elapsed
-
 def main():
-    parser = argparse.ArgumentParser(description="OSM vector tile generator (memory-optimized with complete optimization pipeline)")
+    parser = argparse.ArgumentParser(description="OSM vector tile generator (direct processing with database)")
     parser.add_argument("pbf_file", help="Path to .pbf file")
     parser.add_argument("output_dir", help="Output directory")
     parser.add_argument("config_file", help="JSON config with features/colors")
@@ -1009,11 +954,8 @@ def main():
     feature_types = detect_feature_types(config)
     print(f"Ready for feature-specific optimizations: {', '.join(sorted(feature_types)) if feature_types else 'general optimization only'}")
 
-    geojson_tmp = os.path.abspath("tmp_extract.geojson")
-    extract_geojson_from_pbf(args.pbf_file, geojson_tmp, config)
-
-    # Process features once and store in database
-    process_features_to_database(geojson_tmp, config, args.db_path, zoom_levels)
+    # Process features directly from PBF to database (no intermediate GeoJSON)
+    process_pbf_directly_to_database(args.pbf_file, config, args.db_path, zoom_levels)
 
     # Generate tiles for each zoom level from database
     for zoom in zoom_levels:
@@ -1023,8 +965,6 @@ def main():
     print("\nProcess completed successfully.")
 
     # Cleanup
-    if os.path.exists(geojson_tmp):
-        os.remove(geojson_tmp)
     if os.path.exists(args.db_path):
         os.remove(args.db_path)
     
