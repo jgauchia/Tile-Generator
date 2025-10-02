@@ -337,6 +337,21 @@ class FeatureDatabase:
 
 
 def deg2num(lat_deg: float, lon_deg: float, zoom: int) -> Tuple[int, int]:
+    """
+    Convert latitude/longitude coordinates to tile coordinates.
+    
+    Args:
+        lat_deg: Latitude in degrees
+        lon_deg: Longitude in degrees  
+        zoom: Zoom level (0-18)
+        
+    Returns:
+        Tuple of (x, y) tile coordinates
+        
+    Example:
+        >>> deg2num(42.5, 1.5, 10)
+        (512, 384)
+    """
     lat_rad = math.radians(lat_deg)
     n = 2.0 ** zoom
     xtile = int((lon_deg + 180.0) / 360.0 * n)
@@ -344,6 +359,21 @@ def deg2num(lat_deg: float, lon_deg: float, zoom: int) -> Tuple[int, int]:
     return xtile, ytile
 
 def deg2pixel(lat_deg: float, lon_deg: float, zoom: int) -> Tuple[float, float]:
+    """
+    Convert latitude/longitude coordinates to pixel coordinates within a tile.
+    
+    Args:
+        lat_deg: Latitude in degrees
+        lon_deg: Longitude in degrees
+        zoom: Zoom level (0-18)
+        
+    Returns:
+        Tuple of (x, y) pixel coordinates within the tile
+        
+    Example:
+        >>> deg2pixel(42.5, 1.5, 10)
+        (256.0, 128.0)
+    """
     lat_rad = math.radians(lat_deg)
     n = 2.0 ** zoom
     x = ((lon_deg + 180.0) / 360.0 * n * Config.TILE_SIZE)
@@ -351,6 +381,23 @@ def deg2pixel(lat_deg: float, lon_deg: float, zoom: int) -> Tuple[float, float]:
     return x, y
 
 def coords_to_pixel_coords_uint16(coords: List[Tuple[float, float]], zoom: int, tile_x: int, tile_y: int) -> List[Tuple[int, int]]:
+    """
+    Convert coordinate list to pixel coordinates relative to a specific tile.
+    
+    Args:
+        coords: List of (longitude, latitude) coordinate tuples
+        zoom: Zoom level (0-18)
+        tile_x: X coordinate of the target tile
+        tile_y: Y coordinate of the target tile
+        
+    Returns:
+        List of (x, y) pixel coordinates relative to the tile (0-65535 range)
+        
+    Example:
+        >>> coords = [(1.5, 42.5), (1.6, 42.6)]
+        >>> coords_to_pixel_coords_uint16(coords, 10, 512, 384)
+        [(256, 128), (300, 150)]
+    """
     pixel_coords = []
     for lon, lat in coords:
         px_global, py_global = deg2pixel(lat, lon, zoom)
@@ -373,6 +420,19 @@ def remove_duplicate_points(points: List[Tuple[float, float]]) -> List[Tuple[flo
     return result
 
 def hex_to_rgb332_direct(hex_color: str) -> int:
+    """
+    Convert hex color string to RGB332 format (8-bit color).
+    
+    Args:
+        hex_color: Hex color string (e.g., "#FF0000")
+        
+    Returns:
+        8-bit RGB332 color value (0-255)
+        
+    Example:
+        >>> hex_to_rgb332_direct("#FF0000")
+        224  # Red in RGB332 format
+    """
     try:
         if not hex_color or not isinstance(hex_color, str) or not hex_color.startswith("#"):
             return 0xFF
@@ -389,6 +449,22 @@ def hex_to_color_index(hex_color: str) -> Optional[int]:
     return GLOBAL_COLOR_PALETTE.get(hex_color, None)
 
 def get_style_for_tags(tags: Dict[str, str], config: Dict[str, Any]) -> Tuple[Dict[str, Any], Optional[str]]:
+    """
+    Find matching style configuration for feature tags.
+    
+    Args:
+        tags: Dictionary of feature tags (e.g., {"highway": "primary"})
+        config: Style configuration dictionary
+        
+    Returns:
+        Tuple of (style_dict, matching_key) or ({}, None) if no match
+        
+    Example:
+        >>> tags = {"highway": "primary", "surface": "asphalt"}
+        >>> config = {"highway=primary": {"color": "#FF0000"}}
+        >>> get_style_for_tags(tags, config)
+        ({"color": "#FF0000"}, "highway=primary")
+    """
     for k, v in tags.items():
         keyval = f"{k}={v}"
         if keyval in config:
@@ -408,7 +484,22 @@ def tile_latlon_bounds(tile_x: int, tile_y: int, zoom: int, pixel_margin: int = 
     lat_min = math.degrees(lat_rad2)
     return lon_min, lat_min, lon_max, lat_max
 
-def is_area(tags):
+def is_area(tags: Dict[str, str]) -> bool:
+    """
+    Determine if a feature should be treated as an area based on its tags.
+    
+    Args:
+        tags: Dictionary of feature tags
+        
+    Returns:
+        True if the feature should be treated as an area, False otherwise
+        
+    Example:
+        >>> is_area({"building": "house"})
+        True
+        >>> is_area({"highway": "primary"})
+        False
+    """
     AREA_TAGS = {
         'building','landuse','amenity','leisure','tourism','waterway','natural','man_made',
         'boundary','place','aeroway','area','shop','craft','office','historic','public_transport',
@@ -717,7 +808,21 @@ def get_config_fields(config):
     return fields
 
 def validate_pbf_file(pbf_file: str) -> None:
-    """Validate PBF file exists and is readable"""
+    """
+    Validate PBF file exists, is readable, and has correct format.
+    
+    Args:
+        pbf_file: Path to the PBF file to validate
+        
+    Raises:
+        FileNotFoundError: If file doesn't exist
+        ValueError: If file is not a PBF file or is empty
+        PermissionError: If file is not readable
+        
+    Example:
+        >>> validate_pbf_file("data.osm.pbf")
+        # No exception if file is valid
+    """
     if not os.path.exists(pbf_file):
         raise FileNotFoundError(f"PBF file not found: {pbf_file}")
     
@@ -738,7 +843,24 @@ def validate_pbf_file(pbf_file: str) -> None:
     logger.debug(f"PBF file validation passed: {pbf_file} ({file_size} bytes)")
 
 def validate_config_file(config_file: str) -> Dict[str, Any]:
-    """Validate configuration file exists and is valid JSON"""
+    """
+    Validate configuration file exists and contains valid JSON.
+    
+    Args:
+        config_file: Path to the configuration file
+        
+    Returns:
+        Parsed configuration dictionary
+        
+    Raises:
+        FileNotFoundError: If config file doesn't exist
+        ValueError: If file contains invalid JSON
+        
+    Example:
+        >>> config = validate_config_file("features.json")
+        >>> print(config["highway=primary"]["color"])
+        "#FF0000"
+    """
     if not os.path.exists(config_file):
         raise FileNotFoundError(f"Config file not found: {config_file}")
     
@@ -1290,6 +1412,24 @@ def write_palette_bin(output_dir):
     logger.info("Palette written successfully")
 
 def main() -> None:
+    """
+    Main entry point for the OSM vector tile generator.
+    
+    Processes OpenStreetMap PBF files directly to vector tiles using a database
+    for efficient feature storage and retrieval. Supports multiple zoom levels
+    and configurable styling through JSON configuration files.
+    
+    Command line arguments:
+        pbf_file: Path to input OSM PBF file
+        output_dir: Directory for generated vector tiles
+        config_file: JSON file with feature styling configuration
+        --zoom: Zoom level or range (e.g., "12" or "6-17")
+        --max-file-size: Maximum tile file size in KB
+        --db-path: Path for temporary SQLite database
+        
+    Example:
+        python tile_generator_direct.py data.osm.pbf tiles/ features.json --zoom 6-17
+    """
     parser = argparse.ArgumentParser(description="OSM vector tile generator (direct processing with database)")
     parser.add_argument("pbf_file", help="Path to .pbf file")
     parser.add_argument("output_dir", help="Output directory")
