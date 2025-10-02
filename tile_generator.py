@@ -30,6 +30,95 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+class Config:
+    """Configuration constants for the tile generator"""
+    
+    # Tile and coordinate system
+    TILE_SIZE = 256
+    UINT16_TILE_SIZE = 65536
+    
+    # Processing limits
+    MAX_WORKERS = min(os.cpu_count() or 4, 4)
+    DB_BATCH_SIZE = 10000
+    TILE_BATCH_SIZE = 5000
+    
+    # File size limits
+    MAX_FILE_SIZE_KB_LIMIT = 10240  # 10MB
+    DEFAULT_MAX_FILE_SIZE_KB = 128
+    
+    # Zoom level limits
+    MIN_ZOOM_LEVEL = 0
+    MAX_ZOOM_LEVEL = 20
+    DEFAULT_ZOOM_RANGE = "6-17"
+    
+    # File extensions
+    PBF_EXTENSION = ".pbf"
+    JSON_EXTENSION = ".json"
+    GEOJSON_EXTENSION = ".geojson"
+    
+    # Default values
+    DEFAULT_DB_PATH = "features.db"
+    DEFAULT_COLOR = "#FFFFFF"
+    DEFAULT_PRIORITY = 5
+    DEFAULT_ZOOM_FILTER = 6
+    
+    # Simplify tolerances by zoom level
+    SIMPLIFY_TOLERANCES = {
+        "low_zoom": 0.05,    # For zoom <= 10
+        "high_zoom": None    # For zoom > 10
+    }
+    
+    # OSM field categories
+    OSM_FIELD_CATEGORIES = {
+        "transport": {"highway", "railway", "aeroway", "route"},
+        "water": {"waterway", "natural", "water"},
+        "landuse": {"landuse", "leisure", "amenity", "tourism"},
+        "infrastructure": {"power", "man_made", "barrier"},
+        "boundaries": {"boundary", "place"},
+        "buildings": {"building"},
+        "services": {"shop", "craft", "office", "emergency", "military"},
+        "recreation": {"sport", "historic"}
+    }
+    
+    # All OSM fields that might be needed
+    ALL_OSM_FIELDS = {
+        "highway", "waterway", "railway", "natural", "place", "boundary", "power", 
+        "man_made", "barrier", "aeroway", "route", "building", "landuse", "leisure", 
+        "amenity", "shop", "tourism", "historic", "office", "craft", "emergency", 
+        "military", "sport", "water"
+    }
+    
+    # Layer field mappings
+    LAYER_FIELDS = {
+        "points": ALL_OSM_FIELDS,
+        "lines": ALL_OSM_FIELDS,
+        "multilinestrings": ALL_OSM_FIELDS,
+        "multipolygons": ALL_OSM_FIELDS,
+        "other_relations": ALL_OSM_FIELDS
+    }
+    
+    # Processing layers
+    PROCESSING_LAYERS = ["points", "lines", "multilinestrings", "multipolygons", "other_relations"]
+    
+    # Drawing command codes
+    DRAW_COMMANDS = {
+        'LINE': 1,
+        'POLYLINE': 2,
+        'STROKE_POLYGON': 3,
+        'HORIZONTAL_LINE': 5,
+        'VERTICAL_LINE': 6,
+        'SET_COLOR': 0x80,  # State command for direct RGB332 color
+        'SET_COLOR_INDEX': 0x81,  # State command for palette index
+        'RECTANGLE': 0x82,  # Optimized rectangle for buildings
+        'STRAIGHT_LINE': 0x83,  # Optimized straight line for highways
+        'HIGHWAY_SEGMENT': 0x84,  # Highway segment with continuity
+        'GRID_PATTERN': 0x85,  # Urban grid pattern
+        'BLOCK_PATTERN': 0x86,  # City block pattern
+        'CIRCLE': 0x87,  # Circle/roundabout
+        'RELATIVE_MOVE': 0x88,  # Relative coordinate movement
+        'PREDICTED_LINE': 0x89,  # Predictive line based on pattern
+        'COMPRESSED_POLYLINE': 0x8A,  # Huffman-compressed polyline
+    }
 
 # Global variables to track files for cleanup
 _db_file_to_cleanup = None
@@ -73,37 +162,14 @@ atexit.register(cleanup_all)
 signal.signal(signal.SIGINT, signal_handler)   # Ctrl+C
 signal.signal(signal.SIGTERM, signal_handler) # Termination signal
 
-max_workers = min(os.cpu_count() or 4, 4)
-
-TILE_SIZE = 256
-DRAW_COMMANDS = {
-    'LINE': 1,
-    'POLYLINE': 2,
-    'STROKE_POLYGON': 3,
-    'HORIZONTAL_LINE': 5,
-    'VERTICAL_LINE': 6,
-    'SET_COLOR': 0x80,  # State command for direct RGB332 color
-    'SET_COLOR_INDEX': 0x81,  # State command for palette index
-    'RECTANGLE': 0x82,  # Optimized rectangle for buildings
-    'STRAIGHT_LINE': 0x83,  # Optimized straight line for highways
-    'HIGHWAY_SEGMENT': 0x84,  # Highway segment with continuity
-    'GRID_PATTERN': 0x85,  # Urban grid pattern
-    'BLOCK_PATTERN': 0x86,  # City block pattern
-    'CIRCLE': 0x87,  # Circle/roundabout
-    'RELATIVE_MOVE': 0x88,  # Relative coordinate movement
-    'PREDICTED_LINE': 0x89,  # Predictive line based on pattern
-    'COMPRESSED_POLYLINE': 0x8A,  # Huffman-compressed polyline
-}
-
-UINT16_TILE_SIZE = 65536
+# Use Config class constants instead of global variables
 
 # Global variables for dynamic palette
 GLOBAL_COLOR_PALETTE = {}  # hex_color -> index
 GLOBAL_INDEX_TO_RGB332 = {}  # index -> rgb332_value
 
 
-# Database configuration for feature storage
-DB_BATCH_SIZE = 10000
+# Database configuration moved to Config class
 
 class FeatureDatabase:
     """Database for storing and retrieving features by zoom level and tile coordinates"""
@@ -192,20 +258,20 @@ def deg2num(lat_deg, lon_deg, zoom):
 def deg2pixel(lat_deg, lon_deg, zoom):
     lat_rad = math.radians(lat_deg)
     n = 2.0 ** zoom
-    x = ((lon_deg + 180.0) / 360.0 * n * TILE_SIZE)
-    y = ((1.0 - math.log(math.tan(lat_rad) + 1 / math.cos(lat_rad)) / math.pi) / 2.0 * n * TILE_SIZE)
+    x = ((lon_deg + 180.0) / 360.0 * n * Config.TILE_SIZE)
+    y = ((1.0 - math.log(math.tan(lat_rad) + 1 / math.cos(lat_rad)) / math.pi) / 2.0 * n * Config.TILE_SIZE)
     return x, y
 
 def coords_to_pixel_coords_uint16(coords, zoom, tile_x, tile_y):
     pixel_coords = []
     for lon, lat in coords:
         px_global, py_global = deg2pixel(lat, lon, zoom)
-        x = (px_global - tile_x * TILE_SIZE) * (UINT16_TILE_SIZE - 1) / (TILE_SIZE - 1)
-        y = ((py_global - tile_y * TILE_SIZE) * (UINT16_TILE_SIZE - 1) / (TILE_SIZE - 1))
+        x = (px_global - tile_x * Config.TILE_SIZE) * (Config.UINT16_TILE_SIZE - 1) / (Config.TILE_SIZE - 1)
+        y = ((py_global - tile_y * Config.TILE_SIZE) * (Config.UINT16_TILE_SIZE - 1) / (Config.TILE_SIZE - 1))
         x = int(round(x))
         y = int(round(y))
-        x = max(0, min(UINT16_TILE_SIZE - 1, x))
-        y = max(0, min(UINT16_TILE_SIZE - 1, y))
+        x = max(0, min(Config.UINT16_TILE_SIZE - 1, x))
+        y = max(0, min(Config.UINT16_TILE_SIZE - 1, y))
         pixel_coords.append((x, y))
     return pixel_coords
 
@@ -290,12 +356,12 @@ def is_area(tags):
 
 def get_simplify_tolerance_for_zoom(zoom):
     if zoom <= 10:
-        return 0.05
+        return Config.SIMPLIFY_TOLERANCES["low_zoom"]
     else:
-        return None
+        return Config.SIMPLIFY_TOLERANCES["high_zoom"]
 
 def clamp_uint16(x):
-    return max(0, min(UINT16_TILE_SIZE - 1, int(x)))
+    return max(0, min(Config.UINT16_TILE_SIZE - 1, int(x)))
 
 def pack_varint(n):
     out = bytearray()
@@ -331,7 +397,7 @@ def insert_palette_commands(commands):
             # Use optimized palette
             if color_index != current_color_index:
                 result.append({
-                    'type': DRAW_COMMANDS['SET_COLOR_INDEX'], 
+                    'type': Config.DRAW_COMMANDS['SET_COLOR_INDEX'], 
                     'color_index': color_index
                 })
                 current_color_index = color_index
@@ -340,7 +406,7 @@ def insert_palette_commands(commands):
             # Fallback to direct SET_COLOR
             if cmd_color_rgb332 != current_color_index:  # Reset current_color_index
                 result.append({
-                    'type': DRAW_COMMANDS['SET_COLOR'], 
+                    'type': Config.DRAW_COMMANDS['SET_COLOR'], 
                     'color': cmd_color_rgb332
                 })
                 current_color_index = cmd_color_rgb332
@@ -367,29 +433,29 @@ def pack_draw_commands(commands):
         t = cmd['type']
         out += pack_varint(t)
         
-        if t == DRAW_COMMANDS['SET_COLOR']:
+        if t == Config.DRAW_COMMANDS['SET_COLOR']:
             # Original SET_COLOR command (direct RGB332)
             color = cmd['color'] & 0xFF
             out += struct.pack("B", color)
-        elif t == DRAW_COMMANDS['SET_COLOR_INDEX']:
+        elif t == Config.DRAW_COMMANDS['SET_COLOR_INDEX']:
             # SET_COLOR_INDEX command (palette index)
             color_index = cmd['color_index'] & 0xFF
             out += pack_varint(color_index)
-        elif t == DRAW_COMMANDS['RECTANGLE']:
+        elif t == Config.DRAW_COMMANDS['RECTANGLE']:
             # Optimized RECTANGLE command
             x1, y1, x2, y2 = map(clamp_uint16, [cmd['x1'], cmd['y1'], cmd['x2'], cmd['y2']])
             out += pack_zigzag(x1)
             out += pack_zigzag(y1)
             out += pack_zigzag(x2 - x1)
             out += pack_zigzag(y2 - y1)
-        elif t == DRAW_COMMANDS['STRAIGHT_LINE']:
+        elif t == Config.DRAW_COMMANDS['STRAIGHT_LINE']:
             # Optimized STRAIGHT_LINE command
             x1, y1, x2, y2 = map(clamp_uint16, [cmd['x1'], cmd['y1'], cmd['x2'], cmd['y2']])
             out += pack_zigzag(x1)
             out += pack_zigzag(y1)
             out += pack_zigzag(x2 - x1)
             out += pack_zigzag(y2 - y1)
-        elif t == DRAW_COMMANDS['GRID_PATTERN']:
+        elif t == Config.DRAW_COMMANDS['GRID_PATTERN']:
             # Step 6: Grid pattern command
             x, y, width, spacing, count = map(clamp_uint16, [cmd['x'], cmd['y'], cmd['width'], cmd['spacing'], cmd['count']])
             direction = cmd.get('direction', 'horizontal')
@@ -399,26 +465,26 @@ def pack_draw_commands(commands):
             out += pack_zigzag(spacing)
             out += pack_varint(count)
             out += struct.pack("B", 1 if direction == 'horizontal' else 0)
-        elif t == DRAW_COMMANDS['CIRCLE']:
+        elif t == Config.DRAW_COMMANDS['CIRCLE']:
             # Step 6: Circle command
             center_x, center_y, radius = map(clamp_uint16, [cmd['center_x'], cmd['center_y'], cmd['radius']])
             out += pack_zigzag(center_x)
             out += pack_zigzag(center_y)
             out += pack_zigzag(radius)
-        elif t == DRAW_COMMANDS['PREDICTED_LINE']:
+        elif t == Config.DRAW_COMMANDS['PREDICTED_LINE']:
             # Step 6: Predicted line command (only end point needed)
             end_x, end_y = map(clamp_uint16, [cmd['end_x'], cmd['end_y']])
             out += pack_zigzag(end_x)
             out += pack_zigzag(end_y)
         else:
             # Original geometric commands
-            if t == DRAW_COMMANDS['LINE']:
+            if t == Config.DRAW_COMMANDS['LINE']:
                 x1, y1, x2, y2 = map(clamp_uint16, [cmd['x1'], cmd['y1'], cmd['x2'], cmd['y2']])
                 out += pack_zigzag(x1)
                 out += pack_zigzag(y1)
                 out += pack_zigzag(x2 - x1)
                 out += pack_zigzag(y2 - y1)
-            elif t == DRAW_COMMANDS['POLYLINE'] or t == DRAW_COMMANDS['STROKE_POLYGON']:
+            elif t == Config.DRAW_COMMANDS['POLYLINE'] or t == Config.DRAW_COMMANDS['STROKE_POLYGON']:
                 pts = cmd['points']
                 out += pack_varint(len(pts))
                 prev_x, prev_y = 0, 0
@@ -431,12 +497,12 @@ def pack_draw_commands(commands):
                         out += pack_zigzag(x - prev_x)
                         out += pack_zigzag(y - prev_y)
                     prev_x, prev_y = x, y
-            elif t == DRAW_COMMANDS['HORIZONTAL_LINE']:
+            elif t == Config.DRAW_COMMANDS['HORIZONTAL_LINE']:
                 x1, x2, y = clamp_uint16(cmd['x1']), clamp_uint16(cmd['x2']), clamp_uint16(cmd['y'])
                 out += pack_zigzag(x1)
                 out += pack_zigzag(x2 - x1)
                 out += pack_zigzag(y)
-            elif t == DRAW_COMMANDS['VERTICAL_LINE']:
+            elif t == Config.DRAW_COMMANDS['VERTICAL_LINE']:
                 x, y1, y2 = clamp_uint16(cmd['x']), clamp_uint16(cmd['y1']), clamp_uint16(cmd['y2'])
                 out += pack_zigzag(x)
                 out += pack_zigzag(y1)
@@ -461,7 +527,7 @@ def geometry_to_draw_commands(geom, color, tags, zoom, tile_x, tile_y, simplify_
             exterior_pixels = coords_to_pixel_coords_uint16(exterior, zoom, tile_x, tile_y)
             exterior_pixels = ensure_closed_ring(exterior_pixels)
             if len(set(exterior_pixels)) >= 3:
-                cmd = {'type': DRAW_COMMANDS['STROKE_POLYGON'], 'points': exterior_pixels, 'color': color}
+                cmd = {'type': Config.DRAW_COMMANDS['STROKE_POLYGON'], 'points': exterior_pixels, 'color': color}
                 if hex_color:
                     cmd['color_hex'] = hex_color
                 local_cmds.append(cmd)
@@ -471,7 +537,7 @@ def geometry_to_draw_commands(geom, color, tags, zoom, tile_x, tile_y, simplify_
                 exterior_pixels = coords_to_pixel_coords_uint16(exterior, zoom, tile_x, tile_y)
                 exterior_pixels = ensure_closed_ring(exterior_pixels)
                 if len(set(exterior_pixels)) >= 3:
-                    cmd = {'type': DRAW_COMMANDS['STROKE_POLYGON'], 'points': exterior_pixels, 'color': color}
+                    cmd = {'type': Config.DRAW_COMMANDS['STROKE_POLYGON'], 'points': exterior_pixels, 'color': color}
                     if hex_color:
                         cmd['color_hex'] = hex_color
                     local_cmds.append(cmd)
@@ -485,7 +551,7 @@ def geometry_to_draw_commands(geom, color, tags, zoom, tile_x, tile_y, simplify_
             is_closed = coords[0] == coords[-1]
             if is_closed and is_area(tags):
                 if len(set(pixel_coords)) >= 3:
-                    cmd = {'type': DRAW_COMMANDS['STROKE_POLYGON'], 'points': pixel_coords, 'color': color}
+                    cmd = {'type': Config.DRAW_COMMANDS['STROKE_POLYGON'], 'points': pixel_coords, 'color': color}
                     if hex_color:
                         cmd['color_hex'] = hex_color
                     local_cmds.append(cmd)
@@ -497,14 +563,14 @@ def geometry_to_draw_commands(geom, color, tags, zoom, tile_x, tile_y, simplify_
                     if hex_color:
                         cmd['color_hex'] = hex_color
                     if y1 == y2:
-                        cmd.update({'type': DRAW_COMMANDS['HORIZONTAL_LINE'], 'x1': x1, 'x2': x2, 'y': y1})
+                        cmd.update({'type': Config.DRAW_COMMANDS['HORIZONTAL_LINE'], 'x1': x1, 'x2': x2, 'y': y1})
                     elif x1 == x2:
-                        cmd.update({'type': DRAW_COMMANDS['VERTICAL_LINE'], 'x': x1, 'y1': y1, 'y2': y2})
+                        cmd.update({'type': Config.DRAW_COMMANDS['VERTICAL_LINE'], 'x': x1, 'y1': y1, 'y2': y2})
                     else:
-                        cmd.update({'type': DRAW_COMMANDS['LINE'], 'x1': x1, 'y1': y1, 'x2': x2, 'y2': y2})
+                        cmd.update({'type': Config.DRAW_COMMANDS['LINE'], 'x1': x1, 'y1': y1, 'x2': x2, 'y2': y2})
                     local_cmds.append(cmd)
                 else:
-                    cmd = {'type': DRAW_COMMANDS['POLYLINE'], 'points': pixel_coords, 'color': color}
+                    cmd = {'type': Config.DRAW_COMMANDS['POLYLINE'], 'points': pixel_coords, 'color': color}
                     if hex_color:
                         cmd['color_hex'] = hex_color
                     local_cmds.append(cmd)
@@ -570,8 +636,8 @@ def validate_pbf_file(pbf_file):
     if not os.path.isfile(pbf_file):
         raise ValueError(f"Path is not a file: {pbf_file}")
     
-    if not pbf_file.lower().endswith('.pbf'):
-        raise ValueError(f"File must have .pbf extension: {pbf_file}")
+    if not pbf_file.lower().endswith(Config.PBF_EXTENSION):
+        raise ValueError(f"File must have {Config.PBF_EXTENSION} extension: {pbf_file}")
     
     if not os.access(pbf_file, os.R_OK):
         raise PermissionError(f"Cannot read PBF file: {pbf_file}")
@@ -591,8 +657,8 @@ def validate_config_file(config_file):
     if not os.path.isfile(config_file):
         raise ValueError(f"Path is not a file: {config_file}")
     
-    if not config_file.lower().endswith('.json'):
-        raise ValueError(f"Config file must have .json extension: {config_file}")
+    if not config_file.lower().endswith(Config.JSON_EXTENSION):
+        raise ValueError(f"Config file must have {Config.JSON_EXTENSION} extension: {config_file}")
     
     if not os.access(config_file, os.R_OK):
         raise PermissionError(f"Cannot read config file: {config_file}")
@@ -639,12 +705,12 @@ def validate_zoom_range(zoom_str):
     if "-" in zoom_str:
         try:
             start, end = map(int, zoom_str.split("-"))
-            if start < 0 or end < 0:
-                raise ValueError("Zoom levels cannot be negative")
+            if start < Config.MIN_ZOOM_LEVEL or end < Config.MIN_ZOOM_LEVEL:
+                raise ValueError(f"Zoom levels cannot be negative (minimum: {Config.MIN_ZOOM_LEVEL})")
             if start > end:
                 raise ValueError("Start zoom level cannot be greater than end zoom level")
-            if end > 20:
-                raise ValueError("Zoom level cannot exceed 20")
+            if end > Config.MAX_ZOOM_LEVEL:
+                raise ValueError(f"Zoom level cannot exceed {Config.MAX_ZOOM_LEVEL}")
             zoom_levels = list(range(start, end + 1))
         except ValueError as e:
             if "invalid literal" in str(e):
@@ -653,10 +719,10 @@ def validate_zoom_range(zoom_str):
     else:
         try:
             zoom = int(zoom_str)
-            if zoom < 0:
-                raise ValueError("Zoom level cannot be negative")
-            if zoom > 20:
-                raise ValueError("Zoom level cannot exceed 20")
+            if zoom < Config.MIN_ZOOM_LEVEL:
+                raise ValueError(f"Zoom level cannot be negative (minimum: {Config.MIN_ZOOM_LEVEL})")
+            if zoom > Config.MAX_ZOOM_LEVEL:
+                raise ValueError(f"Zoom level cannot exceed {Config.MAX_ZOOM_LEVEL}")
             zoom_levels = [zoom]
         except ValueError:
             raise ValueError(f"Invalid zoom level: {zoom_str}. Must be a number or range like '6-17'")
@@ -672,8 +738,8 @@ def validate_max_file_size(max_file_size_kb):
     if max_file_size_kb <= 0:
         raise ValueError("Max file size must be positive")
     
-    if max_file_size_kb > 10240:  # 10MB limit
-        raise ValueError("Max file size cannot exceed 10240 KB (10MB)")
+    if max_file_size_kb > Config.MAX_FILE_SIZE_KB_LIMIT:
+        raise ValueError(f"Max file size cannot exceed {Config.MAX_FILE_SIZE_KB_LIMIT} KB ({Config.MAX_FILE_SIZE_KB_LIMIT // 1024}MB)")
     
     logger.debug(f"Max file size validation passed: {max_file_size_kb} KB")
 
@@ -697,7 +763,7 @@ def validate_db_path(db_path):
 
 def extract_layer_to_temp_file(pbf_file, layer, where_clause, select_fields):
     """Extract layer data from PBF to temporary GeoJSON file"""
-    tmp_filename = f"tmp_{layer}_{os.getpid()}.geojson"
+    tmp_filename = f"tmp_{layer}_{os.getpid()}{Config.GEOJSON_EXTENSION}"
     
     # Register temporary file for cleanup
     global _temp_files_to_cleanup
@@ -798,7 +864,7 @@ def process_feature_for_zoom_levels(feat, config, config_fields, zoom_levels, db
                     features_added += 1
                     
                     # Batch insert to avoid memory buildup
-                    if len(batch_features) >= DB_BATCH_SIZE:
+                    if len(batch_features) >= Config.DB_BATCH_SIZE:
                         for zoom_batch, x_batch, y_batch, feat_data, prio in batch_features:
                             db.insert_feature(zoom_batch, x_batch, y_batch, feat_data, prio)
                         db.commit()
@@ -975,7 +1041,7 @@ def write_tile_batch(batch, output_dir, zoom, max_file_size, simplify_tolerance)
     tile_sizes = []
     
     # Use fewer workers for tile batches to control memory
-    batch_workers = min(max_workers, 2)
+    batch_workers = min(Config.MAX_WORKERS, 2)
     with ProcessPoolExecutor(max_workers=batch_workers) as executor:
         futures = [executor.submit(tile_worker, job) for job in batch]
         for future in as_completed(futures):
@@ -1001,12 +1067,11 @@ def generate_tiles_from_database(db_path, output_dir, zoom, max_file_size=65536)
     
     # Process tiles in batches
     all_tile_sizes = []
-    TILE_BATCH_SIZE = 5000
-    total_batches = (len(tiles) + TILE_BATCH_SIZE - 1) // TILE_BATCH_SIZE
+    total_batches = (len(tiles) + Config.TILE_BATCH_SIZE - 1) // Config.TILE_BATCH_SIZE
     
     with tqdm(total=len(tiles), desc=f"Writing tiles (zoom {zoom})") as pbar:
-        for batch_idx in range(0, len(tiles), TILE_BATCH_SIZE):
-            batch_tiles = tiles[batch_idx:batch_idx + TILE_BATCH_SIZE]
+        for batch_idx in range(0, len(tiles), Config.TILE_BATCH_SIZE):
+            batch_tiles = tiles[batch_idx:batch_idx + Config.TILE_BATCH_SIZE]
             batch_jobs = []
             
             for (tile_x, tile_y) in batch_tiles:
@@ -1088,9 +1153,9 @@ def main():
     parser.add_argument("pbf_file", help="Path to .pbf file")
     parser.add_argument("output_dir", help="Output directory")
     parser.add_argument("config_file", help="JSON config with features/colors")
-    parser.add_argument("--zoom", help="Zoom level or range (e.g. 12 or 6-17)", default="6-17")
-    parser.add_argument("--max-file-size", help="Maximum file size in KB", type=int, default=128)
-    parser.add_argument("--db-path", help="Path for temporary database", default="features.db")
+    parser.add_argument("--zoom", help="Zoom level or range (e.g. 12 or 6-17)", default=Config.DEFAULT_ZOOM_RANGE)
+    parser.add_argument("--max-file-size", help="Maximum file size in KB", type=int, default=Config.DEFAULT_MAX_FILE_SIZE_KB)
+    parser.add_argument("--db-path", help="Path for temporary database", default=Config.DEFAULT_DB_PATH)
     args = parser.parse_args()
     
     try:
@@ -1119,7 +1184,7 @@ def main():
     
     # Clean up any existing temporary files from previous runs
     import glob
-    existing_temp_files = glob.glob("tmp_*.geojson")
+    existing_temp_files = glob.glob(f"tmp_*{Config.GEOJSON_EXTENSION}")
     for temp_file in existing_temp_files:
         try:
             os.remove(temp_file)
