@@ -23,6 +23,7 @@ import atexit
 
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import List, Dict, Tuple, Optional, Union, Set, Any, Iterator
+from contextlib import contextmanager, ExitStack
 
 # Configure logging
 logging.basicConfig(
@@ -124,6 +125,78 @@ class Config:
 # Global variables to track files for cleanup
 _db_file_to_cleanup = None
 _temp_files_to_cleanup = set()
+
+@contextmanager
+def managed_temp_file(prefix: str = "tmp", suffix: str = Config.GEOJSON_EXTENSION) -> Iterator[str]:
+    """Context manager for temporary files with automatic cleanup"""
+    import tempfile
+    import uuid
+    
+    temp_file = None
+    try:
+        # Create temporary file in current directory instead of /tmp
+        temp_filename = f"{prefix}_{uuid.uuid4().hex[:8]}{suffix}"
+        
+        # Register for cleanup
+        global _temp_files_to_cleanup
+        _temp_files_to_cleanup.add(temp_filename)
+        
+        yield temp_filename
+        
+    finally:
+        # Cleanup
+        if temp_filename and os.path.exists(temp_filename):
+            try:
+                os.remove(temp_filename)
+                _temp_files_to_cleanup.discard(temp_filename)
+            except Exception as e:
+                logger.debug(f"Could not remove temporary file {temp_filename}: {e}")
+
+@contextmanager
+def managed_database(db_path: str) -> Iterator['FeatureDatabase']:
+    """Context manager for database connections with automatic cleanup"""
+    db = None
+    try:
+        db = FeatureDatabase(db_path)
+        
+        # Register for cleanup
+        global _db_file_to_cleanup
+        _db_file_to_cleanup = db_path
+        
+        yield db
+        
+    finally:
+        if db:
+            db.close()
+        _db_file_to_cleanup = None
+
+@contextmanager
+def memory_management():
+    """Context manager for memory management with garbage collection"""
+    try:
+        yield
+    finally:
+        # Force garbage collection
+        gc.collect()
+        
+        # Log memory usage if available
+        try:
+            import psutil
+            process = psutil.Process()
+            memory_info = process.memory_info()
+            logger.debug(f"Memory usage: {memory_info.rss / 1024 / 1024:.1f} MB")
+        except ImportError:
+            pass  # psutil not available
+
+@contextmanager
+def resource_monitor():
+    """Context manager for monitoring resource usage"""
+    start_time = time.time()
+    try:
+        yield
+    finally:
+        elapsed = time.time() - start_time
+        logger.debug(f"Operation completed in {elapsed:.2f} seconds")
 
 def cleanup_database():
     """Clean up database file if it exists"""
@@ -240,13 +313,27 @@ class FeatureDatabase:
         self.conn.execute("DELETE FROM features WHERE zoom_level = ?", (zoom_level,))
         self.conn.commit()
     
-    def close(self):
+    def close(self) -> None:
         """Close the database connection"""
-        self.conn.close()
+        if self.conn:
+            self.conn.close()
+            self.conn = None
     
-    def commit(self):
+    def commit(self) -> None:
         """Commit pending transactions"""
-        self.conn.commit()
+        if self.conn:
+            self.conn.commit()
+    
+    def __enter__(self):
+        """Context manager entry"""
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Context manager exit - ensures cleanup"""
+        self.close()
+        if exc_type is not None:
+            logger.error(f"Database error: {exc_val}")
+        return False  # Don't suppress exceptions
 
 
 def deg2num(lat_deg: float, lon_deg: float, zoom: int) -> Tuple[int, int]:
@@ -608,7 +695,7 @@ def get_layer_fields_from_pbf(pbf_file, layer):
 
 def build_ogr2ogr_where_clause_from_config(config, allowed_fields):
     conds = []
-    for k in config.keys():
+    for k, v in config.items():
         if "=" in k:
             key, val = k.split("=", 1)
             if key in allowed_fields:
@@ -762,11 +849,53 @@ def validate_db_path(db_path: str) -> None:
     
     logger.debug(f"Database path validation passed: {db_path}")
 
-def extract_layer_to_temp_file(pbf_file: str, layer: str, where_clause: str, select_fields: str) -> str:
-    """Extract layer data from PBF to temporary GeoJSON file"""
-    tmp_filename = f"tmp_{layer}_{os.getpid()}{Config.GEOJSON_EXTENSION}"
+def get_layer_fields_from_pbf(pbf_file: str, layer: str) -> Set[str]:
+    """Get available fields from a PBF layer"""
+    cmd = ["ogrinfo", "-so", pbf_file, layer]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        logger.warning(f"Could not get fields for layer {layer}: {result.stderr}")
+        return set()
     
-    # Register temporary file for cleanup
+    fields = set()
+    for line in result.stdout.split('\n'):
+        if ':' in line and not line.strip().startswith('Geometry'):
+            field_name = line.split(':')[0].strip()
+            if field_name and not field_name.startswith('FID'):
+                fields.add(field_name)
+    
+    logger.debug(f"Available fields for layer {layer}: {sorted(fields)}")
+    return fields
+
+def check_pbf_layers(pbf_file: str) -> List[str]:
+    """Check what layers are available in the PBF file"""
+    cmd = ["ogrinfo", pbf_file]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        logger.error(f"Could not read PBF file: {result.stderr}")
+        return []
+    
+    layers = []
+    for line in result.stdout.split('\n'):
+        # Look for lines like "1: points (Point)" or "2: lines (Line String)"
+        if ':' in line and not line.startswith('INFO:'):
+            parts = line.split(':')
+            if len(parts) >= 2:
+                layer_name = parts[1].strip().split(' ')[0]  # Get just the layer name before the parentheses
+                if layer_name and layer_name not in ['Open', 'using', 'driver']:
+                    layers.append(layer_name)
+    
+    logger.info(f"Available layers in PBF: {layers}")
+    return layers
+
+def extract_layer_to_temp_file(pbf_file: str, layer: str, where_clause: str, select_fields: str) -> Optional[str]:
+    """Extract layer data from PBF to temporary GeoJSON file"""
+    
+    # Create temporary file name manually (don't use context manager yet)
+    import uuid
+    tmp_filename = f"tmp_{layer}_{uuid.uuid4().hex[:8]}.geojson"
+    
+    # Register for cleanup
     global _temp_files_to_cleanup
     _temp_files_to_cleanup.add(tmp_filename)
     
@@ -781,15 +910,25 @@ def extract_layer_to_temp_file(pbf_file: str, layer: str, where_clause: str, sel
         layer
     ]
     
-    result = subprocess.run(cmd, capture_output=True)
+    with resource_monitor():
+        result = subprocess.run(cmd, capture_output=True, text=True)
+    
     if result.returncode != 0:
         # ogr2ogr command failed - layer might be empty or invalid
+        logger.warning(f"ogr2ogr failed for layer {layer}")
         return None
     
     # Check if file was created and has content
-    if not os.path.exists(tmp_filename) or os.path.getsize(tmp_filename) == 0:
+    if not os.path.exists(tmp_filename):
+        logger.warning(f"Output file not created for layer {layer}")
+        return None
+        
+    file_size = os.path.getsize(tmp_filename)
+    if file_size == 0:
+        logger.warning(f"Empty output file for layer {layer}")
         return None
     
+    # Return the filename (it will be cleaned up manually later)
     return tmp_filename
 
 def process_feature_for_zoom_levels(feat: Dict[str, Any], config: Dict[str, Any], config_fields: Set[str], zoom_levels: List[int], db: 'FeatureDatabase', batch_features: List[Tuple[int, int, int, Dict[str, Any], int]]) -> int:
@@ -889,6 +1028,7 @@ def process_layer_directly_to_database(pbf_file: str, layer: str, config: Dict[s
     # Extract layer to temporary file
     tmp_filename = extract_layer_to_temp_file(pbf_file, layer, where_clause, select_fields)
     if not tmp_filename:
+        logger.warning(f"No temporary file created for layer {layer}")
         return 0
     
     try:
@@ -912,71 +1052,71 @@ def process_layer_directly_to_database(pbf_file: str, layer: str, config: Dict[s
                 db.insert_feature(zoom_batch, x_batch, y_batch, feat_data, prio)
             db.commit()
         
+        logger.info(f"Processed {features_processed} features from layer {layer}")
         return features_processed
         
+    except FileNotFoundError:
+        logger.error(f"Temporary file {tmp_filename} not found")
+        return 0
+    except Exception as e:
+        logger.error(f"Error processing layer {layer}: {e}")
+        return 0
     finally:
         # Always clean up the temporary file
-        if os.path.exists(tmp_filename):
-            os.remove(tmp_filename)
-        # Remove from tracking set since we cleaned it up manually
-        _temp_files_to_cleanup.discard(tmp_filename)
+        if tmp_filename and os.path.exists(tmp_filename):
+            try:
+                os.remove(tmp_filename)
+                _temp_files_to_cleanup.discard(tmp_filename)
+                logger.debug(f"Cleaned up temporary file: {tmp_filename}")
+            except Exception as e:
+                logger.debug(f"Could not remove temporary file {tmp_filename}: {e}")
 
-def process_pbf_directly_to_database(pbf_file, config, db_path, zoom_levels):
+def process_pbf_directly_to_database(pbf_file: str, config: Dict[str, Any], db_path: str, zoom_levels: List[int]) -> int:
     """Process PBF directly to database with minimal temporary files"""
-    global _db_file_to_cleanup
-    _db_file_to_cleanup = db_path  # Register for cleanup
-    
     logger.info("Processing PBF directly to database (minimal temporary files)")
     
-    db = FeatureDatabase(db_path)
-    config_fields = get_config_fields(config)
+    # First, check what layers are available in the PBF file
+    available_layers = check_pbf_layers(pbf_file)
+    if not available_layers:
+        logger.error("No layers found in PBF file")
+        return 0
     
-    # All OSM fields that might be needed
-    ALL_OSM_FIELDS = {
-        "highway", "waterway", "railway", "natural", "place", "boundary", "power", 
-        "man_made", "barrier", "aeroway", "route", "building", "landuse", "leisure", 
-        "amenity", "shop", "tourism", "historic", "office", "craft", "emergency", 
-        "military", "sport", "water"
-    }
-    
-    LAYER_FIELDS = {
-        "points": ALL_OSM_FIELDS,
-        "lines": ALL_OSM_FIELDS,
-        "multilinestrings": ALL_OSM_FIELDS,
-        "multipolygons": ALL_OSM_FIELDS,
-        "other_relations": ALL_OSM_FIELDS
-    }
-    
-    layers = ["points", "lines", "multilinestrings", "multipolygons", "other_relations"]
-    logger.info(f"Config requires these fields: {', '.join(sorted(config_fields))}")
-    
-    total_features_processed = 0
-    
-    # Process each layer separately and immediately clean up
-    for i, layer in enumerate(layers):
-        logger.info(f"[{i+1}/{len(layers)}] Processing layer: {layer} directly to database")
-        
-        layer_features = process_layer_directly_to_database(
-            pbf_file, layer, config, db, zoom_levels, config_fields, LAYER_FIELDS
-        )
-        
-        total_features_processed += layer_features
-        logger.info(f"Layer {layer}: {layer_features} features processed")
-        
-        # Force garbage collection after each layer
-        gc.collect()
-    
-    logger.info(f"Total processed: {total_features_processed} features directly from PBF")
-    
-    # Print statistics for each zoom level
-    for zoom in zoom_levels:
-        count = db.count_features_for_zoom(zoom)
-        logger.info(f"Zoom {zoom}: {count} features stored")
-    
-    db.close()
-    gc.collect()
-    
-    return total_features_processed
+    with managed_database(db_path) as db:
+        with memory_management():
+            config_fields = get_config_fields(config)
+            
+            logger.info(f"Config requires these fields: {', '.join(sorted(config_fields))}")
+            
+            total_features_processed = 0
+            
+            # Process each layer separately and immediately clean up
+            for i, layer in enumerate(Config.PROCESSING_LAYERS):
+                if layer not in available_layers:
+                    logger.warning(f"Layer {layer} not found in PBF file, skipping")
+                    continue
+                    
+                logger.info(f"[{i+1}/{len(Config.PROCESSING_LAYERS)}] Processing layer: {layer} directly to database")
+                
+                with resource_monitor():
+                    layer_features = process_layer_directly_to_database(
+                        pbf_file, layer, config, db, zoom_levels, config_fields, Config.LAYER_FIELDS
+                    )
+                
+                total_features_processed += layer_features
+                logger.info(f"Layer {layer}: {layer_features} features processed")
+                
+                # Memory management between layers
+                with memory_management():
+                    pass
+            
+            logger.info(f"Total processed: {total_features_processed} features directly from PBF")
+            
+            # Print statistics for each zoom level
+            for zoom in zoom_levels:
+                count = db.count_features_for_zoom(zoom)
+                logger.info(f"Zoom {zoom}: {count} features stored")
+            
+            return total_features_processed
 
 def tile_worker(args):
     start_time = time.time()
@@ -1055,44 +1195,44 @@ def generate_tiles_from_database(db_path: str, output_dir: str, zoom: int, max_f
     """Generate tiles for a specific zoom level from the database"""
     logger.info(f"Processing zoom level {zoom} from database")
     
-    db = FeatureDatabase(db_path)
-    
-    # Get all tiles for this zoom level
-    tiles = db.get_tiles_for_zoom(zoom)
-    if not tiles:
-        logger.warning(f"No tiles found for zoom {zoom}")
-        db.close()
-        return
-    
-    logger.info(f"Found {len(tiles)} tiles for zoom {zoom}")
-    
-    # Process tiles in batches
-    all_tile_sizes = []
-    total_batches = (len(tiles) + Config.TILE_BATCH_SIZE - 1) // Config.TILE_BATCH_SIZE
-    
-    with tqdm(total=len(tiles), desc=f"Writing tiles (zoom {zoom})") as pbar:
-        for batch_idx in range(0, len(tiles), Config.TILE_BATCH_SIZE):
-            batch_tiles = tiles[batch_idx:batch_idx + Config.TILE_BATCH_SIZE]
-            batch_jobs = []
+    with managed_database(db_path) as db:
+        with memory_management():
+            # Get all tiles for this zoom level
+            tiles = db.get_tiles_for_zoom(zoom)
+            if not tiles:
+                logger.warning(f"No tiles found for zoom {zoom}")
+                return
             
-            for (tile_x, tile_y) in batch_tiles:
-                features = db.get_features_for_tile(zoom, tile_x, tile_y)
-                if features:
-                    batch_jobs.append((tile_x, tile_y, features, zoom, output_dir, max_file_size, None))
+            logger.info(f"Found {len(tiles)} tiles for zoom {zoom}")
             
-            if batch_jobs:
-                # Write this batch
-                batch_sizes = write_tile_batch(batch_jobs, output_dir, zoom, max_file_size, None)
-                all_tile_sizes.extend(batch_sizes)
+            # Process tiles in batches
+            all_tile_sizes = []
+            total_batches = (len(tiles) + Config.TILE_BATCH_SIZE - 1) // Config.TILE_BATCH_SIZE
             
-            pbar.update(len(batch_tiles))
-            gc.collect()
-    
-    avg_tile_size = sum(all_tile_sizes) / len(all_tile_sizes) if all_tile_sizes else 0
-    print(f"Zoom {zoom}: {len(all_tile_sizes)} tiles, average size = {avg_tile_size:.2f} bytes")
-    
-    db.close()
-    gc.collect()
+            with tqdm(total=len(tiles), desc=f"Writing tiles (zoom {zoom})") as pbar:
+                for batch_idx in range(0, len(tiles), Config.TILE_BATCH_SIZE):
+                    batch_tiles = tiles[batch_idx:batch_idx + Config.TILE_BATCH_SIZE]
+                    batch_jobs = []
+                    
+                    for (tile_x, tile_y) in batch_tiles:
+                        features = db.get_features_for_tile(zoom, tile_x, tile_y)
+                        if features:
+                            batch_jobs.append((tile_x, tile_y, features, zoom, output_dir, max_file_size, None))
+                    
+                    if batch_jobs:
+                        # Write this batch
+                        with resource_monitor():
+                            batch_sizes = write_tile_batch(batch_jobs, output_dir, zoom, max_file_size, None)
+                        all_tile_sizes.extend(batch_sizes)
+                    
+                    pbar.update(len(batch_tiles))
+                    
+                    # Memory management between batches
+                    with memory_management():
+                        pass
+            
+            avg_tile_size = sum(all_tile_sizes) / len(all_tile_sizes) if all_tile_sizes else 0
+            logger.info(f"Zoom {zoom}: {len(all_tile_sizes)} tiles, average size = {avg_tile_size:.2f} bytes")
 
 def precompute_global_color_palette(config: Dict[str, Any]) -> int:
     global GLOBAL_COLOR_PALETTE, GLOBAL_INDEX_TO_RGB332
