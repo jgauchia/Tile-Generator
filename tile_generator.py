@@ -562,6 +562,118 @@ def get_config_fields(config):
             fields.add(k)
     return fields
 
+def extract_layer_to_temp_file(pbf_file, layer, where_clause, select_fields):
+    """Extract layer data from PBF to temporary GeoJSON file"""
+    tmp_filename = f"tmp_{layer}_{os.getpid()}.geojson"
+    
+    # Register temporary file for cleanup
+    global _temp_files_to_cleanup
+    _temp_files_to_cleanup.add(tmp_filename)
+    
+    cmd = [
+        "ogr2ogr",
+        "-f", "GeoJSON",
+        "-nlt", "PROMOTE_TO_MULTI",
+        "-where", where_clause,
+        "-select", select_fields,
+        tmp_filename,
+        pbf_file,
+        layer
+    ]
+    
+    result = subprocess.run(cmd, capture_output=True)
+    if result.returncode != 0:
+        # ogr2ogr command failed - layer might be empty or invalid
+        return None
+    
+    # Check if file was created and has content
+    if not os.path.exists(tmp_filename) or os.path.getsize(tmp_filename) == 0:
+        return None
+    
+    return tmp_filename
+
+def process_feature_for_zoom_levels(feat, config, config_fields, zoom_levels, db, batch_features):
+    """Process a single feature for all relevant zoom levels"""
+    feat['properties'] = {k: v for k, v in feat['properties'].items() if k in config_fields}
+    
+    tags = feat['properties']
+    style, stylekey = get_style_for_tags(tags, config)
+    if not style:
+        return 0
+    
+    try:
+        geom = shape(feat['geometry'])
+    except (ValueError, TypeError) as e:
+        # Invalid geometry data - skip this feature
+        return 0
+        
+    if not geom.is_valid or geom.is_empty:
+        return 0
+    
+    zoom_filter = style.get("zoom", 6)
+    priority = style.get("priority", 5)
+    hex_color = style.get("color", "#FFFFFF")
+    color = hex_to_rgb332_direct(hex_color)
+    
+    features_added = 0
+    
+    # Process this feature for all relevant zoom levels
+    for zoom in zoom_levels:
+        if zoom < zoom_filter:
+            continue
+        
+        simplify_tolerance = get_simplify_tolerance_for_zoom(zoom)
+        feature_geom = geom
+        
+        if simplify_tolerance is not None and geom.geom_type in ("LineString", "MultiLineString"):
+            try:
+                feature_geom = feature_geom.simplify(simplify_tolerance, preserve_topology=True)
+            except (ValueError, TypeError) as e:
+                # Geometry simplification failed - use original geometry
+                pass
+        
+        if feature_geom.is_empty or not feature_geom.is_valid:
+            continue
+        
+        # Calculate tile bounds for this zoom level
+        minx, miny, maxx, maxy = feature_geom.bounds
+        xtile_min, ytile_min = deg2num(miny, minx, zoom)
+        xtile_max, ytile_max = deg2num(maxy, maxx, zoom)
+        
+        # Store feature for each tile it intersects
+        for xt in range(min(xtile_min, xtile_max), max(xtile_min, xtile_max) + 1):
+            for yt in range(min(ytile_min, ytile_max), max(ytile_min, ytile_max) + 1):
+                t_lon_min, t_lat_min, t_lon_max, t_lat_max = tile_latlon_bounds(xt, yt, zoom)
+                tile_bbox = box(t_lon_min, t_lat_min, t_lon_max, t_lat_max)
+                
+                try:
+                    clipped_geom = feature_geom.intersection(tile_bbox)
+                except (ValueError, TypeError) as e:
+                    # Geometry intersection failed - skip this tile
+                    continue
+                
+                if not clipped_geom.is_empty:
+                    feature_data = {
+                        "geom": clipped_geom,
+                        "color": color,
+                        "color_hex": hex_color,
+                        "tags": tags,
+                        "priority": priority
+                    }
+                    
+                    batch_features.append((zoom, xt, yt, feature_data, priority))
+                    features_added += 1
+                    
+                    # Batch insert to avoid memory buildup
+                    if len(batch_features) >= DB_BATCH_SIZE:
+                        for zoom_batch, x_batch, y_batch, feat_data, prio in batch_features:
+                            db.insert_feature(zoom_batch, x_batch, y_batch, feat_data, prio)
+                        db.commit()
+                        batch_features.clear()
+                        gc.collect()
+    
+    return features_added
+
 def process_layer_directly_to_database(pbf_file, layer, config, db, zoom_levels, config_fields, LAYER_FIELDS):
     """Process a single layer directly from PBF to database"""
     possible = LAYER_FIELDS[layer]
@@ -574,115 +686,23 @@ def process_layer_directly_to_database(pbf_file, layer, config, db, zoom_levels,
     
     select_fields = ",".join(sorted(allowed))
     
-    # Create temporary file in current working directory
-    tmp_filename = f"tmp_{layer}_{os.getpid()}.geojson"
-    
-    # Register temporary file for cleanup
-    global _temp_files_to_cleanup
-    _temp_files_to_cleanup.add(tmp_filename)
+    # Extract layer to temporary file
+    tmp_filename = extract_layer_to_temp_file(pbf_file, layer, where_clause, select_fields)
+    if not tmp_filename:
+        return 0
     
     try:
-        cmd = [
-            "ogr2ogr",
-            "-f", "GeoJSON",
-            "-nlt", "PROMOTE_TO_MULTI",
-            "-where", where_clause,
-            "-select", select_fields,
-            tmp_filename,
-            pbf_file,
-            layer
-        ]
-        
-        result = subprocess.run(cmd, capture_output=True)
-        if result.returncode != 0:
-            # ogr2ogr command failed - layer might be empty or invalid
-            return 0
-        
-        # Process the temporary file immediately and delete it
+        # Process features from temporary file
         features_processed = 0
         batch_features = []
         
-        # Check if file was created and has content
-        if not os.path.exists(tmp_filename) or os.path.getsize(tmp_filename) == 0:
-            return 0
         with open(tmp_filename, "r", encoding="utf-8") as f:
             for feat in ijson.items(f, "features.item"):
-                feat['properties'] = {k: v for k, v in feat['properties'].items() if k in config_fields}
-                
-                tags = feat['properties']
-                style, stylekey = get_style_for_tags(tags, config)
-                if not style:
-                    continue
-                
-                try:
-                    geom = shape(feat['geometry'])
-                except (ValueError, TypeError) as e:
-                    # Invalid geometry data - skip this feature
-                    continue
-                    
-                if not geom.is_valid or geom.is_empty:
-                    continue
-                
-                zoom_filter = style.get("zoom", 6)
-                priority = style.get("priority", 5)
-                hex_color = style.get("color", "#FFFFFF")
-                color = hex_to_rgb332_direct(hex_color)
-                
-                # Process this feature for all relevant zoom levels
-                for zoom in zoom_levels:
-                    if zoom < zoom_filter:
-                        continue
-                    
-                    simplify_tolerance = get_simplify_tolerance_for_zoom(zoom)
-                    feature_geom = geom
-                    
-                    if simplify_tolerance is not None and geom.geom_type in ("LineString", "MultiLineString"):
-                        try:
-                            feature_geom = feature_geom.simplify(simplify_tolerance, preserve_topology=True)
-                        except (ValueError, TypeError) as e:
-                            # Geometry simplification failed - use original geometry
-                            pass
-                    
-                    if feature_geom.is_empty or not feature_geom.is_valid:
-                        continue
-                    
-                    # Calculate tile bounds for this zoom level
-                    minx, miny, maxx, maxy = feature_geom.bounds
-                    xtile_min, ytile_min = deg2num(miny, minx, zoom)
-                    xtile_max, ytile_max = deg2num(maxy, maxx, zoom)
-                    
-                    # Store feature for each tile it intersects
-                    for xt in range(min(xtile_min, xtile_max), max(xtile_min, xtile_max) + 1):
-                        for yt in range(min(ytile_min, ytile_max), max(ytile_min, ytile_max) + 1):
-                            t_lon_min, t_lat_min, t_lon_max, t_lat_max = tile_latlon_bounds(xt, yt, zoom)
-                            tile_bbox = box(t_lon_min, t_lat_min, t_lon_max, t_lat_max)
-                            
-                            try:
-                                clipped_geom = feature_geom.intersection(tile_bbox)
-                            except (ValueError, TypeError) as e:
-                                # Geometry intersection failed - skip this tile
-                                continue
-                            
-                            if not clipped_geom.is_empty:
-                                feature_data = {
-                                    "geom": clipped_geom,
-                                    "color": color,
-                                    "color_hex": hex_color,
-                                    "tags": tags,
-                                    "priority": priority
-                                }
-                                
-                                batch_features.append((zoom, xt, yt, feature_data, priority))
-                                
-                                # Batch insert to avoid memory buildup
-                                if len(batch_features) >= DB_BATCH_SIZE:
-                                    for zoom_batch, x_batch, y_batch, feat_data, prio in batch_features:
-                                        db.insert_feature(zoom_batch, x_batch, y_batch, feat_data, prio)
-                                    db.commit()
-                                    batch_features.clear()
-                                    gc.collect()
-                
+                features_added = process_feature_for_zoom_levels(
+                    feat, config, config_fields, zoom_levels, db, batch_features
+                )
                 features_processed += 1
+                
                 if features_processed % 1000 == 0:
                     gc.collect()
         
