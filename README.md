@@ -10,13 +10,13 @@ The generated tiles are extremely compact and optimized for fast rendering in cu
 
 - Extracts relevant geometries and attributes from OSM PBF files using `ogr2ogr` with parallel processing
 - Filters and merges data into simplified GeoJSON with streaming processing
-- **Implements complete 6-step optimization pipeline** for maximum compression and performance
 - **Builds dynamic color palette** automatically from `features.json` configuration  
-- **Applies feature-specific optimizations** for buildings, highways, waterways, and natural features
-- **Uses advanced compression techniques** including geometric pattern detection and coordinate prediction
+- **Detects feature types** for highway, building, waterway, and natural features
+- **Memory-optimized processing** with single-pass feature reading for all zoom levels
+- **SQLite database storage** for efficient feature management and retrieval
 - Assigns features to tiles for zoom levels with boundary optimization
-- **Generates ultra-compact binary tiles** achieving **40-75% size reduction** compared to unoptimized formats
-- Uses comprehensive caching and performance optimizations for large-scale processing
+- **Generates compact binary tiles** with efficient coordinate encoding
+- Uses comprehensive memory management for large-scale processing
 
 ---
 
@@ -24,26 +24,31 @@ The generated tiles are extremely compact and optimized for fast rendering in cu
 
 The script implements multiple optimization layers for maximum compression and performance:
 
+### Memory Optimization
+- **Single feature processing**: Features are read once for all zoom levels
+- **Disk-based storage**: Uses SQLite database for temporary feature storage
+- **Batch processing**: Processes features in configurable batches to control memory usage
+- **Automatic cleanup**: Garbage collection and memory management throughout processing
+
 ### Dynamic Color Palette System
 - **Automatic palette generation**: Analyzes `features.json` and creates optimal color palette
 - **Indexed colors**: Each unique color gets compact index (0-N) for maximum compression
 - **Smart state management**: SET_COLOR_INDEX and SET_COLOR commands minimize redundancy
 - **Adaptive encoding**: Most frequent colors get optimal indices
 
-### Advanced Compression Techniques
-- **Feature-specific optimizations**: Buildings, highways, and geometric patterns get specialized commands
-- **Pattern recognition**: Detects urban grids, circles, and predictable coordinate sequences  
-- **Performance micro-optimizations**: Coordinate quantization, geometry validation, memory pooling
-- **Variable-length encoding**: Efficient coordinate and index compression with varint/zigzag
-- **State-based architecture**: Separated color state from geometry reduces redundancy
+### Compression Techniques
+- **Variable-length encoding**: Efficient coordinate compression with varint/zigzag
+- **Delta encoding**: Coordinate differences for compact storage
+- **RGB332 color format**: 8-bit color encoding for efficient storage
+- **Boundary optimization**: Cross-tile geometries optimized to reduce duplication
 
 ---
 
-## Complete Drawing Command Set
+## Drawing Command Set
 
-The script implements a comprehensive set of drawing commands organized in categories:
+The script implements a set of drawing commands for efficient tile generation:
 
-### Basic Geometry Commands (0x01-0x06)
+### Basic Geometry Commands
 | Command | Code | Purpose | Data Format |
 |---------|------|---------|-------------|
 | `LINE` | 0x01 | Single line segment | x1, y1, x2, y2 (delta-encoded) |
@@ -52,54 +57,24 @@ The script implements a comprehensive set of drawing commands organized in categ
 | `HORIZONTAL_LINE` | 0x05 | Horizontal line optimization | x1, width, y |
 | `VERTICAL_LINE` | 0x06 | Vertical line optimization | x, y1, height |
 
-### State Management Commands (0x80-0x81)
-| Command | Code | Purpose | Data Format |
-|---------|------|---------|-------------|
-| `SET_COLOR` | 0x80 | Direct RGB332 color | 1 byte RGB332 value |
-| `SET_COLOR_INDEX` | 0x81 | Palette color reference | varint palette_index |
-
-### Feature-Optimized Commands (0x82-0x84)
-| Command | Code | Purpose | Optimization | Data Format |
-|---------|------|---------|-------------|-------------|
-| `RECTANGLE` | 0x82 | Building rectangles | 60-80% reduction | x1, y1, width, height (delta) |
-| `STRAIGHT_LINE` | 0x83 | Highway segments | 40-60% reduction | x1, y1, dx, dy (delta) |
-| `HIGHWAY_SEGMENT` | 0x84 | Road continuity | 30-50% reduction | end_x, end_y, road_type |
-
-### Advanced Pattern Commands (0x85-0x8A)
-| Command | Code | Purpose | Optimization | Data Format |
-|---------|------|---------|-------------|-------------|
-| `GRID_PATTERN` | 0x85 | Urban street grids | 70-85% reduction | x, y, width, spacing, count, direction |
-| `BLOCK_PATTERN` | 0x86 | City block patterns | 60-80% reduction | x, y, block_width, block_height, rows, cols |
-| `CIRCLE` | 0x87 | Roundabouts/plazas | 50-70% reduction | center_x, center_y, radius |
-| `RELATIVE_MOVE` | 0x88 | Coordinate positioning | Coordinate compression | dx, dy (from current position) |
-| `PREDICTED_LINE` | 0x89 | Pattern-predicted paths | 30-50% reduction | end_x, end_y (start predicted) |
-| `COMPRESSED_POLYLINE` | 0x8A | Huffman-compressed lines | 20-40% reduction | huffman_encoded_coordinates |
-
 ---
 
-## Performance Results
-
-### File Size Reduction
-Real-world testing with comprehensive optimization pipeline:
-
-| Zoom Level | Tiles Optimized | Average Reduction | Max Reduction |
-|------------|-----------------|-------------------|---------------|
-| 12         | 85-95%         | 35-50%           | 75%           |
-| 13         | 80-90%         | 30-45%           | 70%           |
-| 14         | 75-85%         | 25-40%           | 65%           |
-| 15         | 70-80%         | 20-35%           | 60%           |
-| 16+        | 60-70%         | 15-30%           | 55%           |
 
 ### Processing Performance
 - **Multi-core processing**: Utilizes all available CPU cores for PBF extraction
 - **Streaming architecture**: Processes large PBF files without memory overflow
-- **Memory optimization**: Uses object pools and caches for 40-60% memory reduction
-- **Pattern detection**: Advanced algorithms detect and optimize geometric patterns
-- **Adaptive optimization**: Applies appropriate optimization level based on zoom and feature density
+- **Memory optimization**: Constant memory usage regardless of zoom level count
+- **Batch processing**: Configurable batch sizes for optimal memory management
 
 ---
 
-## Enhanced Script Features
+## Script Features
+
+### Memory-Optimized Processing
+- **Single-pass feature processing**: Features are read once for all zoom levels
+- **SQLite database storage**: Efficient disk-based feature storage and retrieval
+- **Batch processing**: Configurable batch sizes to control memory usage
+- **Automatic cleanup**: Garbage collection and memory management
 
 ### Intelligent Feature Detection
 ```
@@ -112,22 +87,21 @@ Feature types detected for optimization:
 ```
 
 ### Comprehensive Statistics
-The script provides detailed optimization reports:
+The script provides detailed processing reports:
 ```
-[Zoom 12] Optimization Results:
-  - Feature types detected: building, highway, natural, waterway
-  - Feature optimizations applied: 1,247
-  - Advanced compression applied: grid patterns, circles, coordinate prediction
-  - Tiles with palette optimization: 892/945 (94.4%)
-  - Total bytes saved: 47,831 bytes
-  - Average savings per tile: 50.6 bytes
+Processing features and storing in database...
+Processing 125000 features for 12 zoom levels...
+Zoom 6: 15420 features stored
+Zoom 7: 28930 features stored
+Zoom 8: 45670 features stored
+...
 ```
 
-### Memory and Performance Monitoring
-- Real-time memory usage tracking with `psutil`
+### Performance Monitoring
+- Real-time memory usage tracking
 - Processing time measurement per zoom level
-- Detailed summary table with optimization statistics
 - Progress bars for all major processing steps
+- Detailed statistics and reporting
 
 ---
 
@@ -135,7 +109,7 @@ The script provides detailed optimization reports:
 
 ### Command Line
 ```bash
-python tile_generator.py planet.osm.pbf tiles/ features.json --zoom 6-17 --max-file-size 128
+python tile_generator.py planet.osm.pbf tiles/ features.json --zoom 6-17 --max-file-size 128 --db-path features.db
 ```
 
 ### Arguments
@@ -146,25 +120,31 @@ python tile_generator.py planet.osm.pbf tiles/ features.json --zoom 6-17 --max-f
 | `config_file` | Features JSON configuration | Required |
 | `--zoom` | Zoom level or range (e.g. `12` or `6-17`) | `6-17` |
 | `--max-file-size` | Max tile size in KB | 128 |
+| `--db-path` | Path for temporary database | `features.db` |
+
+### Memory Optimization Features
+
+The optimized version provides significant memory improvements:
+
+- **Single feature processing**: Features are read once for all zoom levels
+- **Disk-based storage**: Uses SQLite database for temporary feature storage
+- **Memory efficiency**: Constant memory usage regardless of zoom level count
+- **Scalability**: Handles large datasets without memory overflow
+- **Batch processing**: Consistent memory usage across multiple zoom levels
 
 ---
 
 ## Binary Tile Format
 
-### Enhanced Format Features
-- **Multi-tier command system**: Basic geometry + advanced compression commands
-- **State-based rendering**: Separated color state from geometry data
-- **Variable-length encoding**: Optimal storage for coordinates and indices
-- **Pattern-aware compression**: Special encoding for detected geometric patterns
-- **Forward compatibility**: Advanced commands safely ignored by basic parsers
+### Format Features
+- **Basic geometry commands**: Lines, polygons, polylines
+- **Variable-length encoding**: Efficient coordinate compression with varint/zigzag
+- **Delta encoding**: Coordinate differences for compact storage
+- **RGB332 color format**: 8-bit color encoding embedded in each command
 
-### Command Categories
-1. **State Commands** (0x80-0x81): Color management
-2. **Basic Geometry** (0x01-0x06): Lines, polygons, polylines
-3. **Feature-Optimized** (0x82-0x84): Buildings, highways, segments  
-4. **Advanced Compression** (0x85-0x8A): Patterns, circles, prediction
-
-See complete specification: [/docs/bin_tile_format.md](/docs/bin_tile_format.md)
+### Command Types
+1. **Basic Geometry** (0x01-0x06): Lines, polygons, polylines
+2. **Optimized Lines**: Horizontal and vertical line optimizations
 
 ---
 
@@ -188,13 +168,11 @@ The script automatically detects feature types from your configuration:
 }
 ```
 
-**Automatic Optimizations:**
+**Configuration Features:**
 - Colors automatically indexed into optimal palette
-- Feature types detected for specific optimizations
+- Feature types detected for processing
 - Zoom-based filtering reduces processing overhead
 - Priority-based rendering order optimization
-
-See full specification: [/docs/features_json_format.md](/docs/features_json_format.md)
 
 ---
 
@@ -268,32 +246,31 @@ output_dir/
     └── ...
 ```
 
-Each `.bin` file contains highly optimized drawing commands with full 6-step compression applied.
+Each `.bin` file contains optimized drawing commands with variable-length encoding and embedded RGB332 colors.
 
 ---
 
 ## Documentation
 
-- [Binary Tile File Format](/docs/bin_tile_format.md) - Complete specification with advanced commands
-- [Features JSON Format](/docs/features_json_format.md) - Configuration format with auto-detection details
-- [Tile Viewer Documentation](/docs/tile_viewer.md) - Enhanced viewer with advanced command support  
-- [Optimization Pipeline](/docs/tile_optimization_roadmap.md) - Technical implementation details
+- [Binary Tile File Format](/docs/bin_tile_format.md) - Complete specification of drawing commands
+- [Features JSON Format](/docs/features_json_format.md) - Configuration format details
+- [Tile Viewer Documentation](/docs/tile_viewer.md) - Tile viewer with command support
 
 ---
 
 ## Technical Highlights
 
-### Pattern Recognition Algorithms
-- **Grid detection**: Analyzes line patterns to identify urban street grids
-- **Circular approximation**: Uses variance analysis to detect circular polygons
-- **Coordinate prediction**: Implements movement vector prediction for path compression
-- **Geometric primitives**: Automatically detects rectangles, straight lines, and basic shapes
-
 ### Memory Management
-- **Object pooling**: Reuses allocated memory for commands and coordinates
-- **Geometry caching**: Caches processed geometries with hash-based deduplication
+- **SQLite database**: Efficient disk-based storage for features
+- **Batch processing**: Configurable batch sizes for memory control
 - **Streaming processing**: Handles unlimited file sizes with constant memory usage
 - **Garbage collection optimization**: Strategic GC calls prevent memory bloat
+
+### Processing Optimization
+- **Single-pass processing**: Features read once for all zoom levels
+- **Multi-core processing**: Parallel PBF extraction and tile generation
+- **Variable-length encoding**: Efficient coordinate compression
+- **Boundary optimization**: Cross-tile geometries optimized to reduce duplication
 
 ### Rendering Optimization
 - **State-based commands**: Minimizes GPU state changes for better rendering performance
