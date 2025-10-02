@@ -41,7 +41,7 @@ class Config:
     
     # Processing limits
     MAX_WORKERS = min(os.cpu_count() or 4, 4)
-    DB_BATCH_SIZE = 10000
+    DB_BATCH_SIZE = 50000  # Increased for better performance
     TILE_BATCH_SIZE = 5000
     
     # File size limits
@@ -168,7 +168,7 @@ def managed_database(db_path: str) -> Iterator['FeatureDatabase']:
     finally:
         if db:
             db.close()
-        _db_file_to_cleanup = None
+        # Don't reset _db_file_to_cleanup here - let cleanup_all() handle it
 
 @contextmanager
 def memory_management():
@@ -199,14 +199,31 @@ def resource_monitor():
         logger.debug(f"Operation completed in {elapsed:.2f} seconds")
 
 def cleanup_database():
-    """Clean up database file if it exists"""
+    """Clean up database file and WAL mode files if they exist"""
     global _db_file_to_cleanup
     if _db_file_to_cleanup and os.path.exists(_db_file_to_cleanup):
         try:
+            # Remove main database file
             os.remove(_db_file_to_cleanup)
-            logger.debug(f"Cleaned up database file: {_db_file_to_cleanup}")
+            logger.info(f"Cleaned up database file: {_db_file_to_cleanup}")
+            
+            # Remove WAL mode files if they exist
+            wal_file = _db_file_to_cleanup + "-wal"
+            shm_file = _db_file_to_cleanup + "-shm"
+            
+            if os.path.exists(wal_file):
+                os.remove(wal_file)
+                logger.info(f"Cleaned up WAL file: {wal_file}")
+            
+            if os.path.exists(shm_file):
+                os.remove(shm_file)
+                logger.info(f"Cleaned up SHM file: {shm_file}")
+                
         except Exception as e:
-            logger.debug(f"Could not remove database file {_db_file_to_cleanup}: {e}")
+            logger.debug(f"Could not remove database files {_db_file_to_cleanup}: {e}")
+        finally:
+            # Reset the global variable after cleanup
+            _db_file_to_cleanup = None
 
 def cleanup_temp_files():
     """Clean up temporary files if they exist"""
@@ -246,11 +263,22 @@ GLOBAL_INDEX_TO_RGB332 = {}  # index -> rgb332_value
 # Database configuration moved to Config class
 
 class FeatureDatabase:
-    """Database for storing and retrieving features by zoom level and tile coordinates"""
+    """Optimized database for storing and retrieving features by zoom level and tile coordinates"""
     
     def __init__(self, db_path):
         self.db_path = db_path
         self.conn = sqlite3.connect(db_path, check_same_thread=False)
+        
+        # Enable WAL mode for better concurrency and performance
+        self.conn.execute("PRAGMA journal_mode=WAL")
+        
+        # Optimize SQLite settings for performance
+        self.conn.execute("PRAGMA synchronous=NORMAL")  # Faster than FULL, still safe
+        self.conn.execute("PRAGMA cache_size=10000")    # 10MB cache
+        self.conn.execute("PRAGMA temp_store=MEMORY")     # Store temp tables in memory
+        self.conn.execute("PRAGMA mmap_size=268435456")  # 256MB memory mapping
+        
+        # Create optimized table structure
         self.conn.execute("""
             CREATE TABLE IF NOT EXISTS features (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -262,6 +290,12 @@ class FeatureDatabase:
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        
+        # Create optimized composite indexes for faster queries
+        self.conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_zoom_tile_priority 
+            ON features(zoom_level, tile_x, tile_y, priority)
+        """)
         self.conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_zoom_tile 
             ON features(zoom_level, tile_x, tile_y)
@@ -270,22 +304,57 @@ class FeatureDatabase:
             CREATE INDEX IF NOT EXISTS idx_zoom 
             ON features(zoom_level)
         """)
+        
+        # Prepare statements for better performance
+        self._prepare_statements()
+        
         self.conn.commit()
     
-    def insert_feature(self, zoom_level, tile_x, tile_y, feature_data, priority=5):
-        """Insert a feature into the database"""
-        self.conn.execute("""
+    def _prepare_statements(self):
+        """Store SQL statements for better performance (Python sqlite3 doesn't have prepare)"""
+        self.insert_sql = """
             INSERT INTO features (zoom_level, tile_x, tile_y, feature_data, priority)
             VALUES (?, ?, ?, ?, ?)
-        """, (zoom_level, tile_x, tile_y, pickle.dumps(feature_data), priority))
-    
-    def get_features_for_tile(self, zoom_level, tile_x, tile_y):
-        """Get all features for a specific tile"""
-        cursor = self.conn.execute("""
+        """
+        self.select_sql = """
             SELECT feature_data, priority FROM features 
             WHERE zoom_level = ? AND tile_x = ? AND tile_y = ?
             ORDER BY priority
-        """, (zoom_level, tile_x, tile_y))
+        """
+        self.tiles_sql = """
+            SELECT DISTINCT tile_x, tile_y FROM features 
+            WHERE zoom_level = ?
+        """
+        self.count_sql = """
+            SELECT COUNT(*) FROM features WHERE zoom_level = ?
+        """
+        self.clear_sql = """
+            DELETE FROM features WHERE zoom_level = ?
+        """
+    
+    def insert_feature(self, zoom_level, tile_x, tile_y, feature_data, priority=5):
+        """Insert a feature into the database using optimized SQL"""
+        self.conn.execute(self.insert_sql, (zoom_level, tile_x, tile_y, pickle.dumps(feature_data), priority))
+    
+    def insert_features_batch(self, features_batch: List[Tuple[int, int, int, Dict[str, Any], int]]):
+        """Insert multiple features in a single transaction for better performance"""
+        if not features_batch:
+            return
+        
+        try:
+            # Use executemany for batch insert
+            data = [(zoom_level, tile_x, tile_y, pickle.dumps(feature_data), priority) 
+                   for zoom_level, tile_x, tile_y, feature_data, priority in features_batch]
+            self.conn.executemany(self.insert_sql, data)
+        except Exception as e:
+            logger.error(f"Batch insert failed: {e}")
+            # Fallback to individual inserts
+            for zoom_level, tile_x, tile_y, feature_data, priority in features_batch:
+                self.insert_feature(zoom_level, tile_x, tile_y, feature_data, priority)
+    
+    def get_features_for_tile(self, zoom_level, tile_x, tile_y):
+        """Get all features for a specific tile using optimized SQL"""
+        cursor = self.conn.execute(self.select_sql, (zoom_level, tile_x, tile_y))
         
         features = []
         for row in cursor.fetchall():
@@ -294,23 +363,18 @@ class FeatureDatabase:
         return features
     
     def get_tiles_for_zoom(self, zoom_level):
-        """Get all tile coordinates for a specific zoom level"""
-        cursor = self.conn.execute("""
-            SELECT DISTINCT tile_x, tile_y FROM features 
-            WHERE zoom_level = ?
-        """, (zoom_level,))
+        """Get all tile coordinates for a specific zoom level using optimized SQL"""
+        cursor = self.conn.execute(self.tiles_sql, (zoom_level,))
         return cursor.fetchall()
     
     def count_features_for_zoom(self, zoom_level):
-        """Count total features for a zoom level"""
-        cursor = self.conn.execute("""
-            SELECT COUNT(*) FROM features WHERE zoom_level = ?
-        """, (zoom_level,))
+        """Count total features for a zoom level using optimized SQL"""
+        cursor = self.conn.execute(self.count_sql, (zoom_level,))
         return cursor.fetchone()[0]
     
     def clear_zoom(self, zoom_level):
-        """Clear all features for a specific zoom level"""
-        self.conn.execute("DELETE FROM features WHERE zoom_level = ?", (zoom_level,))
+        """Clear all features for a specific zoom level using optimized SQL"""
+        self.conn.execute(self.clear_sql, (zoom_level,))
         self.conn.commit()
     
     def close(self) -> None:
@@ -1127,8 +1191,7 @@ def process_feature_for_zoom_levels(feat: Dict[str, Any], config: Dict[str, Any]
                     
                     # Batch insert to avoid memory buildup
                     if len(batch_features) >= Config.DB_BATCH_SIZE:
-                        for zoom_batch, x_batch, y_batch, feat_data, prio in batch_features:
-                            db.insert_feature(zoom_batch, x_batch, y_batch, feat_data, prio)
+                        db.insert_features_batch(batch_features)
                         db.commit()
                         batch_features.clear()
                         gc.collect()
@@ -1170,8 +1233,7 @@ def process_layer_directly_to_database(pbf_file: str, layer: str, config: Dict[s
         
         # Insert remaining features for this layer
         if batch_features:
-            for zoom_batch, x_batch, y_batch, feat_data, prio in batch_features:
-                db.insert_feature(zoom_batch, x_batch, y_batch, feat_data, prio)
+            db.insert_features_batch(batch_features)
             db.commit()
         
         logger.info(f"Processed {features_processed} features from layer {layer}")
@@ -1490,8 +1552,9 @@ def main() -> None:
         gc.collect()
     
     logger.info("Process completed successfully")
-
-    # File cleanup is handled automatically by atexit and signal handlers
+    
+    # Clean up temporary files and database
+    logger.info("Cleaning up temporary files and database...")
     cleanup_all()
     
     del config
