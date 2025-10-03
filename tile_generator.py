@@ -47,6 +47,17 @@ class Config:
     DB_BATCH_SIZE = 50000  # Increased for better performance
     TILE_BATCH_SIZE = 5000
     
+    # Parallelization optimization
+    TILE_COMPLEXITY_THRESHOLD = 100  # Features per tile threshold
+    MEMORY_AWARE_BATCH_SIZE = 1000  # Smaller batches for memory-intensive tiles
+    WORKER_MEMORY_LIMIT = 200 * 1024 * 1024  # 200MB per worker
+    
+    # I/O optimization
+    FILE_BUFFER_SIZE = 65536  # 64KB buffer for file operations
+    TILE_WRITE_BUFFER_SIZE = 32768  # 32KB buffer for tile writing
+    GEOJSON_READ_BUFFER_SIZE = 8192  # 8KB buffer for GeoJSON reading
+    BATCH_WRITE_SIZE = 100  # Write tiles in batches
+    
     # File size limits
     MAX_FILE_SIZE_KB_LIMIT = 10240  # 10MB
     DEFAULT_MAX_FILE_SIZE_KB = 128
@@ -787,6 +798,185 @@ def clear_object_pools():
     logger.debug("Object pools cleared")
 
 
+def optimized_file_write(filepath: str, data: bytes, buffer_size: int = None) -> None:
+    """
+    Optimized file write with buffering and error handling.
+    
+    Args:
+        filepath: Path to file to write
+        data: Data to write
+        buffer_size: Buffer size for writing (default: TILE_WRITE_BUFFER_SIZE)
+    """
+    if buffer_size is None:
+        buffer_size = Config.TILE_WRITE_BUFFER_SIZE
+    
+    try:
+        with open(filepath, "wb", buffering=buffer_size) as f:
+            f.write(data)
+            f.flush()  # Ensure data is written to disk
+    except IOError as e:
+        logger.error(f"Failed to write file {filepath}: {e}")
+        raise
+
+
+def optimized_file_read(filepath: str, buffer_size: int = None) -> str:
+    """
+    Optimized file read with buffering.
+    
+    Args:
+        filepath: Path to file to read
+        buffer_size: Buffer size for reading (default: GEOJSON_READ_BUFFER_SIZE)
+        
+    Returns:
+        File contents as string
+    """
+    if buffer_size is None:
+        buffer_size = Config.GEOJSON_READ_BUFFER_SIZE
+    
+    try:
+        with open(filepath, "r", encoding="utf-8", buffering=buffer_size) as f:
+            return f.read()
+    except IOError as e:
+        logger.error(f"Failed to read file {filepath}: {e}")
+        raise
+
+
+def batch_write_tiles(tile_data_batch: List[Tuple[str, bytes]], buffer_size: int = None) -> None:
+    """
+    Write multiple tiles in a batch for better I/O performance.
+    
+    Args:
+        tile_data_batch: List of (filepath, data) tuples
+        buffer_size: Buffer size for writing (default: TILE_WRITE_BUFFER_SIZE)
+    """
+    if buffer_size is None:
+        buffer_size = Config.TILE_WRITE_BUFFER_SIZE
+    
+    # Group tiles by directory to minimize directory changes
+    tiles_by_dir = {}
+    for filepath, data in tile_data_batch:
+        dir_path = os.path.dirname(filepath)
+        if dir_path not in tiles_by_dir:
+            tiles_by_dir[dir_path] = []
+        tiles_by_dir[dir_path].append((filepath, data))
+    
+    # Write tiles directory by directory
+    for dir_path, tiles in tiles_by_dir.items():
+        for filepath, data in tiles:
+            optimized_file_write(filepath, data, buffer_size)
+
+
+def create_directory_structure(base_path: str, tile_coords: List[Tuple[int, int]]) -> None:
+    """
+    Pre-create directory structure for tiles to avoid repeated os.makedirs calls.
+    
+    Args:
+        base_path: Base output directory
+        tile_coords: List of (x, y) tile coordinates
+    """
+    dirs_to_create = set()
+    for x, y in tile_coords:
+        tile_dir = os.path.join(base_path, str(x))
+        dirs_to_create.add(tile_dir)
+    
+    for dir_path in dirs_to_create:
+        os.makedirs(dir_path, exist_ok=True)
+
+
+def classify_tile_complexity(tile_data: Tuple[int, int, List[Dict[str, Any]]]) -> str:
+    """
+    Classify tile by complexity based on feature count and types.
+    
+    Args:
+        tile_data: Tuple of (x, y, features)
+        
+    Returns:
+        Complexity level: 'simple', 'medium', 'complex'
+    """
+    x, y, features = tile_data
+    feature_count = len(features)
+    
+    if feature_count <= Config.TILE_COMPLEXITY_THRESHOLD:
+        return 'simple'
+    elif feature_count <= Config.TILE_COMPLEXITY_THRESHOLD * 3:
+        return 'medium'
+    else:
+        return 'complex'
+
+
+def estimate_tile_memory_usage(tile_data: Tuple[int, int, List[Dict[str, Any]]]) -> int:
+    """
+    Estimate memory usage for a tile based on features.
+    
+    Args:
+        tile_data: Tuple of (x, y, features)
+        
+    Returns:
+        Estimated memory usage in bytes
+    """
+    x, y, features = tile_data
+    feature_count = len(features)
+    
+    # Rough estimation: each feature ~1KB, geometry commands ~2KB
+    base_memory = feature_count * 1024  # Base feature memory
+    geometry_memory = feature_count * 2048  # Geometry processing memory
+    command_memory = feature_count * 512  # Command generation memory
+    
+    return base_memory + geometry_memory + command_memory
+
+
+def create_optimized_tile_batches(tiles: List[Tuple[int, int, List[Dict[str, Any]]]]) -> List[List[Tuple[int, int, List[Dict[str, Any]]]]]:
+    """
+    Create optimized tile batches based on complexity and memory usage.
+    
+    Args:
+        tiles: List of tile data tuples
+        
+    Returns:
+        List of optimized tile batches
+    """
+    # Classify tiles by complexity
+    simple_tiles = []
+    medium_tiles = []
+    complex_tiles = []
+    
+    for tile in tiles:
+        complexity = classify_tile_complexity(tile)
+        if complexity == 'simple':
+            simple_tiles.append(tile)
+        elif complexity == 'medium':
+            medium_tiles.append(tile)
+        else:
+            complex_tiles.append(tile)
+    
+    # Create batches with different sizes based on complexity
+    batches = []
+    
+    # Simple tiles: larger batches
+    for i in range(0, len(simple_tiles), Config.TILE_BATCH_SIZE):
+        batch = simple_tiles[i:i + Config.TILE_BATCH_SIZE]
+        if batch:
+            batches.append(batch)
+    
+    # Medium tiles: medium batches
+    medium_batch_size = Config.TILE_BATCH_SIZE // 2
+    for i in range(0, len(medium_tiles), medium_batch_size):
+        batch = medium_tiles[i:i + medium_batch_size]
+        if batch:
+            batches.append(batch)
+    
+    # Complex tiles: smaller batches
+    for i in range(0, len(complex_tiles), Config.MEMORY_AWARE_BATCH_SIZE):
+        batch = complex_tiles[i:i + Config.MEMORY_AWARE_BATCH_SIZE]
+        if batch:
+            batches.append(batch)
+    
+    logger.debug(f"Created {len(batches)} optimized batches: "
+                f"{len(simple_tiles)} simple, {len(medium_tiles)} medium, {len(complex_tiles)} complex tiles")
+    
+    return batches
+
+
 def should_process_geometry_for_tile(geom: 'Geometry', tile_x: int, tile_y: int, zoom: int) -> bool:
     """
     Pre-filter geometry to avoid expensive intersection operations.
@@ -1460,7 +1650,7 @@ def process_layer_directly_to_database(pbf_file: str, layer: str, config: Dict[s
         features_processed = 0
         batch_features = []
         
-        with open(tmp_filename, "r", encoding="utf-8", buffering=8192) as f:
+        with open(tmp_filename, "r", encoding="utf-8", buffering=Config.GEOJSON_READ_BUFFER_SIZE) as f:
             # Process features in chunks for better memory management
             chunk_size = 1000
             feature_chunk = []
@@ -1611,8 +1801,8 @@ def tile_worker(args):
         if num_cmds_written == 0:
             buffer = pack_varint(0)
 
-    with open(filename, "wb") as f:
-        f.write(buffer)
+    # Use optimized file write
+    optimized_file_write(filename, buffer)
 
     tile_size = len(buffer)
     
@@ -1623,11 +1813,30 @@ def tile_worker(args):
     return tile_size, elapsed
 
 def write_tile_batch(batch, output_dir, zoom, max_file_size, simplify_tolerance):
-    """Write a batch of tiles and return statistics"""
+    """Write a batch of tiles with optimized worker allocation"""
     tile_sizes = []
     
-    # Use fewer workers for tile batches to control memory
-    batch_workers = min(Config.MAX_WORKERS, 2)
+    # Calculate optimal worker count based on batch complexity
+    total_features = sum(len(features) for _, _, features, _, _, _, _ in batch)
+    avg_features_per_tile = total_features / len(batch) if batch else 0
+    
+    # Adaptive worker allocation
+    if avg_features_per_tile <= Config.TILE_COMPLEXITY_THRESHOLD:
+        # Simple tiles: use more workers
+        batch_workers = min(Config.MAX_WORKERS, len(batch))
+    elif avg_features_per_tile <= Config.TILE_COMPLEXITY_THRESHOLD * 3:
+        # Medium tiles: use moderate workers
+        batch_workers = min(Config.MAX_WORKERS // 2, len(batch))
+    else:
+        # Complex tiles: use fewer workers to avoid memory issues
+        batch_workers = min(2, len(batch))
+    
+    # Ensure we have at least 1 worker
+    batch_workers = max(1, batch_workers)
+    
+    logger.debug(f"Processing batch of {len(batch)} tiles with {batch_workers} workers "
+                f"(avg features: {avg_features_per_tile:.1f})")
+    
     with ProcessPoolExecutor(max_workers=batch_workers) as executor:
         futures = [executor.submit(tile_worker, job) for job in batch]
         for future in as_completed(futures):
@@ -1650,27 +1859,42 @@ def generate_tiles_from_database(db_path: str, output_dir: str, zoom: int, max_f
             
             logger.info(f"Found {len(tiles)} tiles for zoom {zoom}")
             
-            # Process tiles in batches
-            all_tile_sizes = []
-            total_batches = (len(tiles) + Config.TILE_BATCH_SIZE - 1) // Config.TILE_BATCH_SIZE
+            # Load all tile data first for complexity analysis
+            all_tile_data = []
+            for (tile_x, tile_y) in tiles:
+                features = db.get_features_for_tile(zoom, tile_x, tile_y)
+                if features:
+                    all_tile_data.append((tile_x, tile_y, features))
             
-            with tqdm(total=len(tiles), desc=f"Writing tiles (zoom {zoom})") as pbar:
-                for batch_idx in range(0, len(tiles), Config.TILE_BATCH_SIZE):
-                    batch_tiles = tiles[batch_idx:batch_idx + Config.TILE_BATCH_SIZE]
+            if not all_tile_data:
+                logger.warning(f"No features found for zoom {zoom}")
+                return
+            
+            # Create optimized batches based on complexity
+            optimized_batches = create_optimized_tile_batches(all_tile_data)
+            
+            # Pre-create directory structure for all tiles
+            tile_coords = [(x, y) for x, y, _ in all_tile_data]
+            create_directory_structure(os.path.join(output_dir, str(zoom)), tile_coords)
+            
+            # Process optimized batches
+            all_tile_sizes = []
+            total_tiles = len(all_tile_data)
+            
+            with tqdm(total=total_tiles, desc=f"Writing tiles (zoom {zoom})") as pbar:
+                for batch_idx, batch_tile_data in enumerate(optimized_batches):
+                    # Convert tile data to job format
                     batch_jobs = []
-                    
-                    for (tile_x, tile_y) in batch_tiles:
-                        features = db.get_features_for_tile(zoom, tile_x, tile_y)
-                        if features:
-                            batch_jobs.append((tile_x, tile_y, features, zoom, output_dir, max_file_size, None))
+                    for (tile_x, tile_y, features) in batch_tile_data:
+                        batch_jobs.append((tile_x, tile_y, features, zoom, output_dir, max_file_size, None))
                     
                     if batch_jobs:
-                        # Write this batch
+                        # Write this optimized batch
                         with resource_monitor():
                             batch_sizes = write_tile_batch(batch_jobs, output_dir, zoom, max_file_size, None)
                         all_tile_sizes.extend(batch_sizes)
                     
-                    pbar.update(len(batch_tiles))
+                    pbar.update(len(batch_tile_data))
                     
                     # Memory management between batches
                     with memory_management():
@@ -1728,10 +1952,11 @@ def write_palette_bin(output_dir):
     os.makedirs(output_dir, exist_ok=True)
     palette_path = os.path.join(output_dir, "palette.bin")
     logger.info(f"Writing palette to {palette_path} ({len(GLOBAL_INDEX_TO_RGB332)} colors)")
-    with open(palette_path, "wb") as fp:
-        for idx in range(len(GLOBAL_INDEX_TO_RGB332)):
-            rgb332_val = GLOBAL_INDEX_TO_RGB332[idx]
-            fp.write(bytes([rgb332_val]))
+    
+    # Pre-build palette data for optimized write
+    palette_data = bytes(GLOBAL_INDEX_TO_RGB332)
+    optimized_file_write(palette_path, palette_data)
+    
     logger.info("Palette written successfully")
 
 def main() -> None:
