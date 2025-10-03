@@ -58,6 +58,11 @@ class Config:
     GEOJSON_READ_BUFFER_SIZE = 8192  # 8KB buffer for GeoJSON reading
     BATCH_WRITE_SIZE = 100  # Write tiles in batches
     
+    # Algorithm optimization
+    COORDINATE_PRECISION = 6  # Decimal places for coordinate precision
+    MATH_CACHE_SIZE = 1000  # Cache size for mathematical operations
+    PIXEL_COORD_CACHE_SIZE = 5000  # Cache size for pixel coordinate calculations
+    
     # File size limits
     MAX_FILE_SIZE_KB_LIMIT = 10240  # 10MB
     DEFAULT_MAX_FILE_SIZE_KB = 128
@@ -139,32 +144,6 @@ class Config:
 # Global variables to track files for cleanup
 _db_file_to_cleanup = None
 _temp_files_to_cleanup = set()
-
-@contextmanager
-def managed_temp_file(prefix: str = "tmp", suffix: str = Config.GEOJSON_EXTENSION) -> Iterator[str]:
-    """Context manager for temporary files with automatic cleanup"""
-    import tempfile
-    import uuid
-    
-    temp_file = None
-    try:
-        # Create temporary file in current directory instead of /tmp
-        temp_filename = f"{prefix}_{uuid.uuid4().hex[:8]}{suffix}"
-        
-        # Register for cleanup
-        global _temp_files_to_cleanup
-        _temp_files_to_cleanup.add(temp_filename)
-        
-        yield temp_filename
-        
-    finally:
-        # Cleanup
-        if temp_filename and os.path.exists(temp_filename):
-            try:
-                os.remove(temp_filename)
-                _temp_files_to_cleanup.discard(temp_filename)
-            except Exception as e:
-                logger.debug(f"Could not remove temporary file {temp_filename}: {e}")
 
 @contextmanager
 def managed_database(db_path: str) -> Iterator['FeatureDatabase']:
@@ -293,6 +272,11 @@ GLOBAL_INDEX_TO_RGB332 = {}  # index -> rgb332_value
 GEOMETRY_CACHE = {}  # Cache for simplified geometries by zoom level
 TILE_BBOX_CACHE = {}  # Cache for tile bounding boxes
 SIMPLIFY_TOLERANCE_CACHE = {}  # Cache for simplify tolerances
+
+# Global caches for algorithm optimization
+MATH_CACHE = {}  # Cache for mathematical operations
+PIXEL_COORD_CACHE = {}  # Cache for pixel coordinate calculations
+TILE_BOUNDS_CACHE = {}  # Cache for tile bounds calculations
 
 # Memory optimization pools
 COORDINATE_POOL = []  # Pool for coordinate tuples
@@ -461,31 +445,10 @@ def deg2num(lat_deg: float, lon_deg: float, zoom: int) -> Tuple[int, int]:
     ytile = int((1.0 - math.log(math.tan(lat_rad) + 1 / math.cos(lat_rad)) / math.pi) / 2.0 * n)
     return xtile, ytile
 
-def deg2pixel(lat_deg: float, lon_deg: float, zoom: int) -> Tuple[float, float]:
-    """
-    Convert latitude/longitude coordinates to pixel coordinates within a tile.
-    
-    Args:
-        lat_deg: Latitude in degrees
-        lon_deg: Longitude in degrees
-        zoom: Zoom level (0-18)
-        
-    Returns:
-        Tuple of (x, y) pixel coordinates within the tile
-        
-    Example:
-        >>> deg2pixel(42.5, 1.5, 10)
-        (256.0, 128.0)
-    """
-    lat_rad = math.radians(lat_deg)
-    n = 2.0 ** zoom
-    x = ((lon_deg + 180.0) / 360.0 * n * Config.TILE_SIZE)
-    y = ((1.0 - math.log(math.tan(lat_rad) + 1 / math.cos(lat_rad)) / math.pi) / 2.0 * n * Config.TILE_SIZE)
-    return x, y
 
 def coords_to_pixel_coords_uint16(coords: List[Tuple[float, float]], zoom: int, tile_x: int, tile_y: int) -> List[Tuple[int, int]]:
     """
-    Convert coordinate list to pixel coordinates relative to a specific tile.
+    Convert coordinate list to pixel coordinates relative to a specific tile (optimized version).
     
     Args:
         coords: List of (longitude, latitude) coordinate tuples
@@ -501,21 +464,22 @@ def coords_to_pixel_coords_uint16(coords: List[Tuple[float, float]], zoom: int, 
         >>> coords_to_pixel_coords_uint16(coords, 10, 512, 384)
         [(256, 128), (300, 150)]
     """
-    pixel_coords = []
-    for lon, lat in coords:
-        px_global, py_global = deg2pixel(lat, lon, zoom)
-        x = (px_global - tile_x * Config.TILE_SIZE) * (Config.UINT16_TILE_SIZE - 1) / (Config.TILE_SIZE - 1)
-        y = ((py_global - tile_y * Config.TILE_SIZE) * (Config.UINT16_TILE_SIZE - 1) / (Config.TILE_SIZE - 1))
-        x = int(round(x))
-        y = int(round(y))
-        x = max(0, min(Config.UINT16_TILE_SIZE - 1, x))
-        y = max(0, min(Config.UINT16_TILE_SIZE - 1, y))
+    # Use optimized version with caching
+    pixel_coords = optimized_coords_to_pixel_coords_uint16(coords, zoom, tile_x, tile_y)
+    
+    # Convert to UINT16 range
+    uint16_coords = []
+    for x, y in pixel_coords:
+        x_uint16 = int((x * (Config.UINT16_TILE_SIZE - 1)) / (Config.TILE_SIZE - 1))
+        y_uint16 = int((y * (Config.UINT16_TILE_SIZE - 1)) / (Config.TILE_SIZE - 1))
+        x_uint16 = max(0, min(Config.UINT16_TILE_SIZE - 1, x_uint16))
+        y_uint16 = max(0, min(Config.UINT16_TILE_SIZE - 1, y_uint16))
         
         # Use object pool for coordinate tuples
-        coord = get_coordinate_tuple(x, y)
-        pixel_coords.append(coord)
+        coord = get_coordinate_tuple(x_uint16, y_uint16)
+        uint16_coords.append(coord)
     
-    return pixel_coords
+    return uint16_coords
 
 def remove_duplicate_points(points: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
     if len(points) <= 1:
@@ -582,14 +546,8 @@ def get_style_for_tags(tags: Dict[str, str], config: Dict[str, Any]) -> Tuple[Di
     return {}, None
 
 def tile_latlon_bounds(tile_x: int, tile_y: int, zoom: int, pixel_margin: int = 0) -> Tuple[float, float, float, float]:
-    n = 2.0 ** zoom
-    lon_min = tile_x / n * 360.0 - 180.0
-    lat_rad1 = math.atan(math.sinh(math.pi * (1 - 2 * tile_y / n)))
-    lat_max = math.degrees(lat_rad1)
-    lon_max = (tile_x + 1) / n * 360.0 - 180.0
-    lat_rad2 = math.atan(math.sinh(math.pi * (1 - 2 * (tile_y + 1) / n)))
-    lat_min = math.degrees(lat_rad2)
-    return lon_min, lat_min, lon_max, lat_max
+    """Get lat/lon bounds for a tile (optimized version)"""
+    return optimized_tile_latlon_bounds(tile_x, tile_y, zoom, pixel_margin)
 
 def is_area(tags: Dict[str, str]) -> bool:
     """
@@ -725,6 +683,14 @@ def clear_geometry_caches():
     logger.debug("Geometry caches cleared")
 
 
+def clear_all_caches():
+    """Clear all caches to free memory"""
+    clear_geometry_caches()
+    clear_algorithm_caches()
+    clear_object_pools()
+    logger.debug("All caches cleared")
+
+
 def get_coordinate_tuple(x: float, y: float) -> Tuple[float, float]:
     """
     Get coordinate tuple from pool or create new one.
@@ -819,53 +785,6 @@ def optimized_file_write(filepath: str, data: bytes, buffer_size: int = None) ->
         raise
 
 
-def optimized_file_read(filepath: str, buffer_size: int = None) -> str:
-    """
-    Optimized file read with buffering.
-    
-    Args:
-        filepath: Path to file to read
-        buffer_size: Buffer size for reading (default: GEOJSON_READ_BUFFER_SIZE)
-        
-    Returns:
-        File contents as string
-    """
-    if buffer_size is None:
-        buffer_size = Config.GEOJSON_READ_BUFFER_SIZE
-    
-    try:
-        with open(filepath, "r", encoding="utf-8", buffering=buffer_size) as f:
-            return f.read()
-    except IOError as e:
-        logger.error(f"Failed to read file {filepath}: {e}")
-        raise
-
-
-def batch_write_tiles(tile_data_batch: List[Tuple[str, bytes]], buffer_size: int = None) -> None:
-    """
-    Write multiple tiles in a batch for better I/O performance.
-    
-    Args:
-        tile_data_batch: List of (filepath, data) tuples
-        buffer_size: Buffer size for writing (default: TILE_WRITE_BUFFER_SIZE)
-    """
-    if buffer_size is None:
-        buffer_size = Config.TILE_WRITE_BUFFER_SIZE
-    
-    # Group tiles by directory to minimize directory changes
-    tiles_by_dir = {}
-    for filepath, data in tile_data_batch:
-        dir_path = os.path.dirname(filepath)
-        if dir_path not in tiles_by_dir:
-            tiles_by_dir[dir_path] = []
-        tiles_by_dir[dir_path].append((filepath, data))
-    
-    # Write tiles directory by directory
-    for dir_path, tiles in tiles_by_dir.items():
-        for filepath, data in tiles:
-            optimized_file_write(filepath, data, buffer_size)
-
-
 def create_directory_structure(base_path: str, tile_coords: List[Tuple[int, int]]) -> None:
     """
     Pre-create directory structure for tiles to avoid repeated os.makedirs calls.
@@ -881,6 +800,162 @@ def create_directory_structure(base_path: str, tile_coords: List[Tuple[int, int]
     
     for dir_path in dirs_to_create:
         os.makedirs(dir_path, exist_ok=True)
+
+
+def cached_math_operation(operation: str, *args) -> float:
+    """
+    Cache mathematical operations to avoid repeated calculations.
+    
+    Args:
+        operation: Operation name (e.g., 'sin', 'cos', 'tan', 'log')
+        *args: Arguments for the operation
+        
+    Returns:
+        Cached result of the mathematical operation
+    """
+    global MATH_CACHE
+    
+    # Create cache key
+    cache_key = (operation, args)
+    
+    if cache_key in MATH_CACHE:
+        return MATH_CACHE[cache_key]
+    
+    # Perform operation
+    if operation == 'sin':
+        result = math.sin(args[0])
+    elif operation == 'cos':
+        result = math.cos(args[0])
+    elif operation == 'tan':
+        result = math.tan(args[0])
+    elif operation == 'log':
+        result = math.log(args[0])
+    elif operation == 'atan':
+        result = math.atan(args[0])
+    elif operation == 'sinh':
+        result = math.sinh(args[0])
+    elif operation == 'degrees':
+        result = math.degrees(args[0])
+    elif operation == 'radians':
+        result = math.radians(args[0])
+    else:
+        raise ValueError(f"Unsupported operation: {operation}")
+    
+    # Cache result (with size limit)
+    if len(MATH_CACHE) < Config.MATH_CACHE_SIZE:
+        MATH_CACHE[cache_key] = result
+    
+    return result
+
+
+def optimized_tile_latlon_bounds(tile_x: int, tile_y: int, zoom: int, pixel_margin: int = 0) -> Tuple[float, float, float, float]:
+    """
+    Optimized tile bounds calculation with caching.
+    
+    Args:
+        tile_x: Tile X coordinate
+        tile_y: Tile Y coordinate
+        zoom: Zoom level
+        pixel_margin: Pixel margin for bounds
+        
+    Returns:
+        Tuple of (lon_min, lat_min, lon_max, lat_max)
+    """
+    global TILE_BOUNDS_CACHE
+    
+    cache_key = (tile_x, tile_y, zoom, pixel_margin)
+    if cache_key in TILE_BOUNDS_CACHE:
+        return TILE_BOUNDS_CACHE[cache_key]
+    
+    n = 2.0 ** zoom
+    
+    # Optimized calculations using cached math operations
+    lat_rad1 = cached_math_operation('atan', cached_math_operation('sinh', math.pi * (1 - 2 * tile_y / n)))
+    lat_max = cached_math_operation('degrees', lat_rad1)
+    
+    lat_rad2 = cached_math_operation('atan', cached_math_operation('sinh', math.pi * (1 - 2 * (tile_y + 1) / n)))
+    lat_min = cached_math_operation('degrees', lat_rad2)
+    
+    lon_min = tile_x / n * 360.0 - 180.0
+    lon_max = (tile_x + 1) / n * 360.0 - 180.0
+    
+    # Apply pixel margin
+    if pixel_margin > 0:
+        lat_range = lat_max - lat_min
+        lon_range = lon_max - lon_min
+        lat_margin = lat_range * pixel_margin / Config.TILE_SIZE
+        lon_margin = lon_range * pixel_margin / Config.TILE_SIZE
+        
+        lat_min -= lat_margin
+        lat_max += lat_margin
+        lon_min -= lon_margin
+        lon_max += lon_margin
+    
+    result = (lon_min, lat_min, lon_max, lat_max)
+    
+    # Cache result (with size limit)
+    if len(TILE_BOUNDS_CACHE) < Config.MATH_CACHE_SIZE:
+        TILE_BOUNDS_CACHE[cache_key] = result
+    
+    return result
+
+
+def optimized_coords_to_pixel_coords_uint16(coords: List[Tuple[float, float]], zoom: int, tile_x: int, tile_y: int) -> List[Tuple[int, int]]:
+    """
+    Optimized coordinate to pixel conversion with caching and precision optimization.
+    
+    Args:
+        coords: List of (lon, lat) coordinate tuples
+        zoom: Zoom level
+        tile_x: Tile X coordinate
+        tile_y: Tile Y coordinate
+        
+    Returns:
+        List of (x, y) pixel coordinate tuples
+    """
+    global PIXEL_COORD_CACHE
+    
+    n = 2.0 ** zoom
+    pixel_coords = []
+    
+    for coord in coords:
+        lon, lat = coord
+        
+        # Create cache key for this coordinate
+        cache_key = (lon, lat, zoom, tile_x, tile_y)
+        if cache_key in PIXEL_COORD_CACHE:
+            pixel_coords.append(PIXEL_COORD_CACHE[cache_key])
+            continue
+        
+        # Optimized calculations using cached math operations
+        lat_rad = cached_math_operation('radians', lat)
+        
+        # Calculate pixel coordinates with precision optimization
+        x = int(((lon + 180.0) / 360.0 * n - tile_x) * Config.TILE_SIZE)
+        y = int(((1.0 - cached_math_operation('log', 
+            cached_math_operation('tan', lat_rad) + 1 / cached_math_operation('cos', lat_rad)) / math.pi) / 2.0 * n - tile_y) * Config.TILE_SIZE)
+        
+        # Clamp coordinates to tile bounds
+        x = max(0, min(Config.TILE_SIZE - 1, x))
+        y = max(0, min(Config.TILE_SIZE - 1, y))
+        
+        pixel_coord = (x, y)
+        pixel_coords.append(pixel_coord)
+        
+        # Cache result (with size limit)
+        if len(PIXEL_COORD_CACHE) < Config.PIXEL_COORD_CACHE_SIZE:
+            PIXEL_COORD_CACHE[cache_key] = pixel_coord
+    
+    return pixel_coords
+
+
+def clear_algorithm_caches():
+    """Clear all algorithm-related caches to free memory"""
+    global MATH_CACHE, PIXEL_COORD_CACHE, TILE_BOUNDS_CACHE
+    MATH_CACHE.clear()
+    PIXEL_COORD_CACHE.clear()
+    TILE_BOUNDS_CACHE.clear()
+    logger.debug("Algorithm caches cleared")
 
 
 def classify_tile_complexity(tile_data: Tuple[int, int, List[Dict[str, Any]]]) -> str:
@@ -903,26 +978,6 @@ def classify_tile_complexity(tile_data: Tuple[int, int, List[Dict[str, Any]]]) -
     else:
         return 'complex'
 
-
-def estimate_tile_memory_usage(tile_data: Tuple[int, int, List[Dict[str, Any]]]) -> int:
-    """
-    Estimate memory usage for a tile based on features.
-    
-    Args:
-        tile_data: Tuple of (x, y, features)
-        
-    Returns:
-        Estimated memory usage in bytes
-    """
-    x, y, features = tile_data
-    feature_count = len(features)
-    
-    # Rough estimation: each feature ~1KB, geometry commands ~2KB
-    base_memory = feature_count * 1024  # Base feature memory
-    geometry_memory = feature_count * 2048  # Geometry processing memory
-    command_memory = feature_count * 512  # Command generation memory
-    
-    return base_memory + geometry_memory + command_memory
 
 
 def create_optimized_tile_batches(tiles: List[Tuple[int, int, List[Dict[str, Any]]]]) -> List[List[Tuple[int, int, List[Dict[str, Any]]]]]:
@@ -1267,26 +1322,6 @@ def geometry_to_draw_commands(geom, color, tags, zoom, tile_x, tile_y, simplify_
     if hasattr(geom, "is_valid") and not geom.is_empty:
         commands.extend(process_geom(geom))
     return commands
-
-def get_layer_fields_from_pbf(pbf_file, layer):
-    try:
-        result = subprocess.run(
-            ["ogrinfo", "-so", "-geom=NO", pbf_file, layer],
-            capture_output=True, encoding="utf-8"
-        )
-        if result.returncode != 0:
-            return set()
-        lines = result.stdout.splitlines()
-        fields = set()
-        for line in lines:
-            line = line.strip()
-            if ":" in line:
-                field = line.split(":", 1)[0].strip().replace('"', '')
-                if field:
-                    fields.add(field)
-        return fields
-    except Exception:
-        return set()
 
 def build_ogr2ogr_where_clause_from_config(config, allowed_fields):
     conds = []
@@ -1671,9 +1706,10 @@ def process_layer_directly_to_database(pbf_file: str, layer: str, config: Dict[s
                     smart_gc_collect()
                     
                     # Clear geometry caches periodically to prevent memory buildup
-                    if features_processed % 10000 == 0:
-                        clear_geometry_caches()
-                        clear_object_pools()
+        if features_processed % 10000 == 0:
+            clear_geometry_caches()
+            clear_algorithm_caches()
+            clear_object_pools()
             
             # Process remaining features in the last chunk
             for feat_item in feature_chunk:
@@ -2043,9 +2079,8 @@ def main() -> None:
     logger.info("Cleaning up temporary files and database...")
     cleanup_all()
     
-    # Clear geometry caches and object pools to free memory
-    clear_geometry_caches()
-    clear_object_pools()
+    # Clear all caches to free memory
+    clear_all_caches()
     
     del config
     smart_gc_collect()
