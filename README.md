@@ -19,30 +19,6 @@ The generated tiles are extremely compact and optimized for fast rendering in cu
 
 ---
 
-## Key Optimizations
-
-The script implements multiple optimization layers for maximum compression and performance:
-
-### Memory Optimization
-- **Single feature processing**: Features are read once for all zoom levels
-- **Disk-based storage**: Uses SQLite database for temporary feature storage
-- **Batch processing**: Processes features in configurable batches to control memory usage
-- **Automatic cleanup**: Garbage collection and memory management throughout processing
-
-### Dynamic Color Palette System
-- **Automatic palette generation**: Analyzes `features.json` and creates optimal color palette
-- **Indexed colors**: Each unique color gets compact index (0-N) for maximum compression
-- **Smart state management**: SET_COLOR_INDEX and SET_COLOR commands minimize redundancy
-- **Adaptive encoding**: Most frequent colors get optimal indices
-
-### Compression Techniques
-- **Variable-length encoding**: Efficient coordinate compression with varint/zigzag
-- **Delta encoding**: Coordinate differences for compact storage
-- **RGB332 color format**: 8-bit color encoding for efficient storage
-- **Boundary optimization**: Cross-tile geometries optimized to reduce duplication
-
----
-
 ## Drawing Command Set
 
 The script implements a set of drawing commands for efficient tile generation:
@@ -69,30 +45,54 @@ The script implements a set of drawing commands for efficient tile generation:
 
 ## Script Features
 
-### Memory-Optimized Processing
-- **Single-pass feature processing**: Features are read once for all zoom levels
-- **SQLite database storage**: Efficient disk-based feature storage and retrieval
-- **Batch processing**: Configurable batch sizes to control memory usage
-- **Automatic cleanup**: Garbage collection and memory management
+### Advanced Optimization Suite
+- **Database optimization**: Composite indexes, WAL mode, batch operations
+- **Geometry optimization**: Cached operations, pre-filtering, smart simplification
+- **Memory optimization**: Object pooling, smart GC, streaming with chunking
+- **Parallelization optimization**: Intelligent work distribution, adaptive workers
+- **I/O optimization**: Buffered operations, directory pre-creation, error handling
+- **Algorithm optimization**: Mathematical caching, coordinate transformation caching
 
 ### Dynamic Color Palette
 ```
-Analyzing colors from features.json to build dynamic palette...
+Analyzing colors from features.json to build dynamic palette
 Dynamic color palette created:
-  - Total unique colors: 24
-  - Palette indices: 0-23
-  - Memory saving potential: 24 colors -> compact indices
+  - Total unique colors: 39
+  - Palette indices: 0-38
+  - Memory saving potential: 39 colors -> compact indices
+Dynamic palette ready with 39 colors from your features.json
+Writing palette to TEST/palette.bin (39 colors)
+Palette written successfully
 ```
 
 ### Comprehensive Statistics
 The script provides detailed processing reports:
 ```
-Processing features and storing in database...
-Processing 125000 features for 12 zoom levels...
-Zoom 6: 15420 features stored
-Zoom 7: 28930 features stored
-Zoom 8: 45670 features stored
-...
+Processing PBF directly to database (minimal temporary files)
+Available layers in PBF: ['points', 'lines', 'multilinestrings', 'multipolygons', 'other_relations']
+Config requires these fields: amenity, building, highway, landuse, leisure, natural, place, railway, waterway
+[1/5] Processing layer: points directly to database
+Processed 1328 features from layer points
+Layer points: 1328 features processed
+[2/5] Processing layer: lines directly to database
+Processed 8568 features from layer lines
+Layer lines: 8568 features processed
+[3/5] Processing layer: multilinestrings directly to database
+Layer multilinestrings: 0 features processed
+[4/5] Processing layer: multipolygons directly to database
+Processed 11759 features from layer multipolygons
+Layer multipolygons: 11759 features processed
+[5/5] Processing layer: other_relations directly to database
+Layer other_relations: 0 features processed
+Total processed: 21655 features directly from PBF
+Zoom 6: 870 features stored
+Processing zoom level 6 from database
+Found 1 tiles for zoom 6
+Writing tiles (zoom 6): 100%|█████████████████████| 1/1 [00:00<00:00,  1.51it/s]
+Zoom 6: 1 tiles, average size = 7831.00 bytes
+Process completed successfully
+Cleaning up temporary files and database...
+Cleaned up database file: features.db
 ```
 
 ### Performance Monitoring
@@ -120,15 +120,16 @@ python tile_generator.py planet.osm.pbf tiles/ features.json --zoom 6-17 --max-f
 | `--max-file-size` | Max tile size in KB | 128 |
 | `--db-path` | Path for temporary database | `features.db` |
 
-### Memory Optimization Features
+### Advanced Memory Management
 
 The optimized version provides significant memory improvements:
 
-- **Single feature processing**: Features are read once for all zoom levels
-- **Disk-based storage**: Uses SQLite database for temporary feature storage
-- **Memory efficiency**: Constant memory usage regardless of zoom level count
+- **Object pooling**: Reusable coordinate tuples and feature data dictionaries
+- **Smart garbage collection**: Memory-aware GC with pressure monitoring
+- **Cache management**: Automatic cache clearing (geometry, algorithm, object pools)
+- **Streaming with chunking**: Process features in optimized 1000-feature chunks
+- **Memory monitoring**: Real-time memory usage tracking and optimization
 - **Scalability**: Handles large datasets without memory overflow
-- **Batch processing**: Consistent memory usage across multiple zoom levels
 
 ---
 
@@ -214,14 +215,19 @@ python tile_generator.py region.osm.pbf tiles/ features.json --zoom 13-17
 ### Custom Optimization Tuning
 - **Color palette optimization**: Script automatically creates optimal color palette from your `features.json`
 - **Memory optimization**: Object pools and caches automatically managed for optimal performance
-- **Boundary optimization**: Cross-tile geometries automatically optimized to reduce duplication
+- **Geometry optimization**: Automatic caching and pre-filtering for optimal geometry processing
+- **Parallelization optimization**: Automatic tile complexity classification and worker allocation
+- **I/O optimization**: Automatic buffering and directory pre-creation for optimal file operations
+- **Algorithm optimization**: Automatic mathematical operation caching for optimal performance
 
 ### Performance Monitoring
 The script provides comprehensive monitoring:
-- Memory usage tracking during processing
-- Optimization statistics per zoom level  
-- Detailed savings reports with byte-level analysis
-- Processing time measurements for performance tuning
+- **Memory usage tracking**: Real-time memory usage monitoring during processing
+- **Cache statistics**: Geometry, algorithm, and object pool cache performance
+- **Worker allocation**: Adaptive worker allocation based on tile complexity
+- **I/O optimization**: File operation buffering and directory creation statistics
+- **Processing time measurements**: Detailed timing for each optimization layer
+- **Optimization statistics**: Per-zoom-level performance metrics and savings reports
 
 ---
 
@@ -253,22 +259,52 @@ Each `.bin` file contains optimized drawing commands with variable-length encodi
 
 ## Technical Highlights
 
-### Memory Management
-- **SQLite database**: Efficient disk-based storage for features
-- **Batch processing**: Configurable batch sizes for memory control
-- **Streaming processing**: Handles unlimited file sizes with constant memory usage
-- **Garbage collection optimization**: Strategic GC calls prevent memory bloat
+### Dynamic Color Palette System
+- **Automatic palette generation**: Analyzes `features.json` and creates optimal color palette
+- **Indexed colors**: Each unique color gets compact index (0-N) for maximum compression
+- **Smart state management**: SET_COLOR_INDEX and SET_COLOR commands minimize redundancy
+- **Adaptive encoding**: Most frequent colors get optimal indices
 
-### Processing Optimization
-- **Single-pass processing**: Features read once for all zoom levels
-- **Multi-core processing**: Parallel PBF extraction and tile generation
-- **Variable-length encoding**: Efficient coordinate compression
+### Compression Techniques
+- **Variable-length encoding**: Efficient coordinate compression with varint/zigzag
+- **Delta encoding**: Coordinate differences for compact storage
+- **RGB332 color format**: 8-bit color encoding for efficient storage
 - **Boundary optimization**: Cross-tile geometries optimized to reduce duplication
 
-### Rendering Optimization
-- **State-based commands**: Minimizes GPU state changes for better rendering performance
-- **Priority sorting**: Commands ordered for optimal rendering pipeline utilization
-- **TFT display optimization**: Reduced color register updates for embedded displays
-- **Cache-friendly layout**: Data structures optimized for CPU cache efficiency
+### Database Optimization
+- **Composite indexes**: Multi-column indexes for optimal query performance
+- **WAL mode**: Write-Ahead Logging for better concurrency and crash recovery
+- **Batch operations**: Efficient bulk inserts and updates with executemany
+- **Connection optimization**: Optimized SQLite connection settings
+
+### Geometry Optimization
+- **Geometry caching**: Cached simplified geometries by zoom level
+- **Pre-filtering**: Bounding box checks to avoid expensive intersection operations
+- **Mathematical caching**: Cached sin, cos, tan, log, atan operations
+- **Tile bounds caching**: Cached tile boundary calculations
+
+### Memory Optimization
+- **Object pooling**: Reusable coordinate tuples and feature data dictionaries
+- **Smart garbage collection**: Memory-aware GC with pressure monitoring
+- **Cache management**: Automatic clearing of geometry, algorithm, and object caches
+- **Streaming with chunking**: Process features in optimized chunks
+
+### Parallelization Optimization
+- **Intelligent work distribution**: Tiles classified by complexity (simple/medium/complex)
+- **Adaptive worker allocation**: More workers for simple tiles, fewer for complex ones
+- **Memory-aware scheduling**: Prevents memory overload in worker processes
+- **Optimized batch creation**: Different batch sizes based on tile complexity
+
+### I/O Optimization
+- **Buffered operations**: Configurable buffer sizes for file operations
+- **Directory pre-creation**: Batch directory creation to minimize system calls
+- **Error handling**: Robust I/O error handling and recovery
+- **Optimized file writes**: Pre-built data for efficient file writing
+
+### Algorithm Optimization
+- **Mathematical operation caching**: Cached trigonometric and logarithmic operations
+- **Coordinate transformation caching**: Cached pixel coordinate calculations
+- **Precision optimization**: Configurable coordinate precision for optimal performance
+- **Tile bounds caching**: Cached tile boundary calculations
 
 ---
