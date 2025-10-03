@@ -175,12 +175,14 @@ def managed_database(db_path: str) -> Iterator['FeatureDatabase']:
 
 @contextmanager
 def memory_management():
-    """Context manager for memory management with garbage collection"""
+    """Context manager for memory management with optimized garbage collection"""
     try:
         yield
     finally:
-        # Force garbage collection
-        gc.collect()
+        # Only collect garbage if we have significant memory pressure
+        import sys
+        if sys.getsizeof(gc.get_objects()) > 50 * 1024 * 1024:  # 50MB threshold
+            gc.collect()
         
         # Log memory usage if available
         try:
@@ -190,6 +192,20 @@ def memory_management():
             logger.debug(f"Memory usage: {memory_info.rss / 1024 / 1024:.1f} MB")
         except ImportError:
             pass  # psutil not available
+
+
+def smart_gc_collect():
+    """Perform garbage collection only when memory pressure is high"""
+    import sys
+    
+    # Check if we should collect garbage based on object count and memory usage
+    object_count = len(gc.get_objects())
+    memory_usage = sys.getsizeof(gc.get_objects())
+    
+    # Collect if we have many objects or high memory usage
+    if object_count > 100000 or memory_usage > 100 * 1024 * 1024:  # 100MB threshold
+        gc.collect()
+        logger.debug(f"Garbage collection performed: {object_count} objects, {memory_usage / 1024 / 1024:.1f} MB")
 
 @contextmanager
 def resource_monitor():
@@ -266,6 +282,10 @@ GLOBAL_INDEX_TO_RGB332 = {}  # index -> rgb332_value
 GEOMETRY_CACHE = {}  # Cache for simplified geometries by zoom level
 TILE_BBOX_CACHE = {}  # Cache for tile bounding boxes
 SIMPLIFY_TOLERANCE_CACHE = {}  # Cache for simplify tolerances
+
+# Memory optimization pools
+COORDINATE_POOL = []  # Pool for coordinate tuples
+FEATURE_DATA_POOL = []  # Pool for feature data dictionaries
 
 
 # Database configuration moved to Config class
@@ -479,7 +499,11 @@ def coords_to_pixel_coords_uint16(coords: List[Tuple[float, float]], zoom: int, 
         y = int(round(y))
         x = max(0, min(Config.UINT16_TILE_SIZE - 1, x))
         y = max(0, min(Config.UINT16_TILE_SIZE - 1, y))
-        pixel_coords.append((x, y))
+        
+        # Use object pool for coordinate tuples
+        coord = get_coordinate_tuple(x, y)
+        pixel_coords.append(coord)
+    
     return pixel_coords
 
 def remove_duplicate_points(points: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
@@ -688,6 +712,79 @@ def clear_geometry_caches():
     TILE_BBOX_CACHE.clear()
     SIMPLIFY_TOLERANCE_CACHE.clear()
     logger.debug("Geometry caches cleared")
+
+
+def get_coordinate_tuple(x: float, y: float) -> Tuple[float, float]:
+    """
+    Get coordinate tuple from pool or create new one.
+    
+    Args:
+        x: X coordinate
+        y: Y coordinate
+        
+    Returns:
+        Coordinate tuple (reused from pool if available)
+    """
+    global COORDINATE_POOL
+    
+    if COORDINATE_POOL:
+        coord = COORDINATE_POOL.pop()
+        coord[0] = x
+        coord[1] = y
+        return tuple(coord)  # Convert to immutable tuple
+    else:
+        return (x, y)  # Return immutable tuple
+
+
+def return_coordinate_tuple(coord: Tuple[float, float]) -> None:
+    """
+    Return coordinate tuple to pool for reuse.
+    
+    Args:
+        coord: Coordinate tuple to return to pool
+    """
+    global COORDINATE_POOL
+    
+    if len(COORDINATE_POOL) < 1000:  # Limit pool size
+        # Convert tuple to list for reuse
+        COORDINATE_POOL.append(list(coord))
+
+
+def get_feature_data_dict() -> Dict[str, Any]:
+    """
+    Get feature data dictionary from pool or create new one.
+    
+    Returns:
+        Feature data dictionary (reused from pool if available)
+    """
+    global FEATURE_DATA_POOL
+    
+    if FEATURE_DATA_POOL:
+        return FEATURE_DATA_POOL.pop()
+    else:
+        return {}
+
+
+def return_feature_data_dict(feat_data: Dict[str, Any]) -> None:
+    """
+    Return feature data dictionary to pool for reuse.
+    
+    Args:
+        feat_data: Feature data dictionary to return to pool
+    """
+    global FEATURE_DATA_POOL
+    
+    if len(FEATURE_DATA_POOL) < 1000:  # Limit pool size
+        feat_data.clear()  # Clear contents for reuse
+        FEATURE_DATA_POOL.append(feat_data)
+
+
+def clear_object_pools():
+    """Clear all object pools to free memory"""
+    global COORDINATE_POOL, FEATURE_DATA_POOL
+    COORDINATE_POOL.clear()
+    FEATURE_DATA_POOL.clear()
+    logger.debug("Object pools cleared")
 
 
 def should_process_geometry_for_tile(geom: 'Geometry', tile_x: int, tile_y: int, zoom: int) -> bool:
@@ -1318,13 +1415,15 @@ def process_feature_for_zoom_levels(feat: Dict[str, Any], config: Dict[str, Any]
                 clipped_geom = optimized_geometry_intersection(feature_geom, xt, yt, zoom)
                 
                 if clipped_geom is not None:
-                    feature_data = {
+                    # Use object pool for feature data dictionary
+                    feature_data = get_feature_data_dict()
+                    feature_data.update({
                         "geom": clipped_geom,
                         "color": color,
                         "color_hex": hex_color,
                         "tags": tags,
                         "priority": priority
-                    }
+                    })
                     
                     batch_features.append((zoom, xt, yt, feature_data, priority))
                     features_added += 1
@@ -1361,18 +1460,37 @@ def process_layer_directly_to_database(pbf_file: str, layer: str, config: Dict[s
         features_processed = 0
         batch_features = []
         
-        with open(tmp_filename, "r", encoding="utf-8") as f:
+        with open(tmp_filename, "r", encoding="utf-8", buffering=8192) as f:
+            # Process features in chunks for better memory management
+            chunk_size = 1000
+            feature_chunk = []
+            
             for feat in ijson.items(f, "features.item"):
-                features_added = process_feature_for_zoom_levels(
-                    feat, config, config_fields, zoom_levels, db, batch_features
-                )
-                features_processed += 1
+                feature_chunk.append(feat)
                 
-                if features_processed % 1000 == 0:
-                    gc.collect()
+                # Process chunk when it reaches the desired size
+                if len(feature_chunk) >= chunk_size:
+                    for feat_item in feature_chunk:
+                        features_added = process_feature_for_zoom_levels(
+                            feat_item, config, config_fields, zoom_levels, db, batch_features
+                        )
+                        features_processed += 1
+                    
+                    # Clear chunk and perform memory management
+                    feature_chunk.clear()
+                    smart_gc_collect()
+                    
                     # Clear geometry caches periodically to prevent memory buildup
                     if features_processed % 10000 == 0:
                         clear_geometry_caches()
+                        clear_object_pools()
+            
+            # Process remaining features in the last chunk
+            for feat_item in feature_chunk:
+                features_added = process_feature_for_zoom_levels(
+                    feat_item, config, config_fields, zoom_levels, db, batch_features
+                )
+                features_processed += 1
         
         # Insert remaining features for this layer
         if batch_features:
@@ -1700,11 +1818,12 @@ def main() -> None:
     logger.info("Cleaning up temporary files and database...")
     cleanup_all()
     
-    # Clear geometry caches to free memory
+    # Clear geometry caches and object pools to free memory
     clear_geometry_caches()
+    clear_object_pools()
     
     del config
-    gc.collect()
+    smart_gc_collect()
 
 if __name__ == "__main__":
     main()
