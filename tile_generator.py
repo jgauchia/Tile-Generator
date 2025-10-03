@@ -22,7 +22,10 @@ import signal
 import atexit
 
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from typing import List, Dict, Tuple, Optional, Union, Set, Any, Iterator
+from typing import List, Dict, Tuple, Optional, Union, Set, Any, Iterator, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from shapely.geometry.base import BaseGeometry as Geometry
 from contextlib import contextmanager, ExitStack
 
 # Configure logging
@@ -258,6 +261,11 @@ signal.signal(signal.SIGTERM, signal_handler) # Termination signal
 # Global variables for dynamic palette
 GLOBAL_COLOR_PALETTE = {}  # hex_color -> index
 GLOBAL_INDEX_TO_RGB332 = {}  # index -> rgb332_value
+
+# Global caches for geometry optimization
+GEOMETRY_CACHE = {}  # Cache for simplified geometries by zoom level
+TILE_BBOX_CACHE = {}  # Cache for tile bounding boxes
+SIMPLIFY_TOLERANCE_CACHE = {}  # Cache for simplify tolerances
 
 
 # Database configuration moved to Config class
@@ -597,11 +605,156 @@ def is_area(tags: Dict[str, str]) -> bool:
             return True
     return False
 
-def get_simplify_tolerance_for_zoom(zoom):
-    if zoom <= 10:
-        return Config.SIMPLIFY_TOLERANCES["low_zoom"]
-    else:
-        return Config.SIMPLIFY_TOLERANCES["high_zoom"]
+def get_simplify_tolerance_for_zoom(zoom: int) -> float:
+    """
+    Get simplify tolerance for zoom level with caching.
+    
+    Args:
+        zoom: Zoom level
+        
+    Returns:
+        Simplify tolerance value
+    """
+    global SIMPLIFY_TOLERANCE_CACHE
+    
+    if zoom not in SIMPLIFY_TOLERANCE_CACHE:
+        if zoom <= 10:
+            SIMPLIFY_TOLERANCE_CACHE[zoom] = Config.SIMPLIFY_TOLERANCES["low_zoom"]
+        else:
+            SIMPLIFY_TOLERANCE_CACHE[zoom] = Config.SIMPLIFY_TOLERANCES["high_zoom"]
+    
+    return SIMPLIFY_TOLERANCE_CACHE[zoom]
+
+
+def get_tile_bbox_cached(tile_x: int, tile_y: int, zoom: int) -> 'box':
+    """
+    Get tile bounding box with caching.
+    
+    Args:
+        tile_x: Tile X coordinate
+        tile_y: Tile Y coordinate
+        zoom: Zoom level
+        
+    Returns:
+        Shapely box geometry for tile bounds
+    """
+    global TILE_BBOX_CACHE
+    
+    cache_key = (tile_x, tile_y, zoom)
+    if cache_key not in TILE_BBOX_CACHE:
+        lon_min, lat_min, lon_max, lat_max = tile_latlon_bounds(tile_x, tile_y, zoom)
+        TILE_BBOX_CACHE[cache_key] = box(lon_min, lat_min, lon_max, lat_max)
+    
+    return TILE_BBOX_CACHE[cache_key]
+
+
+def get_simplified_geometry_cached(geom: 'Geometry', zoom: int) -> 'Geometry':
+    """
+    Get simplified geometry with caching.
+    
+    Args:
+        geom: Original geometry
+        zoom: Zoom level
+        
+    Returns:
+        Simplified geometry
+    """
+    global GEOMETRY_CACHE
+    
+    # Create cache key based on geometry bounds and zoom
+    bounds = geom.bounds
+    cache_key = (bounds, zoom)
+    
+    if cache_key not in GEOMETRY_CACHE:
+        simplify_tolerance = get_simplify_tolerance_for_zoom(zoom)
+        
+        if simplify_tolerance is not None and geom.geom_type in ("LineString", "MultiLineString"):
+            try:
+                simplified = geom.simplify(simplify_tolerance, preserve_topology=True)
+                GEOMETRY_CACHE[cache_key] = simplified
+            except (ValueError, TypeError):
+                # Geometry simplification failed - use original geometry
+                GEOMETRY_CACHE[cache_key] = geom
+        else:
+            GEOMETRY_CACHE[cache_key] = geom
+    
+    return GEOMETRY_CACHE[cache_key]
+
+
+def clear_geometry_caches():
+    """Clear all geometry caches to free memory"""
+    global GEOMETRY_CACHE, TILE_BBOX_CACHE, SIMPLIFY_TOLERANCE_CACHE
+    GEOMETRY_CACHE.clear()
+    TILE_BBOX_CACHE.clear()
+    SIMPLIFY_TOLERANCE_CACHE.clear()
+    logger.debug("Geometry caches cleared")
+
+
+def should_process_geometry_for_tile(geom: 'Geometry', tile_x: int, tile_y: int, zoom: int) -> bool:
+    """
+    Pre-filter geometry to avoid expensive intersection operations.
+    
+    Args:
+        geom: Geometry to check
+        tile_x: Tile X coordinate
+        tile_y: Tile Y coordinate
+        zoom: Zoom level
+        
+    Returns:
+        True if geometry should be processed for this tile
+    """
+    try:
+        # Get tile bounding box
+        tile_bbox = get_tile_bbox_cached(tile_x, tile_y, zoom)
+        
+        # Quick bounds check - much faster than intersection
+        geom_bounds = geom.bounds
+        tile_bounds = tile_bbox.bounds
+        
+        # Check if geometry bounds overlap with tile bounds
+        return not (geom_bounds[2] < tile_bounds[0] or  # geom right < tile left
+                   geom_bounds[0] > tile_bounds[2] or  # geom left > tile right
+                   geom_bounds[3] < tile_bounds[1] or  # geom bottom < tile top
+                   geom_bounds[1] > tile_bounds[3])    # geom top > tile bottom
+                   
+    except Exception:
+        # If bounds check fails, process the geometry (fallback)
+        return True
+
+
+def optimized_geometry_intersection(geom: 'Geometry', tile_x: int, tile_y: int, zoom: int) -> Optional['Geometry']:
+    """
+    Optimized geometry intersection with pre-filtering and caching.
+    
+    Args:
+        geom: Geometry to intersect
+        tile_x: Tile X coordinate
+        tile_y: Tile Y coordinate
+        zoom: Zoom level
+        
+    Returns:
+        Intersected geometry or None if no intersection
+    """
+    try:
+        # Pre-filter to avoid expensive operations
+        if not should_process_geometry_for_tile(geom, tile_x, tile_y, zoom):
+            return None
+        
+        # Get cached tile bounding box
+        tile_bbox = get_tile_bbox_cached(tile_x, tile_y, zoom)
+        
+        # Perform intersection
+        clipped_geom = geom.intersection(tile_bbox)
+        
+        # Check if intersection is valid and not empty
+        if clipped_geom.is_empty or not clipped_geom.is_valid:
+            return None
+            
+        return clipped_geom
+        
+    except (ValueError, TypeError):
+        # Geometry intersection failed - skip this tile
+        return None
 
 def clamp_uint16(x):
     return max(0, min(Config.UINT16_TILE_SIZE - 1, int(x)))
@@ -1147,15 +1300,8 @@ def process_feature_for_zoom_levels(feat: Dict[str, Any], config: Dict[str, Any]
         if zoom < zoom_filter:
             continue
         
-        simplify_tolerance = get_simplify_tolerance_for_zoom(zoom)
-        feature_geom = geom
-        
-        if simplify_tolerance is not None and geom.geom_type in ("LineString", "MultiLineString"):
-            try:
-                feature_geom = feature_geom.simplify(simplify_tolerance, preserve_topology=True)
-            except (ValueError, TypeError) as e:
-                # Geometry simplification failed - use original geometry
-                pass
+        # Use cached geometry simplification
+        feature_geom = get_simplified_geometry_cached(geom, zoom)
         
         if feature_geom.is_empty or not feature_geom.is_valid:
             continue
@@ -1168,16 +1314,10 @@ def process_feature_for_zoom_levels(feat: Dict[str, Any], config: Dict[str, Any]
         # Store feature for each tile it intersects
         for xt in range(min(xtile_min, xtile_max), max(xtile_min, xtile_max) + 1):
             for yt in range(min(ytile_min, ytile_max), max(ytile_min, ytile_max) + 1):
-                t_lon_min, t_lat_min, t_lon_max, t_lat_max = tile_latlon_bounds(xt, yt, zoom)
-                tile_bbox = box(t_lon_min, t_lat_min, t_lon_max, t_lat_max)
+                # Use optimized intersection with pre-filtering
+                clipped_geom = optimized_geometry_intersection(feature_geom, xt, yt, zoom)
                 
-                try:
-                    clipped_geom = feature_geom.intersection(tile_bbox)
-                except (ValueError, TypeError) as e:
-                    # Geometry intersection failed - skip this tile
-                    continue
-                
-                if not clipped_geom.is_empty:
+                if clipped_geom is not None:
                     feature_data = {
                         "geom": clipped_geom,
                         "color": color,
@@ -1230,6 +1370,9 @@ def process_layer_directly_to_database(pbf_file: str, layer: str, config: Dict[s
                 
                 if features_processed % 1000 == 0:
                     gc.collect()
+                    # Clear geometry caches periodically to prevent memory buildup
+                    if features_processed % 10000 == 0:
+                        clear_geometry_caches()
         
         # Insert remaining features for this layer
         if batch_features:
@@ -1556,6 +1699,9 @@ def main() -> None:
     # Clean up temporary files and database
     logger.info("Cleaning up temporary files and database...")
     cleanup_all()
+    
+    # Clear geometry caches to free memory
+    clear_geometry_caches()
     
     del config
     gc.collect()
