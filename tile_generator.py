@@ -20,6 +20,7 @@ import ijson
 import logging
 import signal
 import atexit
+import psutil
 
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import List, Dict, Tuple, Optional, Union, Set, Any, Iterator, TYPE_CHECKING
@@ -42,15 +43,15 @@ class Config:
     TILE_SIZE = 256
     UINT16_TILE_SIZE = 65536
     
-    # Processing limits
-    MAX_WORKERS = min(os.cpu_count() or 4, 4)
+    # Processing limits - balanced for CPU and memory
+    MAX_WORKERS = max(1, (os.cpu_count() or 4) // 2)  # Use half of available CPU cores
     DB_BATCH_SIZE = 50000  # Increased for better performance
-    TILE_BATCH_SIZE = 5000
+    TILE_BATCH_SIZE = 2000  # Balanced batch size
     
-    # Parallelization optimization
+    # Parallelization optimization - balanced approach
     TILE_COMPLEXITY_THRESHOLD = 100  # Features per tile threshold
-    MEMORY_AWARE_BATCH_SIZE = 1000  # Smaller batches for memory-intensive tiles
-    WORKER_MEMORY_LIMIT = 200 * 1024 * 1024  # 200MB per worker
+    MEMORY_AWARE_BATCH_SIZE = 1000  # Balanced batches for memory-intensive tiles
+    WORKER_MEMORY_LIMIT = 150 * 1024 * 1024  # 150MB per worker
     
     # I/O optimization
     FILE_BUFFER_SIZE = 65536  # 64KB buffer for file operations
@@ -58,10 +59,10 @@ class Config:
     GEOJSON_READ_BUFFER_SIZE = 8192  # 8KB buffer for GeoJSON reading
     BATCH_WRITE_SIZE = 100  # Write tiles in batches
     
-    # Algorithm optimization
+    # Algorithm optimization - balanced cache sizes
     COORDINATE_PRECISION = 6  # Decimal places for coordinate precision
-    MATH_CACHE_SIZE = 1000  # Cache size for mathematical operations
-    PIXEL_COORD_CACHE_SIZE = 5000  # Cache size for pixel coordinate calculations
+    MATH_CACHE_SIZE = 750  # Balanced cache size for mathematical operations
+    PIXEL_COORD_CACHE_SIZE = 3000  # Balanced cache size for pixel coordinate calculations
     
     # File size limits
     MAX_FILE_SIZE_KB_LIMIT = 10240  # 10MB
@@ -144,6 +145,127 @@ class Config:
 # Global variables to track files for cleanup
 _db_file_to_cleanup = None
 _temp_files_to_cleanup = set()
+
+# Memory monitoring and management
+def get_memory_usage() -> Dict[str, float]:
+    """
+    Get current memory usage information.
+    
+    Returns:
+        Dictionary with memory usage statistics in MB
+    """
+    memory = psutil.virtual_memory()
+    return {
+        'total': memory.total / (1024 * 1024),  # MB
+        'available': memory.available / (1024 * 1024),  # MB
+        'used': memory.used / (1024 * 1024),  # MB
+        'percent': memory.percent,
+        'free': memory.free / (1024 * 1024)  # MB
+    }
+
+def get_memory_pressure() -> str:
+    """
+    Assess current memory pressure level.
+    
+    Returns:
+        Memory pressure level: 'low', 'medium', 'high', 'critical'
+    """
+    memory_info = get_memory_usage()
+    percent_used = memory_info['percent']
+    
+    if percent_used < 60:
+        return 'low'
+    elif percent_used < 75:
+        return 'medium'
+    elif percent_used < 90:
+        return 'high'
+    else:
+        return 'critical'
+
+def calculate_optimal_workers(memory_pressure: str, base_workers: int) -> int:
+    """
+    Calculate optimal number of workers based on memory pressure.
+    
+    Args:
+        memory_pressure: Current memory pressure level
+        base_workers: Base number of workers from CPU cores
+        
+    Returns:
+        Optimal number of workers
+    """
+    if memory_pressure == 'low':
+        return base_workers
+    elif memory_pressure == 'medium':
+        return max(1, base_workers // 2)
+    elif memory_pressure == 'high':
+        return max(1, base_workers // 3)
+    else:  # critical
+        return 1
+
+def calculate_optimal_batch_size(memory_pressure: str, base_batch_size: int) -> int:
+    """
+    Calculate optimal batch size based on memory pressure.
+    
+    Args:
+        memory_pressure: Current memory pressure level
+        base_batch_size: Base batch size
+        
+    Returns:
+        Optimal batch size
+    """
+    if memory_pressure == 'low':
+        return base_batch_size
+    elif memory_pressure == 'medium':
+        return max(100, base_batch_size // 2)
+    elif memory_pressure == 'high':
+        return max(50, base_batch_size // 4)
+    else:  # critical
+        return max(10, base_batch_size // 8)
+
+def force_memory_cleanup():
+    """
+    Force aggressive memory cleanup when memory pressure is high.
+    """
+    logger.debug("Performing aggressive memory cleanup...")
+    
+    # Clear all caches
+    clear_all_caches()
+    
+    # Force garbage collection multiple times
+    for _ in range(3):
+        gc.collect()
+    
+    # Clear object pools
+    clear_object_pools()
+    
+    logger.debug("Memory cleanup completed")
+
+def monitor_memory_and_adjust():
+    """
+    Monitor memory usage and adjust processing parameters dynamically.
+    
+    Returns:
+        Tuple of (adjusted_workers, adjusted_batch_size, memory_pressure)
+    """
+    memory_pressure = get_memory_pressure()
+    memory_info = get_memory_usage()
+    
+    logger.debug(f"Memory: {memory_info['used']:.1f}MB used ({memory_info['percent']:.1f}%), "
+                f"{memory_info['available']:.1f}MB available, pressure: {memory_pressure}")
+    
+    # Adjust workers based on memory pressure
+    base_workers = Config.MAX_WORKERS
+    optimal_workers = calculate_optimal_workers(memory_pressure, base_workers)
+    
+    # Adjust batch size based on memory pressure
+    base_batch_size = Config.TILE_BATCH_SIZE
+    optimal_batch_size = calculate_optimal_batch_size(memory_pressure, base_batch_size)
+    
+    # Force cleanup if memory pressure is critical
+    if memory_pressure in ['high', 'critical']:
+        force_memory_cleanup()
+    
+    return optimal_workers, optimal_batch_size, memory_pressure
 
 @contextmanager
 def managed_database(db_path: str) -> Iterator['FeatureDatabase']:
@@ -1849,20 +1971,23 @@ def tile_worker(args):
     return tile_size, elapsed
 
 def write_tile_batch(batch, output_dir, zoom, max_file_size, simplify_tolerance):
-    """Write a batch of tiles with optimized worker allocation"""
+    """Write a batch of tiles with dynamic memory-aware processing"""
     tile_sizes = []
     
     # Calculate optimal worker count based on batch complexity
     total_features = sum(len(features) for _, _, features, _, _, _, _ in batch)
     avg_features_per_tile = total_features / len(batch) if batch else 0
     
-    # Adaptive worker allocation
+    # Monitor memory and get optimal settings
+    optimal_workers, optimal_batch_size, memory_pressure = monitor_memory_and_adjust()
+    
+    # Adjust worker count based on complexity AND memory pressure
     if avg_features_per_tile <= Config.TILE_COMPLEXITY_THRESHOLD:
-        # Simple tiles: use more workers
-        batch_workers = min(Config.MAX_WORKERS, len(batch))
-    elif avg_features_per_tile <= Config.TILE_COMPLEXITY_THRESHOLD * 3:
-        # Medium tiles: use moderate workers
-        batch_workers = min(Config.MAX_WORKERS // 2, len(batch))
+        # Simple tiles: use more workers (up to optimal_workers)
+        batch_workers = min(optimal_workers, len(batch))
+    elif avg_features_per_tile <= Config.TILE_COMPLEXITY_THRESHOLD * 2:
+        # Medium tiles: use moderate workers (half of optimal_workers)
+        batch_workers = min(max(1, optimal_workers // 2), len(batch))
     else:
         # Complex tiles: use fewer workers to avoid memory issues
         batch_workers = min(2, len(batch))
@@ -1870,14 +1995,24 @@ def write_tile_batch(batch, output_dir, zoom, max_file_size, simplify_tolerance)
     # Ensure we have at least 1 worker
     batch_workers = max(1, batch_workers)
     
-    logger.debug(f"Processing batch of {len(batch)} tiles with {batch_workers} workers "
-                f"(avg features: {avg_features_per_tile:.1f})")
+    logger.info(f"Processing batch of {len(batch)} tiles with {batch_workers} workers "
+               f"(avg features: {avg_features_per_tile:.1f}, memory pressure: {memory_pressure}, "
+               f"optimal workers: {optimal_workers})")
     
+    # Use ProcessPoolExecutor for balanced parallelization
     with ProcessPoolExecutor(max_workers=batch_workers) as executor:
         futures = [executor.submit(tile_worker, job) for job in batch]
-        for future in as_completed(futures):
+        for i, future in enumerate(as_completed(futures)):
             tile_size, _ = future.result()
             tile_sizes.append(tile_size)
+            
+            # Adaptive garbage collection based on memory pressure
+            if memory_pressure == 'critical' and i % 5 == 0:
+                gc.collect()
+            elif memory_pressure == 'high' and i % 10 == 0:
+                gc.collect()
+            elif memory_pressure in ['medium', 'low'] and i % 20 == 0:
+                gc.collect()
     
     return tile_sizes
 
@@ -1906,7 +2041,12 @@ def generate_tiles_from_database(db_path: str, output_dir: str, zoom: int, max_f
                 logger.warning(f"No features found for zoom {zoom}")
                 return
             
-            # Create optimized batches based on complexity
+            # Monitor memory before creating batches
+            memory_info = get_memory_usage()
+            logger.info(f"Memory status before batch creation: {memory_info['used']:.1f}MB used "
+                       f"({memory_info['percent']:.1f}%), {memory_info['available']:.1f}MB available")
+            
+            # Create optimized batches based on complexity and memory
             optimized_batches = create_optimized_tile_batches(all_tile_data)
             
             # Pre-create directory structure for all tiles
@@ -1931,6 +2071,14 @@ def generate_tiles_from_database(db_path: str, output_dir: str, zoom: int, max_f
                         all_tile_sizes.extend(batch_sizes)
                     
                     pbar.update(len(batch_tile_data))
+                    
+                    # Monitor memory after each batch
+                    if batch_idx % 5 == 0:  # Check every 5 batches
+                        memory_pressure = get_memory_pressure()
+                        if memory_pressure in ['high', 'critical']:
+                            logger.warning(f"High memory pressure detected: {memory_pressure}, "
+                                         f"forcing cleanup after batch {batch_idx}")
+                            force_memory_cleanup()
                     
                     # Memory management between batches
                     with memory_management():
@@ -2034,6 +2182,19 @@ def main() -> None:
         config = validate_config_file(args.config_file)
         
         logger.info("All input parameters validated successfully")
+        
+        # Display initial system information
+        memory_info = get_memory_usage()
+        cpu_count = os.cpu_count() or 4
+        max_workers = Config.MAX_WORKERS
+        
+        logger.info(f"System information:")
+        logger.info(f"  CPU cores: {cpu_count}")
+        logger.info(f"  Max workers: {max_workers}")
+        logger.info(f"  Total memory: {memory_info['total']:.1f}MB")
+        logger.info(f"  Available memory: {memory_info['available']:.1f}MB")
+        logger.info(f"  Memory usage: {memory_info['percent']:.1f}%")
+        logger.info(f"  Memory pressure: {get_memory_pressure()}")
         
     except (FileNotFoundError, ValueError, PermissionError) as e:
         logger.error(f"Validation error: {e}")
