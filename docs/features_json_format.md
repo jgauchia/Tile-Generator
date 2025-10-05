@@ -7,9 +7,37 @@ The file defines feature styling, priority, and minimum zoom level for OpenStree
 
 ## File Overview
 
-- The file is a JSON object.
-- Each key is a **feature selector** for OSM data, matching tags in the form `key=value` or just `key`.
-- Each value is an object specifying options for rendering that feature.
+- The file is a JSON object containing both **system configuration** and **feature definitions**.
+- **System configuration** parameters control tile generation and viewer behavior.
+- **Feature definitions** specify styling, priority, and minimum zoom level for OSM tags.
+
+---
+
+## System Configuration Parameters
+
+The following parameters control the tile generation and viewer system:
+
+| Parameter | Type | Description | Default |
+|-----------|------|-------------|---------|
+| `tile_size` | integer | Size of generated tiles in pixels | 256 |
+| `viewport_size` | integer | Size of the viewer viewport in pixels | 768 |
+| `toolbar_width` | integer | Width of the viewer toolbar in pixels | 160 |
+| `statusbar_height` | integer | Height of the viewer status bar in pixels | 40 |
+| `max_cache_size` | integer | Maximum number of tiles to cache in memory | 1000 |
+| `thread_pool_size` | integer | Number of worker threads for tile generation | 4 |
+| `background_colors` | array | Array of background colors [black, white] | `[[0,0,0], [255,255,255]]` |
+| `log_level` | string | Logging level (DEBUG, INFO, WARNING, ERROR) | "INFO" |
+| `config_file` | string | Path to this configuration file | "features.json" |
+| `fps_limit` | integer | Maximum frames per second for the viewer | 30 |
+| `fill_polygons` | boolean | Whether to fill polygons or show only outlines | true |
+
+---
+
+## Feature Definitions
+
+Each feature definition is a key-value pair where:
+- The key is a **feature selector** for OSM data, matching tags in the form `key=value` or just `key`.
+- The value is an object specifying options for rendering that feature.
 
 ---
 
@@ -60,35 +88,50 @@ Each feature definition object can include:
 
 ---
 
-## Example Features
+## Complete Example
 
 ```json
 {
+  "tile_size": 256,
+  "viewport_size": 768,
+  "toolbar_width": 160,
+  "statusbar_height": 40,
+  "max_cache_size": 1000,
+  "thread_pool_size": 4,
+  "background_colors": [
+    [0, 0, 0],
+    [255, 255, 255]
+  ],
+  "log_level": "INFO",
+  "config_file": "features.json",
+  "fps_limit": 30,
+  "fill_polygons": true,
   "natural=coastline": {
     "zoom": 6,
-    "color": "#b5d0d0",
+    "color": "#0077FF",
     "description": "Coastlines",
     "priority": 1
   },
-  "landuse=forest": {
-    "zoom": 12,
-    "color": "#aed18d",
-    "description": "Forest areas",
-    "priority": 2
+  "natural=water": {
+    "zoom": 11,
+    "color": "#3399FF",
+    "description": "Water bodies",
+    "priority": 1
   },
   "building": {
     "zoom": 15,
-    "color": "#bbbbbb",
+    "color": "#BBBBBB",
     "description": "Buildings",
     "priority": 9
   }
 }
 ```
 
-- In this example:
-    - Coastlines appear from zoom level 6 upward, in blueish color, and with high priority.
-    - Forests are rendered from zoom 12 upward, in green.
-    - Buildings appear only at zoom 15 and higher.
+- **System configuration**: Controls tile generation and viewer behavior
+- **Feature definitions**: 
+    - Coastlines appear from zoom level 6 upward, in blue color, with high priority
+    - Water bodies are rendered from zoom 11 upward, in light blue
+    - Buildings appear only at zoom 15 and higher, in gray
 
 ---
 
@@ -102,11 +145,25 @@ Each feature definition object can include:
 
 ---
 
+## Polygon Rendering
+
+The `fill_polygons` parameter controls how polygons are rendered:
+
+- **`true`**: Polygons are filled with their specified color and have outlines:
+  - **Interior segments**: Outlines are 40% darker than the fill color
+  - **Border segments**: Outlines use the original polygon color
+- **`false`**: Polygons show only outlines:
+  - **Interior segments**: Outlines use the original polygon color
+  - **Border segments**: Outlines use the background color (making them invisible)
+
+This creates a visual distinction between polygon interiors and tile borders.
+
 ## Usage Notes
 
 - You can extend the file with new feature selectors and styling as needed.
 - All parameters are optional, but `zoom` and `color` are recommended for correct rendering.
 - This file drives both filtering (which features are extracted from the OSM source) and styling (how they appear in the output tiles).
+- The `fill_polygons` parameter significantly affects the visual appearance of the generated tiles.
 
 ---
 

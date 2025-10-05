@@ -9,6 +9,82 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import OrderedDict
 from functools import lru_cache
 
+# Drawing command codes
+DRAW_COMMANDS = {
+    'LINE': 1,
+    'POLYLINE': 2,
+    'STROKE_POLYGON': 3,
+    'HORIZONTAL_LINE': 5,
+    'VERTICAL_LINE': 6,
+    'SET_COLOR': 0x80,  # State command for direct RGB332 color
+    'SET_COLOR_INDEX': 0x81,  # State command for palette index
+    'RECTANGLE': 0x82,  # Optimized rectangle for buildings
+    'STRAIGHT_LINE': 0x83,  # Optimized straight line for highways
+    'HIGHWAY_SEGMENT': 0x84,  # Highway segment with continuity
+    'GRID_PATTERN': 0x85,  # Urban grid pattern
+    'BLOCK_PATTERN': 0x86,  # City block pattern
+    'CIRCLE': 0x87,  # Circle/roundabout
+    'SET_LAYER': 0x88,  # Layer indicator command
+    'RELATIVE_MOVE': 0x89,  # Relative coordinate movement
+    'PREDICTED_LINE': 0x8A,  # Predictive line based on pattern
+    'COMPRESSED_POLYLINE': 0x8B,  # Huffman-compressed polyline
+    'OPTIMIZED_POLYGON': 0x8C,  # Optimized polygon (contour only, fill decided by viewer)
+    'HOLLOW_POLYGON': 0x8D,  # Polygon outline only (optimized for boundaries)
+    'OPTIMIZED_TRIANGLE': 0x8E,  # Optimized triangle (contour only, fill decided by viewer)
+    'OPTIMIZED_RECTANGLE': 0x8F,  # Optimized rectangle (contour only, fill decided by viewer)
+    'OPTIMIZED_CIRCLE': 0x90,  # Optimized circle (contour only, fill decided by viewer)
+    'SIMPLE_RECTANGLE': 0x96,  # Simple rectangle (x, y, width, height)
+    'SIMPLE_CIRCLE': 0x97,  # Simple circle (center_x, center_y, radius)
+    'SIMPLE_TRIANGLE': 0x98,  # Simple triangle (x1, y1, x2, y2, x3, y3)
+    'DASHED_LINE': 0x99,  # Dashed line with pattern
+    'DOTTED_LINE': 0x9A,  # Dotted line with pattern
+}
+
+# Rendering layers (orden de renderizado de abajo hacia arriba)
+RENDER_LAYERS = {
+    'TERRAIN': 0,      # Background terrain, water bodies
+    'WATER': 1,        # Rivers, lakes, oceans
+    'BUILDINGS': 2,    # Buildings, structures
+    'OUTLINES': 3,     # Polygon outlines, borders
+    'ROADS': 4,        # Roads, highways, paths
+    'LABELS': 5        # Text labels, symbols
+}
+
+# Command type names for analysis
+COMMAND_NAMES = {
+    1: "LINE",
+    2: "POLYLINE",
+    3: "STROKE_POLYGON",
+    5: "HORIZONTAL_LINE",
+    6: "VERTICAL_LINE",
+    0x80: "SET_COLOR",
+    0x81: "SET_COLOR_INDEX",
+    0x82: "RECTANGLE",
+    0x83: "STRAIGHT_LINE",
+    0x84: "HIGHWAY_SEGMENT",
+    0x85: "GRID_PATTERN",
+    0x86: "BLOCK_PATTERN",
+    0x87: "CIRCLE",
+    0x88: "SET_LAYER",
+    0x89: "RELATIVE_MOVE",
+    0x8A: "PREDICTED_LINE",
+    0x8B: "COMPRESSED_POLYLINE",
+    0x8C: "OPTIMIZED_POLYGON",
+    0x8D: "HOLLOW_POLYGON",
+    0x8E: "OPTIMIZED_TRIANGLE",
+    0x8F: "OPTIMIZED_RECTANGLE",
+    0x90: "OPTIMIZED_CIRCLE",
+    0x96: "SIMPLE_RECTANGLE",
+    0x97: "SIMPLE_CIRCLE",
+    0x98: "SIMPLE_TRIANGLE",
+    0x99: "DASHED_LINE",
+    0x9A: "DOTTED_LINE"
+}
+
+# Tile configuration
+TILE_SIZE = 256
+UINT16_TILE_SIZE = 65536
+
 # Setup logging first
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -24,7 +100,8 @@ DEFAULT_CONFIG = {
     'background_colors': [(0, 0, 0), (255, 255, 255)],
     'log_level': 'INFO',
     'config_file': 'features.json',
-    'fps_limit': 30
+    'fps_limit': 30,
+    'fill_polygons': False  # Control for polygon filling (like ESP32 fillPolygons flag)
 }
 
 class Config:
@@ -84,28 +161,6 @@ STATUSBAR_HEIGHT = config.get('statusbar_height', 40)
 WINDOW_WIDTH = VIEWPORT_SIZE + TOOLBAR_WIDTH
 WINDOW_HEIGHT = VIEWPORT_SIZE + STATUSBAR_HEIGHT
 
-DRAW_COMMANDS = {
-    1: "LINE",
-    2: "POLYLINE",
-    3: "STROKE_POLYGON",
-    5: "HORIZONTAL_LINE",
-    6: "VERTICAL_LINE",
-    0x80: "SET_COLOR",        # Original command (direct RGB332)
-    0x81: "SET_COLOR_INDEX",  # Palette command (index)
-    # Feature-specific optimized commands
-    0x82: "RECTANGLE",        # Optimized rectangle for buildings
-    0x83: "STRAIGHT_LINE",    # Optimized straight line for highways
-    0x84: "HIGHWAY_SEGMENT",  # Highway segment with continuity
-    # Advanced compression commands
-    0x85: "GRID_PATTERN",     # Urban grid pattern
-    0x86: "BLOCK_PATTERN",    # City block pattern
-    0x87: "CIRCLE",           # Circle/roundabout
-    0x88: "RELATIVE_MOVE",    # Relative coordinate movement
-    0x89: "PREDICTED_LINE",   # Predictive line based on pattern
-    0x8A: "COMPRESSED_POLYLINE",  # Huffman-compressed polyline
-}
-
-UINT16_TILE_SIZE = 65536
 
 # Global variables for palette (can be loaded dynamically)
 GLOBAL_PALETTE = {}  # Loaded from configuration file or deduced
@@ -196,7 +251,7 @@ class TileLoader:
                 logger.warning(f"Tile file does not exist: {tile_file}")
                 return None, None
             
-            surface = render_tile_surface({'x': x, 'y': y, 'file': tile_file}, bg_color, fill_mode)
+            surface = render_tile_surface({'x': x, 'y': y, 'file': tile_file}, bg_color, fill_mode, False)
             if surface is None:
                 logger.error(f"Failed to render tile surface for {tile_file}")
                 return None, None
@@ -273,6 +328,136 @@ def hex_to_rgb888(hex_color):
 
 def darken_color(rgb, amount=0.3):
     return tuple(max(0, int(v * (1 - amount))) for v in rgb)
+
+# Layer definitions are now imported from map_constants.py
+
+def process_layer_command(data, offset):
+    """Process SET_LAYER command"""
+    layer, offset = read_varint(data, offset)
+    return layer, offset
+
+def skip_command(cmd_type, data, offset):
+    """Skip command data without processing it"""
+    if cmd_type == 1:  # LINE
+        _, offset = read_zigzag(data, offset)
+        _, offset = read_zigzag(data, offset)
+        _, offset = read_zigzag(data, offset)
+        _, offset = read_zigzag(data, offset)
+    elif cmd_type == 2:  # POLYLINE
+        n_pts, offset = read_varint(data, offset)
+        for _ in range(n_pts):
+            if _ == 0:
+                _, offset = read_zigzag(data, offset)
+                _, offset = read_zigzag(data, offset)
+            else:
+                _, offset = read_zigzag(data, offset)
+                _, offset = read_zigzag(data, offset)
+    elif cmd_type == 3:  # STROKE_POLYGON
+        n_pts, offset = read_varint(data, offset)
+        for _ in range(n_pts):
+            _, offset = read_zigzag(data, offset)
+            _, offset = read_zigzag(data, offset)
+    elif cmd_type == 5:  # HORIZONTAL_LINE
+        _, offset = read_zigzag(data, offset)
+        _, offset = read_zigzag(data, offset)
+        _, offset = read_zigzag(data, offset)
+    elif cmd_type == 6:  # VERTICAL_LINE
+        _, offset = read_zigzag(data, offset)
+        _, offset = read_zigzag(data, offset)
+        _, offset = read_zigzag(data, offset)
+    elif cmd_type == 0x82:  # RECTANGLE
+        _, offset = read_zigzag(data, offset)
+        _, offset = read_zigzag(data, offset)
+        _, offset = read_zigzag(data, offset)
+        _, offset = read_zigzag(data, offset)
+    elif cmd_type == 0x83:  # STRAIGHT_LINE
+        n_pts, offset = read_varint(data, offset)
+        for _ in range(n_pts):
+            if _ == 0:
+                _, offset = read_zigzag(data, offset)
+                _, offset = read_zigzag(data, offset)
+            else:
+                _, offset = read_zigzag(data, offset)
+                _, offset = read_zigzag(data, offset)
+    elif cmd_type == 0x87:  # CIRCLE
+        _, offset = read_zigzag(data, offset)
+        _, offset = read_zigzag(data, offset)
+        _, offset = read_zigzag(data, offset)
+    elif cmd_type == 0x84:  # HIGHWAY_SEGMENT
+        _, offset = read_zigzag(data, offset)
+        _, offset = read_zigzag(data, offset)
+        _, offset = read_zigzag(data, offset)
+        _, offset = read_zigzag(data, offset)
+    elif cmd_type == 0x85:  # GRID_PATTERN
+        _, offset = read_zigzag(data, offset)
+        _, offset = read_zigzag(data, offset)
+        _, offset = read_zigzag(data, offset)
+        _, offset = read_zigzag(data, offset)
+        _, offset = read_varint(data, offset)
+    elif cmd_type == 0x86:  # BLOCK_PATTERN
+        _, offset = read_zigzag(data, offset)
+        _, offset = read_zigzag(data, offset)
+        _, offset = read_zigzag(data, offset)
+        _, offset = read_zigzag(data, offset)
+    elif cmd_type == 0x89:  # RELATIVE_MOVE
+        _, offset = read_zigzag(data, offset)
+        _, offset = read_zigzag(data, offset)
+    elif cmd_type == 0x8A:  # PREDICTED_LINE
+        _, offset = read_zigzag(data, offset)
+        _, offset = read_zigzag(data, offset)
+    elif cmd_type == 0x8B:  # COMPRESSED_POLYLINE
+        _, offset = read_varint(data, offset)
+    elif cmd_type == 0x8C:  # OPTIMIZED_POLYGON
+        n_pts, offset = read_varint(data, offset)
+        for _ in range(n_pts):
+            if _ == 0:
+                _, offset = read_zigzag(data, offset)
+                _, offset = read_zigzag(data, offset)
+            else:
+                _, offset = read_zigzag(data, offset)
+                _, offset = read_zigzag(data, offset)
+    elif cmd_type == 0x8D:  # HOLLOW_POLYGON
+        n_pts, offset = read_varint(data, offset)
+        for _ in range(n_pts):
+            if _ == 0:
+                _, offset = read_zigzag(data, offset)
+                _, offset = read_zigzag(data, offset)
+            else:
+                _, offset = read_zigzag(data, offset)
+                _, offset = read_zigzag(data, offset)
+    elif cmd_type == 0x8E:  # OPTIMIZED_TRIANGLE
+        for _ in range(6):
+            _, offset = read_zigzag(data, offset)
+    elif cmd_type == 0x8F:  # OPTIMIZED_RECTANGLE
+        for _ in range(4):
+            _, offset = read_zigzag(data, offset)
+    elif cmd_type == 0x90:  # OPTIMIZED_CIRCLE
+        for _ in range(3):
+            _, offset = read_zigzag(data, offset)
+    elif cmd_type == 0x96:  # SIMPLE_RECTANGLE
+        for _ in range(4):
+            _, offset = read_zigzag(data, offset)
+    elif cmd_type == 0x97:  # SIMPLE_CIRCLE
+        for _ in range(3):
+            _, offset = read_zigzag(data, offset)
+    elif cmd_type == 0x98:  # SIMPLE_TRIANGLE
+        for _ in range(6):
+            _, offset = read_zigzag(data, offset)
+    elif cmd_type == 0x99:  # DASHED_LINE
+        for _ in range(4):
+            _, offset = read_zigzag(data, offset)
+        _, offset = read_varint(data, offset)  # dash_length
+        _, offset = read_varint(data, offset)  # gap_length
+    elif cmd_type == 0x9A:  # DOTTED_LINE
+        for _ in range(4):
+            _, offset = read_zigzag(data, offset)
+        _, offset = read_varint(data, offset)  # dot_spacing
+    else:
+        # For unknown commands, skip 4 bytes
+        if offset < len(data) - 4:
+            offset += 4
+    
+    return offset
 
 @lru_cache(maxsize=1000)
 def uint16_to_tile_pixel(val):
@@ -440,6 +625,35 @@ def is_tile_border_point(pt):
     x, y = pt
     return (x == 0 or x == TILE_SIZE-1) or (y == 0 or y == TILE_SIZE-1)
 
+def is_polygon_on_tile_border(pts):
+    """Check if a polygon has any points on the tile border"""
+    for pt in pts:
+        if is_tile_border_point(pt):
+            return True
+    return False
+
+def get_polygon_border_segments(pts):
+    """Get border segments of a polygon, distinguishing between tile border and interior segments"""
+    border_segments = []
+    interior_segments = []
+    
+    for i in range(len(pts)):
+        pt1 = pts[i]
+        pt2 = pts[(i + 1) % len(pts)]  # Next point (wrapping around)
+        
+        # Check if this segment is on the tile border
+        if is_tile_border_point(pt1) and is_tile_border_point(pt2):
+            border_segments.append((pt1, pt2))
+        else:
+            interior_segments.append((pt1, pt2))
+    
+    return border_segments, interior_segments
+
+def get_background_color(surface):
+    """Get the background color from the surface"""
+    # Get the color of the top-left pixel as background color
+    return surface.get_at((0, 0))[:3]  # RGB only, ignore alpha
+
 def create_error_tile(error_message="Error"):
     """Create a tile surface indicating an error"""
     surface = pygame.Surface((TILE_SIZE, TILE_SIZE))
@@ -511,42 +725,8 @@ def handle_color_command(cmd_type, data, offset, current_color):
     
     return current_color, offset, False
 
-def render_line_command(data, offset, surface, rgb, current_position, movement_vector):
-    """Render LINE command"""
-    x1, offset = read_zigzag(data, offset)
-    y1, offset = read_zigzag(data, offset)
-    dx, offset = read_zigzag(data, offset)
-    dy, offset = read_zigzag(data, offset)
-    x2 = x1 + dx
-    y2 = y1 + dy
-    pygame.draw.line(surface, rgb, (uint16_to_tile_pixel(x1), uint16_to_tile_pixel(y1)),
-                     (uint16_to_tile_pixel(x2), uint16_to_tile_pixel(y2)), 1)
-    # Update position and movement for predictions
-    current_position = (x2, y2)
-    movement_vector = (dx, dy)
-    return offset, current_position, movement_vector
 
-def render_polyline_command(data, offset, surface, rgb):
-    """Render POLYLINE command"""
-    n_pts, offset = read_varint(data, offset)
-    pts = []
-    x, y = 0, 0
-    for i in range(n_pts):
-        if i == 0:
-            x, offset = read_zigzag(data, offset)
-            y, offset = read_zigzag(data, offset)
-        else:
-            dx, offset = read_zigzag(data, offset)
-            dy, offset = read_zigzag(data, offset)
-            x += dx
-            y += dy
-        pts.append((uint16_to_tile_pixel(x), uint16_to_tile_pixel(y)))
-    if len(pts) >= 2:
-        pygame.draw.lines(surface, rgb, False, pts, 1)
-        current_position = (x, y)
-    return offset, current_position
-
-def render_polygon_command(data, offset, surface, rgb, fill_mode):
+def render_polygon_command(data, offset, surface, rgb, fill_polygons):
     """Render STROKE_POLYGON command"""
     n_pts, offset = read_varint(data, offset)
     pts = []
@@ -562,50 +742,88 @@ def render_polygon_command(data, offset, surface, rgb, fill_mode):
             y += dy
         pts.append((uint16_to_tile_pixel(x), uint16_to_tile_pixel(y)))
     
-    if fill_mode and len(pts) >= 3:
+    if fill_polygons and len(pts) >= 3:
         pygame.draw.polygon(surface, rgb, pts, 0)
-        closed = pts[0] == pts[-1] if len(pts) > 0 else False
-        for i in range(len(pts)-1):
-            p1 = pts[i]
-            p2 = pts[i+1]
-            if is_tile_border_point(p1) and is_tile_border_point(p2):
-                continue
-            else:
-                border_rgb = darken_color(rgb)
-                pygame.draw.line(surface, border_rgb, p1, p2, 2)
-        if closed and len(pts) > 1:
-            p1 = pts[-1]
-            p2 = pts[0]
-            if not (is_tile_border_point(p1) and is_tile_border_point(p2)):
-                border_rgb = darken_color(rgb)
-                pygame.draw.line(surface, border_rgb, p1, p2, 2)
+        # Dibujar contorno: más oscuro en segmentos interiores, color original en segmentos de borde del tile
+        border_segments, interior_segments = get_polygon_border_segments(pts)
         
-    if len(pts) >= 2:
-        closed = pts[0] == pts[-1] if len(pts) > 0 else False
-        for i in range(len(pts)-1):
-            p1 = pts[i]
-            p2 = pts[i+1]
-            if not fill_mode and is_tile_border_point(p1) and is_tile_border_point(p2):
-                continue
-            else:
-                pygame.draw.line(surface, rgb, p1, p2, 1)
-        if closed and len(pts) > 1:
-            p1 = pts[-1]
-            p2 = pts[0]
-            if not (not fill_mode and is_tile_border_point(p1) and is_tile_border_point(p2)):
-                pygame.draw.line(surface, rgb, p1, p2, 1)
+        # Dibujar segmentos de borde con color original
+        for pt1, pt2 in border_segments:
+            pygame.draw.line(surface, rgb, pt1, pt2, 1)
+        
+        # Dibujar segmentos interiores con color oscurecido
+        for pt1, pt2 in interior_segments:
+            pygame.draw.line(surface, darken_color(rgb, 0.4), pt1, pt2, 1)
+    elif not fill_polygons and len(pts) >= 2:
+        # Sin relleno: dibujar contorno con color original en interiores, color de fondo en bordes del tile
+        border_segments, interior_segments = get_polygon_border_segments(pts)
+        bg_color = get_background_color(surface)
+        
+        # Dibujar segmentos de borde con color de fondo
+        for pt1, pt2 in border_segments:
+            pygame.draw.line(surface, bg_color, pt1, pt2, 1)
+        
+        # Dibujar segmentos interiores con color original
+        for pt1, pt2 in interior_segments:
+            pygame.draw.line(surface, rgb, pt1, pt2, 1)
     return offset
 
-def render_geometry_command(cmd_type, data, offset, surface, current_color, fill_mode, current_position, movement_vector):
+def render_geometry_command(cmd_type, data, offset, surface, current_color, fill_mode, current_position, movement_vector, fill_polygons=False, show_tile_labels=False):
     """Render geometry commands"""
     rgb = rgb332_to_rgb888(current_color) if current_color is not None else (255, 255, 255)
     
+    # If surface is None, just skip the rendering and return updated offset/position
+    if surface is None:
+        # Skip rendering but still process the command to get correct offset
+        if cmd_type == 1:  # LINE
+            _, offset = read_zigzag(data, offset)
+            _, offset = read_zigzag(data, offset)
+            _, offset = read_zigzag(data, offset)
+            _, offset = read_zigzag(data, offset)
+            return offset, current_position, movement_vector
+        elif cmd_type == 2:  # POLYLINE
+            n_pts, offset = read_varint(data, offset)
+            for _ in range(n_pts):
+                if _ == 0:
+                    _, offset = read_zigzag(data, offset)
+                    _, offset = read_zigzag(data, offset)
+                else:
+                    _, offset = read_zigzag(data, offset)
+                    _, offset = read_zigzag(data, offset)
+            return offset, current_position, movement_vector
+        # Add other command types as needed...
+        return offset, current_position, movement_vector
+    
     if cmd_type == 1:  # LINE
-        offset, current_position, movement_vector = render_line_command(data, offset, surface, rgb, current_position, movement_vector)
+        x1, offset = read_zigzag(data, offset)
+        y1, offset = read_zigzag(data, offset)
+        dx, offset = read_zigzag(data, offset)
+        dy, offset = read_zigzag(data, offset)
+        x2 = x1 + dx
+        y2 = y1 + dy
+        pygame.draw.line(surface, rgb, (uint16_to_tile_pixel(x1), uint16_to_tile_pixel(y1)),
+                         (uint16_to_tile_pixel(x2), uint16_to_tile_pixel(y2)), 1)
+        current_position = (x2, y2)
+        movement_vector = (dx, dy)
     elif cmd_type == 2:  # POLYLINE
-        offset, current_position = render_polyline_command(data, offset, surface, rgb)
+        n_pts, offset = read_varint(data, offset)
+        pts = []
+        x, y = 0, 0
+        for i in range(n_pts):
+            if i == 0:
+                x, offset = read_zigzag(data, offset)
+                y, offset = read_zigzag(data, offset)
+            else:
+                dx, offset = read_zigzag(data, offset)
+                dy, offset = read_zigzag(data, offset)
+                x += dx
+                y += dy
+            pts.append((uint16_to_tile_pixel(x), uint16_to_tile_pixel(y)))
+        if len(pts) >= 2:
+            pygame.draw.lines(surface, rgb, False, pts, 1)
+            current_position = (x, y)
     elif cmd_type == 3:  # STROKE_POLYGON
-        offset = render_polygon_command(data, offset, surface, rgb, fill_mode)
+        offset = render_polygon_command(data, offset, surface, rgb, fill_polygons)
     elif cmd_type == 5:  # HORIZONTAL_LINE
         x1, offset = read_zigzag(data, offset)
         dx, offset = read_zigzag(data, offset)
@@ -644,18 +862,27 @@ def render_geometry_command(cmd_type, data, offset, surface, current_color, fill
         else:
             pygame.draw.rect(surface, rgb, rect, 1)
     elif cmd_type == 0x83:  # STRAIGHT_LINE
-        x1, offset = read_zigzag(data, offset)
-        y1, offset = read_zigzag(data, offset)
-        dx, offset = read_zigzag(data, offset)
-        dy, offset = read_zigzag(data, offset)
-        x2 = x1 + dx
-        y2 = y1 + dy
+        n_pts, offset = read_varint(data, offset)
+        pts = []
+        x, y = 0, 0
+        for i in range(n_pts):
+            if i == 0:
+                x, offset = read_zigzag(data, offset)
+                y, offset = read_zigzag(data, offset)
+            else:
+                dx, offset = read_zigzag(data, offset)
+                dy, offset = read_zigzag(data, offset)
+                x += dx
+                y += dy
+            pts.append((uint16_to_tile_pixel(x), uint16_to_tile_pixel(y)))
         
-        pygame.draw.line(surface, rgb, 
-                       (uint16_to_tile_pixel(x1), uint16_to_tile_pixel(y1)),
-                       (uint16_to_tile_pixel(x2), uint16_to_tile_pixel(y2)), 2)
-        current_position = (x2, y2)
-        movement_vector = (dx, dy)
+        if len(pts) >= 2:
+            pygame.draw.lines(surface, rgb, False, pts, 2)
+            current_position = (x, y)
+            if len(pts) >= 2:
+                movement_vector = (x - pts[-2][0], y - pts[-2][1])
+            else:
+                movement_vector = (0, 0)
     elif cmd_type == 0x84:  # HIGHWAY_SEGMENT
         x1, offset = read_zigzag(data, offset)
         y1, offset = read_zigzag(data, offset)
@@ -677,23 +904,25 @@ def render_geometry_command(cmd_type, data, offset, surface, current_color, fill
         count, offset = read_varint(data, offset)
         direction, offset = data[offset], offset + 1
         
-        px = uint16_to_tile_pixel(x)
-        py = uint16_to_tile_pixel(y)
-        pwidth = uint16_to_tile_pixel(width)
-        pspacing = uint16_to_tile_pixel(spacing)
-        
-        if direction == 1:  # Horizontal
-            for i in range(count):
-                line_y = py + i * pspacing
-                if 0 <= line_y < TILE_SIZE:
-                    pygame.draw.line(surface, rgb, (px, line_y), 
-                                   (px + pwidth, line_y), 1)
-        else:  # Vertical
-            for i in range(count):
-                line_x = px + i * pspacing
-                if 0 <= line_x < TILE_SIZE:
-                    pygame.draw.line(surface, rgb, (line_x, py), 
-                                   (line_x, py + pwidth), 1)
+        # Solo dibujar grid cuando show_tile_labels esté activado
+        if show_tile_labels:
+            px = uint16_to_tile_pixel(x)
+            py = uint16_to_tile_pixel(y)
+            pwidth = uint16_to_tile_pixel(width)
+            pspacing = uint16_to_tile_pixel(spacing)
+            
+            if direction == 1:  # Horizontal
+                for i in range(count):
+                    line_y = py + i * pspacing
+                    if 0 <= line_y < TILE_SIZE:
+                        pygame.draw.line(surface, rgb, (px, line_y), 
+                                       (px + pwidth, line_y), 1)
+            else:  # Vertical
+                for i in range(count):
+                    line_x = px + i * pspacing
+                    if 0 <= line_x < TILE_SIZE:
+                        pygame.draw.line(surface, rgb, (line_x, py), 
+                                       (line_x, py + pwidth), 1)
     elif cmd_type == 0x87:  # CIRCLE
         center_x, offset = read_zigzag(data, offset)
         center_y, offset = read_zigzag(data, offset)
@@ -709,31 +938,253 @@ def render_geometry_command(cmd_type, data, offset, surface, current_color, fill
                 pygame.draw.circle(surface, darken_color(rgb), (pcenter_x, pcenter_y), pradius, 1)
             else:
                 pygame.draw.circle(surface, rgb, (pcenter_x, pcenter_y), pradius, 1)
-    elif cmd_type == 0x89:  # PREDICTED_LINE
+    # This was PREDICTED_LINE but should be 0x8A, not 0x89
+    # 0x89 is RELATIVE_MOVE which is handled below
+    elif cmd_type == 0x86:  # BLOCK_PATTERN
+        x, offset = read_zigzag(data, offset)
+        y, offset = read_zigzag(data, offset)
+        width, offset = read_zigzag(data, offset)
+        height, offset = read_zigzag(data, offset)
+        # Render as filled rectangle
+        pygame.draw.rect(surface, rgb, (uint16_to_tile_pixel(x), uint16_to_tile_pixel(y), 
+                                        uint16_to_tile_pixel(width), uint16_to_tile_pixel(height)))
+    elif cmd_type == 0x88:  # SET_LAYER
+        logger.warning("SET_LAYER command should be handled in main loop, not here")
+    elif cmd_type == 0x89:  # RELATIVE_MOVE
+        dx, offset = read_zigzag(data, offset)
+        dy, offset = read_zigzag(data, offset)
+        current_position = (current_position[0] + dx, current_position[1] + dy)
+    elif cmd_type == 0x8A:  # PREDICTED_LINE
         end_x, offset = read_zigzag(data, offset)
         end_y, offset = read_zigzag(data, offset)
-        
-        start_x = current_position[0] + movement_vector[0]
-        start_y = current_position[1] + movement_vector[1]
-        
-        pygame.draw.line(surface, rgb,
-                       (uint16_to_tile_pixel(start_x), uint16_to_tile_pixel(start_y)),
+        # Use current position as start point
+        start_x, start_y = current_position
+        pygame.draw.line(surface, rgb, (uint16_to_tile_pixel(start_x), uint16_to_tile_pixel(start_y)),
                        (uint16_to_tile_pixel(end_x), uint16_to_tile_pixel(end_y)), 1)
-        
         current_position = (end_x, end_y)
-        movement_vector = (end_x - start_x, end_y - start_y)
-    elif cmd_type == 0x86:  # BLOCK_PATTERN
-        logger.warning("BLOCK_PATTERN command not implemented yet")
-    elif cmd_type == 0x88:  # RELATIVE_MOVE
-        logger.warning("RELATIVE_MOVE command not implemented yet")
-    elif cmd_type == 0x8A:  # COMPRESSED_POLYLINE
-        logger.warning("COMPRESSED_POLYLINE command not implemented yet")
+    elif cmd_type == 0x8B:  # COMPRESSED_POLYLINE
+        # For now, treat as regular polyline
+        n_pts, offset = read_varint(data, offset)
+        pts = []
+        x, y = current_position[0], current_position[1]
+        for i in range(n_pts):
+            if i == 0:
+                x, offset = read_zigzag(data, offset)
+                y, offset = read_zigzag(data, offset)
+            else:
+                dx, offset = read_zigzag(data, offset)
+                dy, offset = read_zigzag(data, offset)
+                x += dx
+                y += dy
+            pts.append((uint16_to_tile_pixel(x), uint16_to_tile_pixel(y)))
+        if len(pts) >= 2:
+            pygame.draw.lines(surface, rgb, False, pts, 1)
+            current_position = (x, y)
+    elif cmd_type == 0x8C:  # OPTIMIZED_POLYGON
+        n_pts, offset = read_varint(data, offset)
+        pts = []
+        x, y = 0, 0
+        for i in range(n_pts):
+            if i == 0:
+                x, offset = read_zigzag(data, offset)
+                y, offset = read_zigzag(data, offset)
+            else:
+                dx, offset = read_zigzag(data, offset)
+                dy, offset = read_zigzag(data, offset)
+                x += dx
+                y += dy
+            pts.append((uint16_to_tile_pixel(x), uint16_to_tile_pixel(y)))
+        if len(pts) >= 3 and fill_polygons:
+            pygame.draw.polygon(surface, rgb, pts, 0)
+            # Dibujar contorno: más oscuro si no está en borde del tile, color original si está en borde
+            if is_polygon_on_tile_border(pts):
+                pygame.draw.lines(surface, rgb, True, pts, 1)  # Color original en bordes
+            else:
+                pygame.draw.lines(surface, darken_color(rgb, 0.4), True, pts, 1)  # Más oscuro en interior
+        elif not fill_polygons and len(pts) >= 2:
+            # Sin relleno: dibujar contorno con color original, pero color de fondo en bordes del tile
+            if is_polygon_on_tile_border(pts):
+                bg_color = get_background_color(surface)
+                pygame.draw.lines(surface, bg_color, True, pts, 1)  # Color de fondo en bordes
+            else:
+                pygame.draw.lines(surface, rgb, True, pts, 1)  # Color original en interior
+    elif cmd_type == 0x8D:  # HOLLOW_POLYGON
+        n_pts, offset = read_varint(data, offset)
+        pts = []
+        x, y = 0, 0
+        for i in range(n_pts):
+            if i == 0:
+                x, offset = read_zigzag(data, offset)
+                y, offset = read_zigzag(data, offset)
+            else:
+                dx, offset = read_zigzag(data, offset)
+                dy, offset = read_zigzag(data, offset)
+                x += dx
+                y += dy
+            pts.append((uint16_to_tile_pixel(x), uint16_to_tile_pixel(y)))
+        # HOLLOW_POLYGON siempre se dibuja como contorno, independientemente de fill_polygons
+        if len(pts) >= 2:
+            pygame.draw.lines(surface, rgb, False, pts, 1)
+    elif cmd_type == 0x8E:  # OPTIMIZED_TRIANGLE
+        x1, offset = read_zigzag(data, offset)
+        y1, offset = read_zigzag(data, offset)
+        x2, offset = read_zigzag(data, offset)
+        y2, offset = read_zigzag(data, offset)
+        x3, offset = read_zigzag(data, offset)
+        y3, offset = read_zigzag(data, offset)
+        pts = [(uint16_to_tile_pixel(x1), uint16_to_tile_pixel(y1)),
+               (uint16_to_tile_pixel(x2), uint16_to_tile_pixel(y2)),
+               (uint16_to_tile_pixel(x3), uint16_to_tile_pixel(y3))]
+        if fill_polygons:
+            pygame.draw.polygon(surface, rgb, pts, 0)
+            # Dibujar contorno: más oscuro si no está en borde del tile, color original si está en borde
+            if is_polygon_on_tile_border(pts):
+                pygame.draw.lines(surface, rgb, True, pts, 1)  # Color original en bordes
+            else:
+                pygame.draw.lines(surface, darken_color(rgb, 0.4), True, pts, 1)  # Más oscuro en interior
+        elif not fill_polygons:
+            # Sin relleno: dibujar contorno con color original, pero color de fondo en bordes del tile
+            if is_polygon_on_tile_border(pts):
+                bg_color = get_background_color(surface)
+                pygame.draw.lines(surface, bg_color, True, pts, 1)  # Color de fondo en bordes
+            else:
+                pygame.draw.lines(surface, rgb, True, pts, 1)  # Color original en interior
+    elif cmd_type == 0x8F:  # OPTIMIZED_RECTANGLE
+        x, offset = read_zigzag(data, offset)
+        y, offset = read_zigzag(data, offset)
+        width, offset = read_zigzag(data, offset)
+        height, offset = read_zigzag(data, offset)
+        rect = (uint16_to_tile_pixel(x), uint16_to_tile_pixel(y),
+                uint16_to_tile_pixel(width), uint16_to_tile_pixel(height))
+        # Fill rectangle only if fill_polygons is enabled
+        if fill_polygons:
+            pygame.draw.rect(surface, rgb, rect, 0)
+        else:
+            pygame.draw.rect(surface, rgb, rect, 1)
+    elif cmd_type == 0x90:  # OPTIMIZED_CIRCLE
+        center_x, offset = read_zigzag(data, offset)
+        center_y, offset = read_zigzag(data, offset)
+        radius, offset = read_zigzag(data, offset)
+        pcenter_x = uint16_to_tile_pixel(center_x)
+        pcenter_y = uint16_to_tile_pixel(center_y)
+        pradius = uint16_to_tile_pixel(radius)
+        # Fill circle only if fill_polygons is enabled
+        if fill_polygons:
+            pygame.draw.circle(surface, rgb, (pcenter_x, pcenter_y), pradius, 0)
+        else:
+            pygame.draw.circle(surface, rgb, (pcenter_x, pcenter_y), pradius, 1)
+    elif cmd_type == 0x96:  # SIMPLE_RECTANGLE
+        x, offset = read_zigzag(data, offset)
+        y, offset = read_zigzag(data, offset)
+        width, offset = read_zigzag(data, offset)
+        height, offset = read_zigzag(data, offset)
+        rect = (uint16_to_tile_pixel(x), uint16_to_tile_pixel(y),
+                uint16_to_tile_pixel(width), uint16_to_tile_pixel(height))
+        if fill_polygons:
+            pygame.draw.rect(surface, rgb, rect, 0)
+        else:
+            pygame.draw.rect(surface, rgb, rect, 1)
+    elif cmd_type == 0x97:  # SIMPLE_CIRCLE
+        center_x, offset = read_zigzag(data, offset)
+        center_y, offset = read_zigzag(data, offset)
+        radius, offset = read_zigzag(data, offset)
+        pcenter_x = uint16_to_tile_pixel(center_x)
+        pcenter_y = uint16_to_tile_pixel(center_y)
+        pradius = uint16_to_tile_pixel(radius)
+        if pradius > 0:
+            if fill_polygons:
+                pygame.draw.circle(surface, rgb, (pcenter_x, pcenter_y), pradius, 0)
+            else:
+                pygame.draw.circle(surface, rgb, (pcenter_x, pcenter_y), pradius, 1)
+    elif cmd_type == 0x98:  # SIMPLE_TRIANGLE
+        x1, offset = read_zigzag(data, offset)
+        y1, offset = read_zigzag(data, offset)
+        x2, offset = read_zigzag(data, offset)
+        y2, offset = read_zigzag(data, offset)
+        x3, offset = read_zigzag(data, offset)
+        y3, offset = read_zigzag(data, offset)
+        pts = [(uint16_to_tile_pixel(x1), uint16_to_tile_pixel(y1)),
+               (uint16_to_tile_pixel(x2), uint16_to_tile_pixel(y2)),
+               (uint16_to_tile_pixel(x3), uint16_to_tile_pixel(y3))]
+        if fill_polygons:
+            pygame.draw.polygon(surface, rgb, pts, 0)
+            # Dibujar contorno: más oscuro si no está en borde del tile, color original si está en borde
+            if is_polygon_on_tile_border(pts):
+                pygame.draw.lines(surface, rgb, True, pts, 1)  # Color original en bordes
+            else:
+                pygame.draw.lines(surface, darken_color(rgb, 0.4), True, pts, 1)  # Más oscuro en interior
+        elif not fill_polygons:
+            # Sin relleno: dibujar contorno con color original, pero color de fondo en bordes del tile
+            if is_polygon_on_tile_border(pts):
+                bg_color = get_background_color(surface)
+                pygame.draw.lines(surface, bg_color, True, pts, 1)  # Color de fondo en bordes
+            else:
+                pygame.draw.lines(surface, rgb, True, pts, 1)  # Color original en interior
+    elif cmd_type == 0x99:  # DASHED_LINE
+        x1, offset = read_zigzag(data, offset)
+        y1, offset = read_zigzag(data, offset)
+        x2, offset = read_zigzag(data, offset)
+        y2, offset = read_zigzag(data, offset)
+        dash_length, offset = read_varint(data, offset)
+        gap_length, offset = read_varint(data, offset)
+        
+        # Draw dashed line
+        px1, py1 = uint16_to_tile_pixel(x1), uint16_to_tile_pixel(y1)
+        px2, py2 = uint16_to_tile_pixel(x2), uint16_to_tile_pixel(y2)
+        
+        # Simple dashed line implementation
+        dx = px2 - px1
+        dy = py2 - py1
+        length = math.sqrt(dx*dx + dy*dy)
+        if length > 0:
+            unit_x = dx / length
+            unit_y = dy / length
+            
+            current_length = 0
+            is_dash = True
+            while current_length < length:
+                if is_dash:
+                    end_length = min(current_length + dash_length, length)
+                    start_x = px1 + current_length * unit_x
+                    start_y = py1 + current_length * unit_y
+                    end_x = px1 + end_length * unit_x
+                    end_y = py1 + end_length * unit_y
+                    pygame.draw.line(surface, rgb, (int(start_x), int(start_y)), (int(end_x), int(end_y)), 1)
+                    current_length = end_length
+                else:
+                    current_length += gap_length
+                is_dash = not is_dash
+    elif cmd_type == 0x9A:  # DOTTED_LINE
+        x1, offset = read_zigzag(data, offset)
+        y1, offset = read_zigzag(data, offset)
+        x2, offset = read_zigzag(data, offset)
+        y2, offset = read_zigzag(data, offset)
+        dot_spacing, offset = read_varint(data, offset)
+        
+        # Draw dotted line
+        px1, py1 = uint16_to_tile_pixel(x1), uint16_to_tile_pixel(y1)
+        px2, py2 = uint16_to_tile_pixel(x2), uint16_to_tile_pixel(y2)
+        
+        # Simple dotted line implementation
+        dx = px2 - px1
+        dy = py2 - py1
+        length = math.sqrt(dx*dx + dy*dy)
+        if length > 0:
+            unit_x = dx / length
+            unit_y = dy / length
+            
+            current_length = 0
+            while current_length < length:
+                x = px1 + current_length * unit_x
+                y = py1 + current_length * unit_y
+                pygame.draw.circle(surface, rgb, (int(x), int(y)), 1, 0)
+                current_length += dot_spacing
     else:
         logger.warning(f"Unknown command type: {cmd_type} (0x{cmd_type:02x})")
     
     return offset, current_position, movement_vector
 
-def render_tile_surface(tile, bg_color, fill_mode):
+def render_tile_surface(tile, bg_color, fill_mode, show_tile_labels=False):
     """Main function to render tile surface from binary data with error recovery"""
     try:
         surface = pygame.Surface((TILE_SIZE, TILE_SIZE))
@@ -786,20 +1237,59 @@ def render_tile_surface(tile, bg_color, fill_mode):
         try:
             num_cmds, offset = parse_command_header(data, offset)
             
+            # First pass: group commands by layer
+            layer_commands = {layer: [] for layer in RENDER_LAYERS.values()}
+            current_layer = RENDER_LAYERS['TERRAIN']  # Default layer
+            
+            temp_offset = offset
+            temp_color = current_color
+            temp_position = current_position
+            temp_movement = movement_vector
+            
             for cmd_idx in range(num_cmds):
-                if offset >= len(data):
+                if temp_offset >= len(data):
                     logger.warning(f"Command {cmd_idx} extends beyond data length in {filepath}")
                     break
                     
-                cmd_type, offset = read_varint(data, offset)
+                cmd_type, temp_offset = read_varint(data, temp_offset)
+                
+                # Handle layer commands
+                if cmd_type == 0x88:  # SET_LAYER
+                    current_layer, temp_offset = process_layer_command(data, temp_offset)
+                    continue
                 
                 # Handle color commands
-                current_color, offset, is_color_cmd = handle_color_command(cmd_type, data, offset, current_color)
+                temp_color, temp_offset, is_color_cmd = handle_color_command(cmd_type, data, temp_offset, temp_color)
                 if is_color_cmd:
                     continue
                 
-                # Handle geometry commands
-                offset, current_position, movement_vector = render_geometry_command(cmd_type, data, offset, surface, current_color, fill_mode, current_position, movement_vector)
+                # Store command for later rendering
+                cmd_data = {
+                    'type': cmd_type,
+                    'offset': temp_offset,
+                    'color': temp_color,
+                    'position': temp_position,
+                    'movement': temp_movement
+                }
+                layer_commands[current_layer].append(cmd_data)
+                
+                # Skip command data for now (we'll process it later)
+                temp_offset = skip_command(cmd_type, data, temp_offset)
+            
+            # Second pass: render commands in layer order
+            for layer in sorted(RENDER_LAYERS.values()):
+                for cmd_data in layer_commands[layer]:
+                    cmd_type = cmd_data['type']
+                    cmd_offset = cmd_data['offset']
+                    cmd_color = cmd_data['color']
+                    cmd_position = cmd_data['position']
+                    cmd_movement = cmd_data['movement']
+                    
+                    # Render the command
+                    fill_polygons = config.config.get('fill_polygons', False)
+                    _, current_position, movement_vector = render_geometry_command(
+                        cmd_type, data, cmd_offset, surface, cmd_color, fill_mode, cmd_position, cmd_movement, fill_polygons, show_tile_labels
+                    )
                                      
         except Exception as e:
             logger.error(f"Error parsing commands in {filepath}: {e}")
@@ -930,7 +1420,7 @@ def show_status_progress_bar(surface, percent, text, font):
     surface.blit(label, label_rect)
 
 def draw_tile_labels(
-    screen, font, available_tiles, viewport_x, viewport_y, zoom_level, background_color, show_tile_labels, directory
+    screen, font, available_tiles, viewport_x, viewport_y, zoom_level, background_color, show_tile_labels, directory, fill_polygons=False
 ):
     if not show_tile_labels:
         return
@@ -965,6 +1455,7 @@ def draw_tile_labels(
         for surf in label_surfs:
             screen.blit(surf, (label_rect.left + margin, offset_y))
             offset_y += surf.get_height()
+        # Dibujar bordes de tiles cuando show_tile_labels esté activado
         draw_dashed_rect(screen, pygame.Rect(px, py, TILE_SIZE, TILE_SIZE), outline, width=1)
 
 def draw_dashed_rect(surface, rect, color, dash_length=6, gap_length=4, width=1):
@@ -989,40 +1480,26 @@ def draw_dashed_rect(surface, rect, color, dash_length=6, gap_length=4, width=1)
         pygame.draw.line(surface, color, (rect.right-1, y), (rect.right-1, end_y), width)
         y += dash_length + gap_length
 
-# Function removed - functionality replaced by pixel_to_latlon_cached
-
-@lru_cache(maxsize=500)
-def pixel_to_latlon_cached(tile_x, tile_y, zoom):
-    """Cached version of pixel to lat/lon conversion"""
-    n = 2.0 ** zoom
-    lon_deg = tile_x / n * 360.0 - 180.0
-    lat_rad = math.atan(math.sinh(math.pi * (1 - 2 * tile_y / n)))
-    lat_deg = math.degrees(lat_rad)
-    return lat_deg, lon_deg
-
 def pixel_to_latlon(px, py, viewport_x, viewport_y, zoom):
     """Convert pixel coordinates to lat/lon"""
     map_px = viewport_x + px
     map_py = viewport_y + py
     tile_x = map_px / TILE_SIZE
     tile_y = map_py / TILE_SIZE
-    return pixel_to_latlon_cached(tile_x, tile_y, zoom)
+    n = 2.0 ** zoom
+    lon_deg = tile_x / n * 360.0 - 180.0
+    lat_rad = math.atan(math.sinh(math.pi * (1 - 2 * tile_y / n)))
+    lat_deg = math.degrees(lat_rad)
+    return lat_deg, lon_deg
 
-@lru_cache(maxsize=500)
-def latlon_to_pixel_cached(lat, lon, zoom):
-    """Cached version of lat/lon to pixel conversion"""
+def latlon_to_pixel(lat, lon, zoom):
+    """Convert lat/lon to pixel coordinates"""
     n = 2.0 ** zoom
     x = (lon + 180.0) / 360.0 * n
     y = (1 - math.asinh(math.tan(math.radians(lat))) / math.pi) / 2 * n
     map_px = x * TILE_SIZE
     map_py = y * TILE_SIZE
     return map_px, map_py
-
-def latlon_to_pixel(lat, lon, zoom):
-    """Convert lat/lon to pixel coordinates"""
-    return latlon_to_pixel_cached(lat, lon, zoom)
-
-# Function removed - not used in current implementation
 
 def decimal_to_gms(decimal, is_latitude=True):
     sign = ""
@@ -1075,7 +1552,6 @@ def main(base_dir):
 
     show_tile_labels = False
     show_gps_tooltip = False
-    fill_polygons_mode = False
 
     pygame.init()
     screen = pygame.display.set_mode((WINDOW_WIDTH, WINDOW_HEIGHT))
@@ -1145,7 +1621,7 @@ def main(base_dir):
         available = index_available_tiles(directory, progress_callback)
         return available, directory
 
-    def get_tile_surface(x, y, zoom_level, directory, bg_color, fill_mode):
+    def get_tile_surface(x, y, zoom_level, directory, bg_color, fill_mode, show_tile_labels=False):
         """Get tile surface with lazy loading - only load if visible"""
         key = (zoom_level, x, y, bg_color, fill_mode)
         if (x, y) not in available_tiles:
@@ -1166,7 +1642,7 @@ def main(base_dir):
         if not tile_file:
             return None
         
-        surface = render_tile_surface({'x': x, 'y': y, 'file': tile_file}, bg_color, fill_mode)
+        surface = render_tile_surface({'x': x, 'y': y, 'file': tile_file}, bg_color, fill_mode, show_tile_labels)
         tile_cache.put(key, surface)
         return surface
 
@@ -1262,8 +1738,9 @@ def main(base_dir):
 
         # Only check for uncached tiles among visible ones (lazy loading)
         uncached_tiles = []
+        fill_polygons = config.config.get('fill_polygons', False)
         for x, y in visible_tiles:
-            key = (zoom_levels[zoom_idx], x, y, background_color, fill_polygons_mode)
+            key = (zoom_levels[zoom_idx], x, y, background_color, fill_polygons)
             if tile_cache.get(key) is None:
                 uncached_tiles.append((x, y))
 
@@ -1275,19 +1752,19 @@ def main(base_dir):
             def done_callback():
                 set_tiles_loading(False)
             preload_tile_surfaces_threaded(
-                uncached_tiles, zoom_levels[zoom_idx], directory, background_color, fill_polygons_mode,
+                uncached_tiles, zoom_levels[zoom_idx], directory, background_color, fill_polygons,
                 status_render_progress_callback, done_callback
             )
 
         for x, y in visible_tiles:
-            surf = get_tile_surface(x, y, zoom_levels[zoom_idx], directory, background_color, fill_polygons_mode)
+            surf = get_tile_surface(x, y, zoom_levels[zoom_idx], directory, background_color, fill_polygons, show_tile_labels)
             if surf:
                 px = x * TILE_SIZE - viewport_x
                 py = y * TILE_SIZE - viewport_y
                 screen.blit(surf, (px, py))
 
         draw_tile_labels(
-            screen, font, available_tiles, viewport_x, viewport_y, zoom_levels[zoom_idx], background_color, show_tile_labels, directory
+            screen, font, available_tiles, viewport_x, viewport_y, zoom_levels[zoom_idx], background_color, show_tile_labels, directory, fill_polygons
         )
         pygame.draw.rect(screen, (0,0,0), (toolbar_x, toolbar_y, TOOLBAR_WIDTH, VIEWPORT_SIZE))
         pygame.draw.line(screen, (160,160,160), (toolbar_x,0), (toolbar_x, VIEWPORT_SIZE))
@@ -1307,10 +1784,13 @@ def main(base_dir):
             screen, gps_btn_text, gps_button_rect, button_color, button_fg, button_border, font_b,
             icon=icon_gps, pressed=False
         )
-        fill_btn_text = "Fill polygons ON" if fill_polygons_mode else "Fill polygons OFF"
+        
+        # Polygon fill button
+        fill_polygons = config.config.get('fill_polygons', False)
+        fill_btn_text = "Fill Polygons ON" if fill_polygons else "Fill Polygons OFF"
         draw_button(
             screen, fill_btn_text, fill_button_rect, button_color, button_fg, button_border, font_b,
-            icon=icon_fill, pressed=fill_polygons_mode
+            icon=icon_fill, pressed=False
         )
         pygame.draw.rect(screen, (0,0,0), (0, VIEWPORT_SIZE, WINDOW_WIDTH, STATUSBAR_HEIGHT))
         pygame.draw.line(screen, (160,160,160), (0, VIEWPORT_SIZE), (WINDOW_WIDTH, VIEWPORT_SIZE))
@@ -1393,6 +1873,13 @@ def main(base_dir):
                 elif event.key == pygame.K_l and can_interact:
                     show_tile_labels = not show_tile_labels
                     need_redraw = True
+                elif event.key == pygame.K_f and can_interact:
+                    # Toggle polygon filling
+                    config.config['fill_polygons'] = not config.config.get('fill_polygons', False)
+                    config.save_config()
+                    tile_cache.clear()  # Clear cache to force redraw with new fill setting
+                    need_redraw = True
+                    logger.info(f"Polygon filling: {'ON' if config.config['fill_polygons'] else 'OFF'}")
             elif event.type == pygame.MOUSEBUTTONDOWN:
                 if event.button == 1 and can_interact:
                     if tile_label_button_rect.collidepoint(event.pos):
@@ -1406,9 +1893,12 @@ def main(base_dir):
                         show_gps_tooltip = not show_gps_tooltip
                         need_redraw = True
                     elif fill_button_rect.collidepoint(event.pos):
-                        fill_polygons_mode = not fill_polygons_mode
-                        tile_cache.clear()
+                        # Toggle polygon filling
+                        config.config['fill_polygons'] = not config.config.get('fill_polygons', False)
+                        config.save_config()
+                        tile_cache.clear()  # Clear cache to force redraw with new fill setting
                         need_redraw = True
+                        logger.info(f"Polygon filling: {'ON' if config.config['fill_polygons'] else 'OFF'}")
                     else:
                         dragging = True
                         drag_start = event.pos

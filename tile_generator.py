@@ -18,7 +18,13 @@ import pickle
 
 import ijson
 import logging
-import signal
+
+# Try to import osmium for PBF processing
+try:
+    import osmium
+    OSM_PYOSMIUM_AVAILABLE = True
+except ImportError:
+    OSM_PYOSMIUM_AVAILABLE = False
 import atexit
 import psutil
 
@@ -28,6 +34,51 @@ from typing import List, Dict, Tuple, Optional, Union, Set, Any, Iterator, TYPE_
 if TYPE_CHECKING:
     from shapely.geometry.base import BaseGeometry as Geometry
 from contextlib import contextmanager, ExitStack
+
+# Drawing command codes
+DRAW_COMMANDS = {
+    'LINE': 1,
+    'POLYLINE': 2,
+    'STROKE_POLYGON': 3,  # Polígono solo contorno (sin relleno)
+    'HORIZONTAL_LINE': 5,
+    'VERTICAL_LINE': 6,
+    'SET_COLOR': 0x80,  # State command for direct RGB332 color
+    'SET_COLOR_INDEX': 0x81,  # State command for palette index
+    'SET_LAYER': 0x88,  # Layer indicator command (moved up for priority)
+    'RECTANGLE': 0x82,  # Optimized rectangle for buildings
+    'STRAIGHT_LINE': 0x83,  # Optimized straight line for highways
+    'HIGHWAY_SEGMENT': 0x84,  # Highway segment with continuity
+    'GRID_PATTERN': 0x85,  # Urban grid pattern
+    'BLOCK_PATTERN': 0x86,  # City block pattern
+    'CIRCLE': 0x87,  # Circle/roundabout
+    'RELATIVE_MOVE': 0x89,  # Relative coordinate movement
+    'PREDICTED_LINE': 0x8A,  # Predictive line based on pattern
+    'COMPRESSED_POLYLINE': 0x8B,  # Huffman-compressed polyline
+    'OPTIMIZED_POLYGON': 0x8C,  # Optimized polygon (contour only, fill decided by viewer)
+    'HOLLOW_POLYGON': 0x8D,  # Polygon outline only (optimized for boundaries)
+    'OPTIMIZED_TRIANGLE': 0x8E,  # Optimized triangle (contour only, fill decided by viewer)
+    'OPTIMIZED_RECTANGLE': 0x8F,  # Optimized rectangle (contour only, fill decided by viewer)
+    'OPTIMIZED_CIRCLE': 0x90,  # Optimized circle (contour only, fill decided by viewer)
+    'SIMPLE_RECTANGLE': 0x96,  # Simple rectangle (x, y, width, height)
+    'SIMPLE_CIRCLE': 0x97,  # Simple circle (center_x, center_y, radius)
+    'SIMPLE_TRIANGLE': 0x98,  # Simple triangle (x1, y1, x2, y2, x3, y3)
+    'DASHED_LINE': 0x99,  # Dashed line with pattern
+    'DOTTED_LINE': 0x9A,  # Dotted line with pattern
+}
+
+# Rendering layers (orden de renderizado de abajo hacia arriba)
+RENDER_LAYERS = {
+    'TERRAIN': 0,      # Background terrain, water bodies
+    'WATER': 1,        # Rivers, lakes, oceans
+    'BUILDINGS': 2,    # Buildings, structures
+    'OUTLINES': 3,     # Polygon outlines, borders
+    'ROADS': 4,        # Roads, highways, paths
+    'LABELS': 5        # Text labels, symbols
+}
+
+# Tile configuration
+TILE_SIZE = 256
+UINT16_TILE_SIZE = 65536
 
 # Configure logging
 logging.basicConfig(
@@ -86,8 +137,8 @@ class Config:
     
     # Simplify tolerances by zoom level
     SIMPLIFY_TOLERANCES = {
-        "low_zoom": 0.05,    # For zoom <= 10
-        "high_zoom": None    # For zoom > 10
+        "low_zoom": 0.0001,  # For zoom <= 10 - Mucho más detallado
+        "high_zoom": 0.00001 # For zoom > 10 - Máximo detalle
     }
     
     # OSM field categories
@@ -122,25 +173,7 @@ class Config:
     # Processing layers
     PROCESSING_LAYERS = ["points", "lines", "multilinestrings", "multipolygons", "other_relations"]
     
-    # Drawing command codes
-    DRAW_COMMANDS = {
-        'LINE': 1,
-        'POLYLINE': 2,
-        'STROKE_POLYGON': 3,
-        'HORIZONTAL_LINE': 5,
-        'VERTICAL_LINE': 6,
-        'SET_COLOR': 0x80,  # State command for direct RGB332 color
-        'SET_COLOR_INDEX': 0x81,  # State command for palette index
-        'RECTANGLE': 0x82,  # Optimized rectangle for buildings
-        'STRAIGHT_LINE': 0x83,  # Optimized straight line for highways
-        'HIGHWAY_SEGMENT': 0x84,  # Highway segment with continuity
-        'GRID_PATTERN': 0x85,  # Urban grid pattern
-        'BLOCK_PATTERN': 0x86,  # City block pattern
-        'CIRCLE': 0x87,  # Circle/roundabout
-        'RELATIVE_MOVE': 0x88,  # Relative coordinate movement
-        'PREDICTED_LINE': 0x89,  # Predictive line based on pattern
-        'COMPRESSED_POLYLINE': 0x8A,  # Huffman-compressed polyline
-    }
+    # Drawing command codes and rendering layers are now imported from map_constants.py
 
 # Global variables to track files for cleanup
 _db_file_to_cleanup = None
@@ -234,9 +267,6 @@ def force_memory_cleanup():
     # Force garbage collection multiple times
     for _ in range(3):
         gc.collect()
-    
-    # Clear object pools
-    clear_object_pools()
     
     logger.debug("Memory cleanup completed")
 
@@ -373,16 +403,9 @@ def cleanup_all():
     cleanup_database()
     cleanup_temp_files()
 
-def signal_handler(signum, frame):
-    """Handle interrupt signals to ensure cleanup"""
-    logger.info("Script interrupted - cleaning up...")
-    cleanup_all()
-    sys.exit(1)
 
 # Register cleanup functions
 atexit.register(cleanup_all)
-signal.signal(signal.SIGINT, signal_handler)   # Ctrl+C
-signal.signal(signal.SIGTERM, signal_handler) # Termination signal
 
 # Use Config class constants instead of global variables
 
@@ -394,15 +417,6 @@ GLOBAL_INDEX_TO_RGB332 = {}  # index -> rgb332_value
 GEOMETRY_CACHE = {}  # Cache for simplified geometries by zoom level
 TILE_BBOX_CACHE = {}  # Cache for tile bounding boxes
 SIMPLIFY_TOLERANCE_CACHE = {}  # Cache for simplify tolerances
-
-# Global caches for algorithm optimization
-MATH_CACHE = {}  # Cache for mathematical operations
-PIXEL_COORD_CACHE = {}  # Cache for pixel coordinate calculations
-TILE_BOUNDS_CACHE = {}  # Cache for tile bounds calculations
-
-# Memory optimization pools
-COORDINATE_POOL = []  # Pool for coordinate tuples
-FEATURE_DATA_POOL = []  # Pool for feature data dictionaries
 
 
 # Database configuration moved to Config class
@@ -479,7 +493,11 @@ class FeatureDatabase:
     
     def insert_feature(self, zoom_level, tile_x, tile_y, feature_data, priority=5):
         """Insert a feature into the database using optimized SQL"""
-        self.conn.execute(self.insert_sql, (zoom_level, tile_x, tile_y, pickle.dumps(feature_data), priority))
+        # Convert Shapely geometry to WKT for serialization
+        serializable_data = feature_data.copy()
+        if 'geom' in serializable_data and hasattr(serializable_data['geom'], 'wkt'):
+            serializable_data['geom'] = serializable_data['geom'].wkt
+        self.conn.execute(self.insert_sql, (zoom_level, tile_x, tile_y, pickle.dumps(serializable_data), priority))
     
     def insert_features_batch(self, features_batch: List[Tuple[int, int, int, Dict[str, Any], int]]):
         """Insert multiple features in a single transaction for better performance"""
@@ -488,8 +506,14 @@ class FeatureDatabase:
         
         try:
             # Use executemany for batch insert
-            data = [(zoom_level, tile_x, tile_y, pickle.dumps(feature_data), priority) 
-                   for zoom_level, tile_x, tile_y, feature_data, priority in features_batch]
+            data = []
+            for zoom_level, tile_x, tile_y, feature_data, priority in features_batch:
+                # Convert Shapely geometry to WKT for serialization
+                serializable_data = feature_data.copy()
+                if 'geom' in serializable_data and hasattr(serializable_data['geom'], 'wkt'):
+                    serializable_data['geom'] = serializable_data['geom'].wkt
+                data.append((zoom_level, tile_x, tile_y, pickle.dumps(serializable_data), priority))
+            
             self.conn.executemany(self.insert_sql, data)
         except Exception as e:
             logger.error(f"Batch insert failed: {e}")
@@ -504,6 +528,14 @@ class FeatureDatabase:
         features = []
         for row in cursor.fetchall():
             feature_data = pickle.loads(row[0])
+            # Convert WKT back to Shapely geometry if needed
+            if 'geom' in feature_data and isinstance(feature_data['geom'], str):
+                try:
+                    from shapely import wkt
+                    feature_data['geom'] = wkt.loads(feature_data['geom'])
+                except ImportError:
+                    # Fallback if shapely.wkt is not available
+                    pass
             features.append(feature_data)
         return features
     
@@ -570,7 +602,7 @@ def deg2num(lat_deg: float, lon_deg: float, zoom: int) -> Tuple[int, int]:
 
 def coords_to_pixel_coords_uint16(coords: List[Tuple[float, float]], zoom: int, tile_x: int, tile_y: int) -> List[Tuple[int, int]]:
     """
-    Convert coordinate list to pixel coordinates relative to a specific tile (optimized version).
+    Convert coordinate list to pixel coordinates relative to a specific tile (simplified version).
     
     Args:
         coords: List of (longitude, latitude) coordinate tuples
@@ -580,26 +612,26 @@ def coords_to_pixel_coords_uint16(coords: List[Tuple[float, float]], zoom: int, 
         
     Returns:
         List of (x, y) pixel coordinates relative to the tile (0-65535 range)
-        
-    Example:
-        >>> coords = [(1.5, 42.5), (1.6, 42.6)]
-        >>> coords_to_pixel_coords_uint16(coords, 10, 512, 384)
-        [(256, 128), (300, 150)]
     """
-    # Use optimized version with caching
-    pixel_coords = optimized_coords_to_pixel_coords_uint16(coords, zoom, tile_x, tile_y)
+    n = 2.0 ** zoom
+    uint16_coords = []
+    
+    for lon, lat in coords:
+        # Calculate pixel coordinates within the tile
+        x = int(((lon + 180.0) / 360.0 * n - tile_x) * Config.TILE_SIZE)
+        y = int(((1.0 - math.log(math.tan(math.radians(lat)) + 1 / math.cos(math.radians(lat))) / math.pi) / 2.0 * n - tile_y) * Config.TILE_SIZE)
+        
+        # Clamp to tile bounds
+        x = max(0, min(Config.TILE_SIZE - 1, x))
+        y = max(0, min(Config.TILE_SIZE - 1, y))
     
     # Convert to UINT16 range
-    uint16_coords = []
-    for x, y in pixel_coords:
         x_uint16 = int((x * (Config.UINT16_TILE_SIZE - 1)) / (Config.TILE_SIZE - 1))
         y_uint16 = int((y * (Config.UINT16_TILE_SIZE - 1)) / (Config.TILE_SIZE - 1))
         x_uint16 = max(0, min(Config.UINT16_TILE_SIZE - 1, x_uint16))
         y_uint16 = max(0, min(Config.UINT16_TILE_SIZE - 1, y_uint16))
         
-        # Use object pool for coordinate tuples
-        coord = get_coordinate_tuple(x_uint16, y_uint16)
-        uint16_coords.append(coord)
+        uint16_coords.append((x_uint16, y_uint16))
     
     return uint16_coords
 
@@ -640,6 +672,45 @@ def hex_to_rgb332_direct(hex_color: str) -> int:
 def hex_to_color_index(hex_color: str) -> Optional[int]:
     global GLOBAL_COLOR_PALETTE
     return GLOBAL_COLOR_PALETTE.get(hex_color, None)
+
+def determine_render_layer(tags: Dict[str, str], geometry_type: str) -> str:
+    """
+    Determine the rendering layer for a feature based on its tags and geometry type.
+    
+    Args:
+        tags: OSM tags dictionary
+        geometry_type: Type of geometry ('polygon', 'line', 'point')
+    
+    Returns:
+        Layer name for rendering order
+    """
+    # Water bodies and terrain
+    if tags.get('natural') in ['water', 'coastline', 'bay', 'strait']:
+        return 'WATER'
+    if tags.get('waterway') in ['river', 'stream', 'canal', 'ditch']:
+        return 'WATER'
+    if tags.get('landuse') in ['water', 'reservoir']:
+        return 'WATER'
+    
+    # Buildings and structures
+    if tags.get('building') or tags.get('amenity') in ['school', 'hospital', 'university']:
+        return 'BUILDINGS'
+    if tags.get('landuse') in ['residential', 'commercial', 'industrial']:
+        return 'BUILDINGS'
+    
+    # Roads and transportation
+    if tags.get('highway') or tags.get('railway'):
+        return 'ROADS'
+    if tags.get('aeroway') in ['runway', 'taxiway']:
+        return 'ROADS'
+    
+    # Default based on geometry type
+    if geometry_type == 'polygon':
+        return 'TERRAIN'
+    elif geometry_type == 'line':
+        return 'ROADS'
+    else:
+        return 'LABELS'
 
 def get_style_for_tags(tags: Dict[str, str], config: Dict[str, Any]) -> Tuple[Dict[str, Any], Optional[str]]:
     """
@@ -720,9 +791,10 @@ def is_area(tags: Dict[str, str]) -> bool:
             return True
     return False
 
+
 def get_simplify_tolerance_for_zoom(zoom: int) -> float:
     """
-    Get simplify tolerance for zoom level with caching.
+    Get simplify tolerance for zoom level.
     
     Args:
         zoom: Zoom level
@@ -730,15 +802,10 @@ def get_simplify_tolerance_for_zoom(zoom: int) -> float:
     Returns:
         Simplify tolerance value
     """
-    global SIMPLIFY_TOLERANCE_CACHE
-    
-    if zoom not in SIMPLIFY_TOLERANCE_CACHE:
-        if zoom <= 10:
-            SIMPLIFY_TOLERANCE_CACHE[zoom] = Config.SIMPLIFY_TOLERANCES["low_zoom"]
-        else:
-            SIMPLIFY_TOLERANCE_CACHE[zoom] = Config.SIMPLIFY_TOLERANCES["high_zoom"]
-    
-    return SIMPLIFY_TOLERANCE_CACHE[zoom]
+    if zoom <= 10:
+        return Config.SIMPLIFY_TOLERANCES["low_zoom"]
+    else:
+        return Config.SIMPLIFY_TOLERANCES["high_zoom"]
 
 
 def get_tile_bbox_cached(tile_x: int, tile_y: int, zoom: int) -> 'box':
@@ -809,81 +876,9 @@ def clear_all_caches():
     """Clear all caches to free memory"""
     clear_geometry_caches()
     clear_algorithm_caches()
-    clear_object_pools()
     logger.debug("All caches cleared")
 
 
-def get_coordinate_tuple(x: float, y: float) -> Tuple[float, float]:
-    """
-    Get coordinate tuple from pool or create new one.
-    
-    Args:
-        x: X coordinate
-        y: Y coordinate
-        
-    Returns:
-        Coordinate tuple (reused from pool if available)
-    """
-    global COORDINATE_POOL
-    
-    if COORDINATE_POOL:
-        coord = COORDINATE_POOL.pop()
-        coord[0] = x
-        coord[1] = y
-        return tuple(coord)  # Convert to immutable tuple
-    else:
-        return (x, y)  # Return immutable tuple
-
-
-def return_coordinate_tuple(coord: Tuple[float, float]) -> None:
-    """
-    Return coordinate tuple to pool for reuse.
-    
-    Args:
-        coord: Coordinate tuple to return to pool
-    """
-    global COORDINATE_POOL
-    
-    if len(COORDINATE_POOL) < 1000:  # Limit pool size
-        # Convert tuple to list for reuse
-        COORDINATE_POOL.append(list(coord))
-
-
-def get_feature_data_dict() -> Dict[str, Any]:
-    """
-    Get feature data dictionary from pool or create new one.
-    
-    Returns:
-        Feature data dictionary (reused from pool if available)
-    """
-    global FEATURE_DATA_POOL
-    
-    if FEATURE_DATA_POOL:
-        return FEATURE_DATA_POOL.pop()
-    else:
-        return {}
-
-
-def return_feature_data_dict(feat_data: Dict[str, Any]) -> None:
-    """
-    Return feature data dictionary to pool for reuse.
-    
-    Args:
-        feat_data: Feature data dictionary to return to pool
-    """
-    global FEATURE_DATA_POOL
-    
-    if len(FEATURE_DATA_POOL) < 1000:  # Limit pool size
-        feat_data.clear()  # Clear contents for reuse
-        FEATURE_DATA_POOL.append(feat_data)
-
-
-def clear_object_pools():
-    """Clear all object pools to free memory"""
-    global COORDINATE_POOL, FEATURE_DATA_POOL
-    COORDINATE_POOL.clear()
-    FEATURE_DATA_POOL.clear()
-    logger.debug("Object pools cleared")
 
 
 def optimized_file_write(filepath: str, data: bytes, buffer_size: int = None) -> None:
@@ -924,55 +919,11 @@ def create_directory_structure(base_path: str, tile_coords: List[Tuple[int, int]
         os.makedirs(dir_path, exist_ok=True)
 
 
-def cached_math_operation(operation: str, *args) -> float:
-    """
-    Cache mathematical operations to avoid repeated calculations.
-    
-    Args:
-        operation: Operation name (e.g., 'sin', 'cos', 'tan', 'log')
-        *args: Arguments for the operation
-        
-    Returns:
-        Cached result of the mathematical operation
-    """
-    global MATH_CACHE
-    
-    # Create cache key
-    cache_key = (operation, args)
-    
-    if cache_key in MATH_CACHE:
-        return MATH_CACHE[cache_key]
-    
-    # Perform operation
-    if operation == 'sin':
-        result = math.sin(args[0])
-    elif operation == 'cos':
-        result = math.cos(args[0])
-    elif operation == 'tan':
-        result = math.tan(args[0])
-    elif operation == 'log':
-        result = math.log(args[0])
-    elif operation == 'atan':
-        result = math.atan(args[0])
-    elif operation == 'sinh':
-        result = math.sinh(args[0])
-    elif operation == 'degrees':
-        result = math.degrees(args[0])
-    elif operation == 'radians':
-        result = math.radians(args[0])
-    else:
-        raise ValueError(f"Unsupported operation: {operation}")
-    
-    # Cache result (with size limit)
-    if len(MATH_CACHE) < Config.MATH_CACHE_SIZE:
-        MATH_CACHE[cache_key] = result
-    
-    return result
 
 
 def optimized_tile_latlon_bounds(tile_x: int, tile_y: int, zoom: int, pixel_margin: int = 0) -> Tuple[float, float, float, float]:
     """
-    Optimized tile bounds calculation with caching.
+    Calculate tile bounds for lat/lon coordinates.
     
     Args:
         tile_x: Tile X coordinate
@@ -983,21 +934,13 @@ def optimized_tile_latlon_bounds(tile_x: int, tile_y: int, zoom: int, pixel_marg
     Returns:
         Tuple of (lon_min, lat_min, lon_max, lat_max)
     """
-    global TILE_BOUNDS_CACHE
-    
-    cache_key = (tile_x, tile_y, zoom, pixel_margin)
-    if cache_key in TILE_BOUNDS_CACHE:
-        return TILE_BOUNDS_CACHE[cache_key]
-    
     n = 2.0 ** zoom
     
-    # Optimized calculations using cached math operations
-    lat_rad1 = cached_math_operation('atan', cached_math_operation('sinh', math.pi * (1 - 2 * tile_y / n)))
-    lat_max = cached_math_operation('degrees', lat_rad1)
+    # Calculate latitude bounds
+    lat_max = math.degrees(math.atan(math.sinh(math.pi * (1 - 2 * tile_y / n))))
+    lat_min = math.degrees(math.atan(math.sinh(math.pi * (1 - 2 * (tile_y + 1) / n))))
     
-    lat_rad2 = cached_math_operation('atan', cached_math_operation('sinh', math.pi * (1 - 2 * (tile_y + 1) / n)))
-    lat_min = cached_math_operation('degrees', lat_rad2)
-    
+    # Calculate longitude bounds
     lon_min = tile_x / n * 360.0 - 180.0
     lon_max = (tile_x + 1) / n * 360.0 - 180.0
     
@@ -1013,18 +956,12 @@ def optimized_tile_latlon_bounds(tile_x: int, tile_y: int, zoom: int, pixel_marg
         lon_min -= lon_margin
         lon_max += lon_margin
     
-    result = (lon_min, lat_min, lon_max, lat_max)
-    
-    # Cache result (with size limit)
-    if len(TILE_BOUNDS_CACHE) < Config.MATH_CACHE_SIZE:
-        TILE_BOUNDS_CACHE[cache_key] = result
-    
-    return result
+    return (lon_min, lat_min, lon_max, lat_max)
 
 
 def optimized_coords_to_pixel_coords_uint16(coords: List[Tuple[float, float]], zoom: int, tile_x: int, tile_y: int) -> List[Tuple[int, int]]:
     """
-    Optimized coordinate to pixel conversion with caching and precision optimization.
+    Convert coordinates to pixel coordinates within a tile.
     
     Args:
         coords: List of (lon, lat) coordinate tuples
@@ -1035,121 +972,52 @@ def optimized_coords_to_pixel_coords_uint16(coords: List[Tuple[float, float]], z
     Returns:
         List of (x, y) pixel coordinate tuples
     """
-    global PIXEL_COORD_CACHE
-    
     n = 2.0 ** zoom
     pixel_coords = []
     
     for coord in coords:
         lon, lat = coord
         
-        # Create cache key for this coordinate
-        cache_key = (lon, lat, zoom, tile_x, tile_y)
-        if cache_key in PIXEL_COORD_CACHE:
-            pixel_coords.append(PIXEL_COORD_CACHE[cache_key])
-            continue
-        
-        # Optimized calculations using cached math operations
-        lat_rad = cached_math_operation('radians', lat)
-        
-        # Calculate pixel coordinates with precision optimization
+        # Calculate pixel coordinates
         x = int(((lon + 180.0) / 360.0 * n - tile_x) * Config.TILE_SIZE)
-        y = int(((1.0 - cached_math_operation('log', 
-            cached_math_operation('tan', lat_rad) + 1 / cached_math_operation('cos', lat_rad)) / math.pi) / 2.0 * n - tile_y) * Config.TILE_SIZE)
+        y = int(((1.0 - math.log(math.tan(math.radians(lat)) + 1 / math.cos(math.radians(lat))) / math.pi) / 2.0 * n - tile_y) * Config.TILE_SIZE)
         
         # Clamp coordinates to tile bounds
         x = max(0, min(Config.TILE_SIZE - 1, x))
         y = max(0, min(Config.TILE_SIZE - 1, y))
         
-        pixel_coord = (x, y)
-        pixel_coords.append(pixel_coord)
-        
-        # Cache result (with size limit)
-        if len(PIXEL_COORD_CACHE) < Config.PIXEL_COORD_CACHE_SIZE:
-            PIXEL_COORD_CACHE[cache_key] = pixel_coord
+        pixel_coords.append((x, y))
     
     return pixel_coords
 
 
 def clear_algorithm_caches():
     """Clear all algorithm-related caches to free memory"""
-    global MATH_CACHE, PIXEL_COORD_CACHE, TILE_BOUNDS_CACHE
-    MATH_CACHE.clear()
-    PIXEL_COORD_CACHE.clear()
-    TILE_BOUNDS_CACHE.clear()
     logger.debug("Algorithm caches cleared")
 
 
-def classify_tile_complexity(tile_data: Tuple[int, int, List[Dict[str, Any]]]) -> str:
-    """
-    Classify tile by complexity based on feature count and types.
-    
-    Args:
-        tile_data: Tuple of (x, y, features)
-        
-    Returns:
-        Complexity level: 'simple', 'medium', 'complex'
-    """
-    x, y, features = tile_data
-    feature_count = len(features)
-    
-    if feature_count <= Config.TILE_COMPLEXITY_THRESHOLD:
-        return 'simple'
-    elif feature_count <= Config.TILE_COMPLEXITY_THRESHOLD * 3:
-        return 'medium'
-    else:
-        return 'complex'
 
 
 
 def create_optimized_tile_batches(tiles: List[Tuple[int, int, List[Dict[str, Any]]]]) -> List[List[Tuple[int, int, List[Dict[str, Any]]]]]:
     """
-    Create optimized tile batches based on complexity and memory usage.
+    Create simple tile batches for processing.
     
     Args:
         tiles: List of tile data tuples
         
     Returns:
-        List of optimized tile batches
+        List of tile batches
     """
-    # Classify tiles by complexity
-    simple_tiles = []
-    medium_tiles = []
-    complex_tiles = []
-    
-    for tile in tiles:
-        complexity = classify_tile_complexity(tile)
-        if complexity == 'simple':
-            simple_tiles.append(tile)
-        elif complexity == 'medium':
-            medium_tiles.append(tile)
-        else:
-            complex_tiles.append(tile)
-    
-    # Create batches with different sizes based on complexity
     batches = []
     
-    # Simple tiles: larger batches
-    for i in range(0, len(simple_tiles), Config.TILE_BATCH_SIZE):
-        batch = simple_tiles[i:i + Config.TILE_BATCH_SIZE]
+    # Create simple batches
+    for i in range(0, len(tiles), Config.TILE_BATCH_SIZE):
+        batch = tiles[i:i + Config.TILE_BATCH_SIZE]
         if batch:
             batches.append(batch)
     
-    # Medium tiles: medium batches
-    medium_batch_size = Config.TILE_BATCH_SIZE // 2
-    for i in range(0, len(medium_tiles), medium_batch_size):
-        batch = medium_tiles[i:i + medium_batch_size]
-        if batch:
-            batches.append(batch)
-    
-    # Complex tiles: smaller batches
-    for i in range(0, len(complex_tiles), Config.MEMORY_AWARE_BATCH_SIZE):
-        batch = complex_tiles[i:i + Config.MEMORY_AWARE_BATCH_SIZE]
-        if batch:
-            batches.append(batch)
-    
-    logger.debug(f"Created {len(batches)} optimized batches: "
-                f"{len(simple_tiles)} simple, {len(medium_tiles)} medium, {len(complex_tiles)} complex tiles")
+    logger.debug(f"Created {len(batches)} batches with {len(tiles)} tiles")
     
     return batches
 
@@ -1257,7 +1125,7 @@ def insert_palette_commands(commands):
             # Use optimized palette
             if color_index != current_color_index:
                 result.append({
-                    'type': Config.DRAW_COMMANDS['SET_COLOR_INDEX'], 
+                    'type': DRAW_COMMANDS['SET_COLOR_INDEX'], 
                     'color_index': color_index
                 })
                 current_color_index = color_index
@@ -1266,7 +1134,7 @@ def insert_palette_commands(commands):
             # Fallback to direct SET_COLOR
             if cmd_color_rgb332 != current_color_index:  # Reset current_color_index
                 result.append({
-                    'type': Config.DRAW_COMMANDS['SET_COLOR'], 
+                    'type': DRAW_COMMANDS['SET_COLOR'], 
                     'color': cmd_color_rgb332
                 })
                 current_color_index = cmd_color_rgb332
@@ -1293,29 +1161,52 @@ def pack_draw_commands(commands):
         t = cmd['type']
         out += pack_varint(t)
         
-        if t == Config.DRAW_COMMANDS['SET_COLOR']:
+        if t == DRAW_COMMANDS['SET_COLOR']:
             # Original SET_COLOR command (direct RGB332)
-            color = cmd['color'] & 0xFF
+            color = cmd.get('color', 0xFF)  # Default to white if color is None
+            if color is not None:
+                color = color & 0xFF
+            else:
+                color = 0xFF  # Default white color
             out += struct.pack("B", color)
-        elif t == Config.DRAW_COMMANDS['SET_COLOR_INDEX']:
+        elif t == DRAW_COMMANDS['SET_COLOR_INDEX']:
             # SET_COLOR_INDEX command (palette index)
-            color_index = cmd['color_index'] & 0xFF
+            color_index = cmd.get('color_index', 0)  # Default to 0 if color_index is None
+            if color_index is not None:
+                color_index = color_index & 0xFF
+            else:
+                color_index = 0  # Default color index
             out += pack_varint(color_index)
-        elif t == Config.DRAW_COMMANDS['RECTANGLE']:
+        elif t == DRAW_COMMANDS['SET_LAYER']:
+            # SET_LAYER command (layer indicator)
+            layer = cmd.get('layer', 0)  # Default to TERRAIN layer if layer is None
+            if layer is not None:
+                layer = layer & 0xFF
+            else:
+                layer = 0  # Default to TERRAIN layer
+            out += pack_varint(layer)
+        elif t == DRAW_COMMANDS['RECTANGLE']:
             # Optimized RECTANGLE command
             x1, y1, x2, y2 = map(clamp_uint16, [cmd['x1'], cmd['y1'], cmd['x2'], cmd['y2']])
             out += pack_zigzag(x1)
             out += pack_zigzag(y1)
             out += pack_zigzag(x2 - x1)
             out += pack_zigzag(y2 - y1)
-        elif t == Config.DRAW_COMMANDS['STRAIGHT_LINE']:
+        elif t == DRAW_COMMANDS['STRAIGHT_LINE']:
             # Optimized STRAIGHT_LINE command
-            x1, y1, x2, y2 = map(clamp_uint16, [cmd['x1'], cmd['y1'], cmd['x2'], cmd['y2']])
-            out += pack_zigzag(x1)
-            out += pack_zigzag(y1)
-            out += pack_zigzag(x2 - x1)
-            out += pack_zigzag(y2 - y1)
-        elif t == Config.DRAW_COMMANDS['GRID_PATTERN']:
+            points = cmd['points']
+            out += pack_varint(len(points))
+            prev_x, prev_y = 0, 0
+            for i, (x, y) in enumerate(points):
+                x, y = clamp_uint16(x), clamp_uint16(y)
+                if i == 0:
+                    out += pack_zigzag(x)
+                    out += pack_zigzag(y)
+                else:
+                    out += pack_zigzag(x - prev_x)
+                    out += pack_zigzag(y - prev_y)
+                prev_x, prev_y = x, y
+        elif t == DRAW_COMMANDS['GRID_PATTERN']:
             # Step 6: Grid pattern command
             x, y, width, spacing, count = map(clamp_uint16, [cmd['x'], cmd['y'], cmd['width'], cmd['spacing'], cmd['count']])
             direction = cmd.get('direction', 'horizontal')
@@ -1325,26 +1216,118 @@ def pack_draw_commands(commands):
             out += pack_zigzag(spacing)
             out += pack_varint(count)
             out += struct.pack("B", 1 if direction == 'horizontal' else 0)
-        elif t == Config.DRAW_COMMANDS['CIRCLE']:
+        elif t == DRAW_COMMANDS['CIRCLE']:
             # Step 6: Circle command
             center_x, center_y, radius = map(clamp_uint16, [cmd['center_x'], cmd['center_y'], cmd['radius']])
             out += pack_zigzag(center_x)
             out += pack_zigzag(center_y)
             out += pack_zigzag(radius)
-        elif t == Config.DRAW_COMMANDS['PREDICTED_LINE']:
+        elif t == DRAW_COMMANDS['OPTIMIZED_POLYGON']:
+            # Optimized polygon command (contour only, fill decided by viewer)
+            pts = cmd['points']
+            out += pack_varint(len(pts))
+            prev_x, prev_y = 0, 0
+            for i, (x, y) in enumerate(pts):
+                x, y = clamp_uint16(x), clamp_uint16(y)
+                if i == 0:
+                    out += pack_zigzag(x)
+                    out += pack_zigzag(y)
+                else:
+                    out += pack_zigzag(x - prev_x)
+                    out += pack_zigzag(y - prev_y)
+                prev_x, prev_y = x, y
+        elif t == DRAW_COMMANDS['HOLLOW_POLYGON']:
+            # Optimized hollow polygon command (outline only)
+            pts = cmd['points']
+            out += pack_varint(len(pts))
+            prev_x, prev_y = 0, 0
+            for i, (x, y) in enumerate(pts):
+                x, y = clamp_uint16(x), clamp_uint16(y)
+                if i == 0:
+                    out += pack_zigzag(x)
+                    out += pack_zigzag(y)
+                else:
+                    out += pack_zigzag(x - prev_x)
+                    out += pack_zigzag(y - prev_y)
+                prev_x, prev_y = x, y
+        elif t == DRAW_COMMANDS['OPTIMIZED_TRIANGLE']:
+            # Optimized triangle command (contour only, fill decided by viewer)
+            x1, y1, x2, y2, x3, y3 = map(clamp_uint16, [cmd['x1'], cmd['y1'], cmd['x2'], cmd['y2'], cmd['x3'], cmd['y3']])
+            out += pack_zigzag(x1)
+            out += pack_zigzag(y1)
+            out += pack_zigzag(x2 - x1)
+            out += pack_zigzag(y2 - y1)
+            out += pack_zigzag(x3 - x2)
+            out += pack_zigzag(y3 - y2)
+        elif t == DRAW_COMMANDS['OPTIMIZED_RECTANGLE']:
+            # Optimized rectangle command (contour only, fill decided by viewer)
+            x, y, width, height = map(clamp_uint16, [cmd['x'], cmd['y'], cmd['width'], cmd['height']])
+            out += pack_zigzag(x)
+            out += pack_zigzag(y)
+            out += pack_zigzag(width)
+            out += pack_zigzag(height)
+        elif t == DRAW_COMMANDS['OPTIMIZED_CIRCLE']:
+            # Optimized circle command (contour only, fill decided by viewer)
+            center_x, center_y, radius = map(clamp_uint16, [cmd['center_x'], cmd['center_y'], cmd['radius']])
+            out += pack_zigzag(center_x)
+            out += pack_zigzag(center_y)
+            out += pack_zigzag(radius)
+        elif t == DRAW_COMMANDS['PREDICTED_LINE']:
             # Step 6: Predicted line command (only end point needed)
             end_x, end_y = map(clamp_uint16, [cmd['end_x'], cmd['end_y']])
             out += pack_zigzag(end_x)
             out += pack_zigzag(end_y)
+        elif t == DRAW_COMMANDS['SIMPLE_RECTANGLE']:
+            # Simple rectangle command (x, y, width, height)
+            x, y, width, height = map(clamp_uint16, [cmd['x'], cmd['y'], cmd['width'], cmd['height']])
+            out += pack_zigzag(x)
+            out += pack_zigzag(y)
+            out += pack_zigzag(width)
+            out += pack_zigzag(height)
+        elif t == DRAW_COMMANDS['SIMPLE_CIRCLE']:
+            # Simple circle command (center_x, center_y, radius)
+            center_x, center_y, radius = map(clamp_uint16, [cmd['center_x'], cmd['center_y'], cmd['radius']])
+            out += pack_zigzag(center_x)
+            out += pack_zigzag(center_y)
+            out += pack_zigzag(radius)
+        elif t == DRAW_COMMANDS['SIMPLE_TRIANGLE']:
+            # Simple triangle command (x1, y1, x2, y2, x3, y3)
+            x1, y1, x2, y2, x3, y3 = map(clamp_uint16, [cmd['x1'], cmd['y1'], cmd['x2'], cmd['y2'], cmd['x3'], cmd['y3']])
+            out += pack_zigzag(x1)
+            out += pack_zigzag(y1)
+            out += pack_zigzag(x2)
+            out += pack_zigzag(y2)
+            out += pack_zigzag(x3)
+            out += pack_zigzag(y3)
+        elif t == DRAW_COMMANDS['DASHED_LINE']:
+            # Dashed line command (x1, y1, x2, y2, dash_length, gap_length)
+            x1, y1, x2, y2 = map(clamp_uint16, [cmd['x1'], cmd['y1'], cmd['x2'], cmd['y2']])
+            dash_length = cmd.get('dash_length', 4)
+            gap_length = cmd.get('gap_length', 2)
+            out += pack_zigzag(x1)
+            out += pack_zigzag(y1)
+            out += pack_zigzag(x2)
+            out += pack_zigzag(y2)
+            out += pack_varint(dash_length)
+            out += pack_varint(gap_length)
+        elif t == DRAW_COMMANDS['DOTTED_LINE']:
+            # Dotted line command (x1, y1, x2, y2, dot_spacing)
+            x1, y1, x2, y2 = map(clamp_uint16, [cmd['x1'], cmd['y1'], cmd['x2'], cmd['y2']])
+            dot_spacing = cmd.get('dot_spacing', 2)
+            out += pack_zigzag(x1)
+            out += pack_zigzag(y1)
+            out += pack_zigzag(x2)
+            out += pack_zigzag(y2)
+            out += pack_varint(dot_spacing)
         else:
             # Original geometric commands
-            if t == Config.DRAW_COMMANDS['LINE']:
+            if t == DRAW_COMMANDS['LINE']:
                 x1, y1, x2, y2 = map(clamp_uint16, [cmd['x1'], cmd['y1'], cmd['x2'], cmd['y2']])
                 out += pack_zigzag(x1)
                 out += pack_zigzag(y1)
                 out += pack_zigzag(x2 - x1)
                 out += pack_zigzag(y2 - y1)
-            elif t == Config.DRAW_COMMANDS['POLYLINE'] or t == Config.DRAW_COMMANDS['STROKE_POLYGON']:
+            elif t == DRAW_COMMANDS['POLYLINE'] or t == DRAW_COMMANDS['STROKE_POLYGON']:
                 pts = cmd['points']
                 out += pack_varint(len(pts))
                 prev_x, prev_y = 0, 0
@@ -1357,12 +1340,12 @@ def pack_draw_commands(commands):
                         out += pack_zigzag(x - prev_x)
                         out += pack_zigzag(y - prev_y)
                     prev_x, prev_y = x, y
-            elif t == Config.DRAW_COMMANDS['HORIZONTAL_LINE']:
+            elif t == DRAW_COMMANDS['HORIZONTAL_LINE']:
                 x1, x2, y = clamp_uint16(cmd['x1']), clamp_uint16(cmd['x2']), clamp_uint16(cmd['y'])
                 out += pack_zigzag(x1)
                 out += pack_zigzag(x2 - x1)
                 out += pack_zigzag(y)
-            elif t == Config.DRAW_COMMANDS['VERTICAL_LINE']:
+            elif t == DRAW_COMMANDS['VERTICAL_LINE']:
                 x, y1, y2 = clamp_uint16(cmd['x']), clamp_uint16(cmd['y1']), clamp_uint16(cmd['y2'])
                 out += pack_zigzag(x)
                 out += pack_zigzag(y1)
@@ -1378,18 +1361,32 @@ def ensure_closed_ring(ring):
 
 def geometry_to_draw_commands(geom, color, tags, zoom, tile_x, tile_y, simplify_tolerance=None, hex_color=None):
     commands = []
+    
     def process_geom(g):
         local_cmds = []
         if g.is_empty:
             return local_cmds
+        
+        # Use original geometry processing without aggressive optimization
         if g.geom_type == "Polygon":
             exterior = remove_duplicate_points(list(g.exterior.coords))
             exterior_pixels = coords_to_pixel_coords_uint16(exterior, zoom, tile_x, tile_y)
             exterior_pixels = ensure_closed_ring(exterior_pixels)
             if len(set(exterior_pixels)) >= 3:
-                cmd = {'type': Config.DRAW_COMMANDS['STROKE_POLYGON'], 'points': exterior_pixels, 'color': color}
-                if hex_color:
-                    cmd['color_hex'] = hex_color
+                # Intentar detectar formas simples primero
+                simple_shape = detect_simple_shapes(g, exterior_pixels)
+                if simple_shape:
+                    # Usar comando optimizado para forma simple
+                    cmd = simple_shape.copy()
+                    cmd['color'] = color
+                    if hex_color:
+                        cmd['color_hex'] = hex_color
+                    local_cmds.append(cmd)
+                else:
+                    # Usar STROKE_POLYGON para polígonos sin relleno (solo contorno)
+                    cmd = {'type': DRAW_COMMANDS['STROKE_POLYGON'], 'points': exterior_pixels, 'color': color}
+                    if hex_color:
+                        cmd['color_hex'] = hex_color
                 local_cmds.append(cmd)
         elif g.geom_type == "MultiPolygon":
             for poly in g.geoms:
@@ -1397,9 +1394,20 @@ def geometry_to_draw_commands(geom, color, tags, zoom, tile_x, tile_y, simplify_
                 exterior_pixels = coords_to_pixel_coords_uint16(exterior, zoom, tile_x, tile_y)
                 exterior_pixels = ensure_closed_ring(exterior_pixels)
                 if len(set(exterior_pixels)) >= 3:
-                    cmd = {'type': Config.DRAW_COMMANDS['STROKE_POLYGON'], 'points': exterior_pixels, 'color': color}
-                    if hex_color:
-                        cmd['color_hex'] = hex_color
+                    # Intentar detectar formas simples primero
+                    simple_shape = detect_simple_shapes(poly, exterior_pixels)
+                    if simple_shape:
+                        # Usar comando optimizado para forma simple
+                        cmd = simple_shape.copy()
+                        cmd['color'] = color
+                        if hex_color:
+                            cmd['color_hex'] = hex_color
+                        local_cmds.append(cmd)
+                    else:
+                        # Usar STROKE_POLYGON para polígonos sin relleno (solo contorno)
+                        cmd = {'type': DRAW_COMMANDS['STROKE_POLYGON'], 'points': exterior_pixels, 'color': color}
+                        if hex_color:
+                            cmd['color_hex'] = hex_color
                     local_cmds.append(cmd)
         elif g.geom_type == "LineString":
             coords = remove_duplicate_points(list(g.coords))
@@ -1411,10 +1419,11 @@ def geometry_to_draw_commands(geom, color, tags, zoom, tile_x, tile_y, simplify_
             is_closed = coords[0] == coords[-1]
             if is_closed and is_area(tags):
                 if len(set(pixel_coords)) >= 3:
-                    cmd = {'type': Config.DRAW_COMMANDS['STROKE_POLYGON'], 'points': pixel_coords, 'color': color}
-                    if hex_color:
-                        cmd['color_hex'] = hex_color
-                    local_cmds.append(cmd)
+                    # Usar STROKE_POLYGON para líneas cerradas que son áreas (sin relleno)
+                    cmd = {'type': DRAW_COMMANDS['STROKE_POLYGON'], 'points': pixel_coords, 'color': color}
+                if hex_color:
+                    cmd['color_hex'] = hex_color
+                local_cmds.append(cmd)
             else:
                 if len(pixel_coords) == 2:
                     x1, y1 = pixel_coords[0]
@@ -1423,14 +1432,14 @@ def geometry_to_draw_commands(geom, color, tags, zoom, tile_x, tile_y, simplify_
                     if hex_color:
                         cmd['color_hex'] = hex_color
                     if y1 == y2:
-                        cmd.update({'type': Config.DRAW_COMMANDS['HORIZONTAL_LINE'], 'x1': x1, 'x2': x2, 'y': y1})
+                        cmd.update({'type': DRAW_COMMANDS['HORIZONTAL_LINE'], 'x1': x1, 'x2': x2, 'y': y1})
                     elif x1 == x2:
-                        cmd.update({'type': Config.DRAW_COMMANDS['VERTICAL_LINE'], 'x': x1, 'y1': y1, 'y2': y2})
+                        cmd.update({'type': DRAW_COMMANDS['VERTICAL_LINE'], 'x': x1, 'y1': y1, 'y2': y2})
                     else:
-                        cmd.update({'type': Config.DRAW_COMMANDS['LINE'], 'x1': x1, 'y1': y1, 'x2': x2, 'y2': y2})
+                        cmd.update({'type': DRAW_COMMANDS['LINE'], 'x1': x1, 'y1': y1, 'x2': x2, 'y2': y2})
                     local_cmds.append(cmd)
                 else:
-                    cmd = {'type': Config.DRAW_COMMANDS['POLYLINE'], 'points': pixel_coords, 'color': color}
+                    cmd = {'type': DRAW_COMMANDS['POLYLINE'], 'points': pixel_coords, 'color': color}
                     if hex_color:
                         cmd['color_hex'] = hex_color
                     local_cmds.append(cmd)
@@ -1441,7 +1450,15 @@ def geometry_to_draw_commands(geom, color, tags, zoom, tile_x, tile_y, simplify_
             for subgeom in g.geoms:
                 local_cmds.extend(process_geom(subgeom))
         return local_cmds
+    
     if hasattr(geom, "is_valid") and not geom.is_empty:
+        # Add layer command at the beginning (using priority from features.json)
+        layer_cmd = {
+            'type': DRAW_COMMANDS['SET_LAYER'],  # SET_LAYER
+            'layer': get_layer_from_priority(tags)
+        }
+        commands.append(layer_cmd)
+        
         commands.extend(process_geom(geom))
     return commands
 
@@ -1762,15 +1779,14 @@ def process_feature_for_zoom_levels(feat: Dict[str, Any], config: Dict[str, Any]
                 clipped_geom = optimized_geometry_intersection(feature_geom, xt, yt, zoom)
                 
                 if clipped_geom is not None:
-                    # Use object pool for feature data dictionary
-                    feature_data = get_feature_data_dict()
-                    feature_data.update({
+                    # Create feature data dictionary
+                    feature_data = {
                         "geom": clipped_geom,
                         "color": color,
                         "color_hex": hex_color,
                         "tags": tags,
                         "priority": priority
-                    })
+                    }
                     
                     batch_features.append((zoom, xt, yt, feature_data, priority))
                     features_added += 1
@@ -1785,62 +1801,106 @@ def process_feature_for_zoom_levels(feat: Dict[str, Any], config: Dict[str, Any]
     return features_added
 
 def process_layer_directly_to_database(pbf_file: str, layer: str, config: Dict[str, Any], db: 'FeatureDatabase', zoom_levels: List[int], config_fields: Set[str], LAYER_FIELDS: Dict[str, Set[str]]) -> int:
-    """Process a single layer directly from PBF to database"""
-    possible = LAYER_FIELDS[layer]
-    available = get_layer_fields_from_pbf(pbf_file, layer)
-    allowed = possible & available & config_fields
-    where_clause = build_ogr2ogr_where_clause_from_config(config, allowed)
+    """Process a single layer directly from PBF to database using Pyosmium"""
+    logger.info(f"Processing layer {layer} directly with Pyosmium (no temporary files)")
     
-    if not where_clause:
-        return 0
+    if not OSM_PYOSMIUM_AVAILABLE:
+        logger.warning("Pyosmium not available, falling back to ogr2ogr with temporary files")
+        return process_layer_streaming_from_pbf(pbf_file, layer, "", "", config, config_fields, zoom_levels, db)
     
-    select_fields = ",".join(sorted(allowed))
+    # Create Pyosmium handler for this specific layer
+    handler = OSMFeatureHandler(config, db, zoom_levels, config_fields)
     
-    # Extract layer to temporary file
+    # Filter handler to only process this layer type
+    original_way = handler.way
+    original_relation = handler.relation
+    
+    def filtered_way(w):
+        if not w.tags:
+            return
+        
+        # Convert tags to dict
+        tags = {tag.k: tag.v for tag in w.tags}
+        
+        # Check if this way matches the layer
+        layer_matches = False
+        for pattern_key, pattern in handler.tag_patterns.items():
+            if pattern['type'] == 'tag_value':
+                if pattern['key'] in tags and tags[pattern['key']] == pattern['value']:
+                    layer_matches = True
+                    break
+            elif pattern['type'] == 'tag_exists':
+                if pattern['key'] in tags:
+                    layer_matches = True
+                    break
+        
+        if layer_matches:
+            original_way(w)
+    
+    def filtered_relation(r):
+        if not r.tags:
+            return
+        
+        # Convert tags to dict
+        tags = {tag.k: tag.v for tag in r.tags}
+        
+        # Check if this relation matches the layer
+        layer_matches = False
+        for pattern_key, pattern in handler.tag_patterns.items():
+            if pattern['type'] == 'tag_value':
+                if pattern['key'] in tags and tags[pattern['key']] == pattern['value']:
+                    layer_matches = True
+                    break
+            elif pattern['type'] == 'tag_exists':
+                if pattern['key'] in tags:
+                    layer_matches = True
+                    break
+        
+        if layer_matches:
+            original_relation(r)
+    
+    # Apply filtered handlers
+    handler.way = filtered_way
+    handler.relation = filtered_relation
+    
+    # Process the file
+    handler.apply_file(pbf_file)
+    
+    return handler.features_processed
+
+def process_layer_streaming_from_pbf(pbf_file: str, layer: str, where_clause: str, select_fields: str, config: Dict[str, Any], config_fields: Set[str], zoom_levels: List[int], db: 'FeatureDatabase') -> int:
+    """Process PBF layer using optimized temporary file approach"""
+    # Use temporary file but with optimized processing
     tmp_filename = extract_layer_to_temp_file(pbf_file, layer, where_clause, select_fields)
     if not tmp_filename:
-        logger.warning(f"No temporary file created for layer {layer}")
+        logger.warning(f"No features found in layer {layer}")
         return 0
     
     try:
-        # Process features from temporary file
         features_processed = 0
         batch_features = []
         
         with open(tmp_filename, "r", encoding="utf-8", buffering=Config.GEOJSON_READ_BUFFER_SIZE) as f:
-            # Process features in chunks for better memory management
-            chunk_size = 1000
-            feature_chunk = []
-            
+            # Use ijson for streaming JSON parsing
             for feat in ijson.items(f, "features.item"):
-                feature_chunk.append(feat)
-                
-                # Process chunk when it reaches the desired size
-                if len(feature_chunk) >= chunk_size:
-                    for feat_item in feature_chunk:
-                        features_added = process_feature_for_zoom_levels(
-                            feat_item, config, config_fields, zoom_levels, db, batch_features
-                        )
-                        features_processed += 1
-                    
-                    # Clear chunk and perform memory management
-                    feature_chunk.clear()
-                    smart_gc_collect()
-                    
-                    # Clear geometry caches periodically to prevent memory buildup
-        if features_processed % 10000 == 0:
-            clear_geometry_caches()
-            clear_algorithm_caches()
-            clear_object_pools()
-            
-            # Process remaining features in the last chunk
-            for feat_item in feature_chunk:
                 features_added = process_feature_for_zoom_levels(
-                    feat_item, config, config_fields, zoom_levels, db, batch_features
+                    feat, config, config_fields, zoom_levels, db, batch_features
                 )
-                features_processed += 1
+                features_processed += features_added
+                
+                # Batch insert to avoid memory buildup
+                if len(batch_features) >= Config.DB_BATCH_SIZE:
+                    db.insert_features_batch(batch_features)
+                    db.commit()
+                    batch_features.clear()
+                    gc.collect()
+                
+                # Periodic memory management
+                if features_processed % 10000 == 0:
+                    clear_geometry_caches()
+                    clear_algorithm_caches()
         
-        # Insert remaining features for this layer
+        # Insert remaining features
         if batch_features:
             db.insert_features_batch(batch_features)
             db.commit()
@@ -1848,14 +1908,11 @@ def process_layer_directly_to_database(pbf_file: str, layer: str, config: Dict[s
         logger.info(f"Processed {features_processed} features from layer {layer}")
         return features_processed
         
-    except FileNotFoundError:
-        logger.error(f"Temporary file {tmp_filename} not found")
-        return 0
     except Exception as e:
         logger.error(f"Error processing layer {layer}: {e}")
         return 0
     finally:
-        # Always clean up the temporary file
+        # Clean up temporary file
         if tmp_filename and os.path.exists(tmp_filename):
             try:
                 os.remove(tmp_filename)
@@ -1865,8 +1922,301 @@ def process_layer_directly_to_database(pbf_file: str, layer: str, config: Dict[s
                 logger.debug(f"Could not remove temporary file {tmp_filename}: {e}")
 
 def process_pbf_directly_to_database(pbf_file: str, config: Dict[str, Any], db_path: str, zoom_levels: List[int]) -> int:
-    """Process PBF directly to database with minimal temporary files"""
-    logger.info("Processing PBF directly to database (minimal temporary files)")
+    """Process PBF directly to database using Pyosmium for maximum performance"""
+    logger.info("Processing PBF directly to database using Pyosmium (maximum performance)")
+    
+    try:
+        import osmium
+    except ImportError:
+        logger.error("Pyosmium not installed. Install with: pip install osmium")
+        logger.info("Falling back to ogr2ogr method...")
+        return process_pbf_directly_to_database_fallback(pbf_file, config, db_path, zoom_levels)
+    
+    with managed_database(db_path) as db:
+        with memory_management():
+            config_fields = get_config_fields(config)
+            logger.info(f"Config requires these fields: {', '.join(sorted(config_fields))}")
+            
+            # Create Pyosmium handler
+            handler = OSMFeatureHandler(config, db, zoom_levels, config_fields)
+            
+            # Process PBF file with Pyosmium
+            logger.info("Starting Pyosmium processing...")
+            start_time = time.time()
+            
+            try:
+                handler.apply_file(pbf_file)
+                processing_time = time.time() - start_time
+                
+                total_features_processed = handler.features_processed
+                logger.info(f"Pyosmium processing completed in {processing_time:.2f}s")
+                logger.info(f"Total processed: {total_features_processed} features directly from PBF")
+                
+                # Print statistics for each zoom level
+                for zoom in zoom_levels:
+                    count = db.count_features_for_zoom(zoom)
+                    logger.info(f"Zoom {zoom}: {count} features stored")
+                
+                return total_features_processed
+                
+            except Exception as e:
+                logger.error(f"Pyosmium processing failed: {e}")
+                logger.info("Falling back to ogr2ogr method...")
+                return process_pbf_directly_to_database_fallback(pbf_file, config, db_path, zoom_levels)
+
+class OSMFeatureHandler:
+    """Pyosmium handler for processing OSM features directly from PBF files"""
+    
+    def __init__(self, config: Dict[str, Any], db: 'FeatureDatabase', zoom_levels: List[int], config_fields: Set[str]):
+        self.config = config
+        self.db = db
+        self.zoom_levels = zoom_levels
+        self.config_fields = config_fields
+        self.features_processed = 0
+        self.batch_features = []
+        self.batch_size = 1000  # Process in batches for memory efficiency
+        
+        # Pre-compile tag patterns for performance
+        self.tag_patterns = self._compile_tag_patterns()
+        
+        # Initialize batch processing
+        self._init_batch_processing()
+    
+    def _compile_tag_patterns(self) -> Dict[str, Dict[str, Any]]:
+        """Pre-compile tag patterns from config for fast matching"""
+        patterns = {}
+        
+        for key, value in self.config.items():
+            if isinstance(value, dict) and 'zoom' in value:
+                # Parse tag pattern (e.g., "highway=motorway" or "building")
+                if '=' in key:
+                    tag_key, tag_value = key.split('=', 1)
+                    patterns[key] = {
+                        'type': 'tag_value',
+                        'key': tag_key,
+                        'value': tag_value,
+                        'config': value
+                    }
+                else:
+                    patterns[key] = {
+                        'type': 'tag_exists',
+                        'key': key,
+                        'config': value
+                    }
+        
+        logger.info(f"Compiled {len(patterns)} tag patterns for Pyosmium processing")
+        return patterns
+    
+    def _init_batch_processing(self):
+        """Initialize batch processing variables"""
+        self.batch_features = []
+        self.features_processed = 0
+    
+    def _should_process_feature(self, tags: Dict[str, str]) -> Optional[Dict[str, Any]]:
+        """Check if feature should be processed based on tags and config"""
+        for pattern_key, pattern in self.tag_patterns.items():
+            if pattern['type'] == 'tag_value':
+                if pattern['key'] in tags and tags[pattern['key']] == pattern['value']:
+                    return pattern['config']
+            elif pattern['type'] == 'tag_exists':
+                if pattern['key'] in tags:
+                    return pattern['config']
+        
+        return None
+    
+    def _process_feature_batch(self):
+        """Process accumulated features in batch"""
+        if self.batch_features:
+            self.db.insert_features_batch(self.batch_features)
+            self.db.commit()
+            self.batch_features = []
+    
+    def _add_feature_to_batch(self, feature_data: Tuple[int, int, int, Dict[str, Any], int]):
+        """Add feature to batch for processing"""
+        self.batch_features.append(feature_data)
+        
+        # Process batch when it reaches batch_size
+        if len(self.batch_features) >= self.batch_size:
+            self._process_feature_batch()
+    
+    def way(self, w):
+        """Process OSM way (lines, polygons)"""
+        if not w.tags:
+            return
+        
+        # Convert tags to dict
+        tags = {tag.k: tag.v for tag in w.tags}
+        
+        # Check if this way should be processed
+        style_config = self._should_process_feature(tags)
+        if not style_config:
+            return
+        
+        # Filter tags to only include config fields
+        filtered_tags = {k: v for k, v in tags.items() if k in self.config_fields}
+        
+        # Get geometry from way
+        try:
+            # Convert way to geometry
+            if len(w.nodes) < 2:
+                return
+            
+            # Create geometry from way nodes
+            coords = []
+            for node in w.nodes:
+                try:
+                    # Check if node has valid location
+                    if hasattr(node, 'location') and node.location.valid():
+                        coords.append([node.location.lon, node.location.lat])
+                    else:
+                        # Skip this way if any node is invalid
+                        if self.features_processed < 5:
+                            logger.debug(f"❌ Way {w.id} has invalid node, skipping")
+                        return
+                except Exception as e:
+                    # Skip this way if any node is invalid
+                    if self.features_processed < 5:
+                        logger.debug(f"❌ Way {w.id} node error: {e}, skipping")
+                    return
+            
+            if len(coords) < 2:
+                if self.features_processed < 5:
+                    logger.debug(f"❌ Way {w.id} has insufficient coordinates: {len(coords)}")
+                return
+            
+            # Determine if it's a polygon or line
+            is_polygon = coords[0] == coords[-1] and len(coords) > 3
+            
+            
+            if is_polygon:
+                # Create polygon geometry
+                from shapely.geometry import Polygon
+                geom = Polygon(coords)
+            else:
+                # Create line geometry
+                from shapely.geometry import LineString
+                geom = LineString(coords)
+            
+            if not geom.is_valid or geom.is_empty:
+                return
+            
+            # Process for all relevant zoom levels
+            self._process_geometry_for_zoom_levels(geom, tags, style_config, w.id)
+            
+        except Exception as e:
+            logger.debug(f"Error processing way {w.id}: {e}")
+            return
+    
+    def relation(self, r):
+        """Process OSM relation (multipolygons, etc.)"""
+        if not r.tags:
+            return
+        
+        # Convert tags to dict
+        tags = {tag.k: tag.v for tag in r.tags}
+        
+        # Check if this relation should be processed
+        style_config = self._should_process_feature(tags)
+        if not style_config:
+            return
+        
+        # Filter tags to only include config fields
+        filtered_tags = {k: v for k, v in tags.items() if k in self.config_fields}
+        
+        # Process relation geometry (simplified for now)
+        # In a full implementation, you'd need to handle multipolygons
+        # For now, we'll skip complex relations
+        logger.debug(f"Skipping complex relation {r.id}")
+    
+    def _process_geometry_for_zoom_levels(self, geom, tags: Dict[str, str], style_config: Dict[str, Any], osm_id: int):
+        """Process geometry for all relevant zoom levels"""
+        zoom_filter = style_config.get("zoom", 6)
+        priority = style_config.get("priority", 5)
+        hex_color = style_config.get("color", "#FFFFFF")
+        color = hex_to_rgb332_direct(hex_color)
+        
+        for zoom in self.zoom_levels:
+            if zoom < zoom_filter:
+                continue
+            
+            # Simplify geometry for zoom level
+            tolerance = get_simplify_tolerance_for_zoom(zoom)
+            simplified_geom = geom.simplify(tolerance, preserve_topology=True)
+            
+            if simplified_geom.is_empty or not simplified_geom.is_valid:
+                continue
+            
+            # Calculate tile bounds for this zoom level
+            minx, miny, maxx, maxy = simplified_geom.bounds
+            xtile_min, ytile_min = deg2num(float(miny), float(minx), zoom)
+            xtile_max, ytile_max = deg2num(float(maxy), float(maxx), zoom)
+            
+            # Store feature for each tile it intersects
+            for xt in range(min(xtile_min, xtile_max), max(xtile_min, xtile_max) + 1):
+                for yt in range(min(ytile_min, ytile_max), max(ytile_min, ytile_max) + 1):
+                    # Use optimized intersection with pre-filtering
+                    # Convert tile coordinates to lat/lon bounds
+                    n = 2.0 ** zoom
+                    lon_min = xt / n * 360.0 - 180.0
+                    lat_max = math.degrees(math.atan(math.sinh(math.pi * (1 - 2 * yt / n))))
+                    lon_max = (xt + 1) / n * 360.0 - 180.0
+                    lat_min = math.degrees(math.atan(math.sinh(math.pi * (1 - 2 * (yt + 1) / n))))
+                    
+                    clipped_geom = simplified_geom.intersection(
+                        box(lon_min, lat_min, lon_max, lat_max)
+                    )
+                    
+                    if clipped_geom.is_empty or not clipped_geom.is_valid:
+                        continue
+                    
+                    # Create feature data
+                    feature_data = {
+                        'geom': clipped_geom,
+                        'color': color,
+                        'color_hex': hex_color,
+                        'tags': tags,
+                        'priority': priority
+                    }
+                    
+                    # Add to batch
+                    self._add_feature_to_batch((zoom, xt, yt, feature_data, priority))
+                    self.features_processed += 1
+    
+    def apply_file(self, pbf_file: str):
+        """Apply the handler to a PBF file"""
+        if not OSM_PYOSMIUM_AVAILABLE:
+            raise ImportError("Pyosmium not available")
+        
+        # Create a SimpleHandler and use it to process the file
+        class PyosmiumHandler(osmium.SimpleHandler):
+            def __init__(self, parent_handler):
+                super().__init__()
+                self.parent = parent_handler
+            
+            def way(self, w):
+                self.parent.way(w)
+            
+            def relation(self, r):
+                self.parent.relation(r)
+        
+        # Create and use the handler
+        handler = PyosmiumHandler(self)
+        
+        # Try to process with node locations first
+        try:
+            # Use apply_file with locations=True to load node coordinates
+            handler.apply_file(pbf_file, locations=True)
+        except Exception as e:
+            logger.warning(f"Failed to process with locations=True: {e}")
+            # Fallback to regular processing
+            handler.apply_file(pbf_file)
+        
+        # Process any remaining features in batch
+        self._process_feature_batch()
+
+def process_pbf_directly_to_database_fallback(pbf_file: str, config: Dict[str, Any], db_path: str, zoom_levels: List[int]) -> int:
+    """Fallback method using ogr2ogr (original implementation)"""
+    logger.info("Processing PBF directly to database (fallback with minimal temporary files)")
     
     # First, check what layers are available in the PBF file
     available_layers = check_pbf_layers(pbf_file)
@@ -1911,21 +2261,160 @@ def process_pbf_directly_to_database(pbf_file: str, config: Dict[str, Any], db_p
             
             return total_features_processed
 
+
+def detect_simple_shapes(geometry, pixel_coords: List[Tuple[int, int]]) -> Optional[Dict]:
+    """Detecta formas simples que pueden usar comandos optimizados"""
+    if len(pixel_coords) < 3:
+        return None
+    
+    # Detectar rectángulo
+    if len(pixel_coords) == 4:
+        px_coords = [p[0] for p in pixel_coords]
+        py_coords = [p[1] for p in pixel_coords]
+        min_x, max_x = min(px_coords), max(px_coords)
+        min_y, max_y = min(py_coords), max(py_coords)
+        
+        # Verificar si es un rectángulo perfecto
+        if (min_x, min_y) in pixel_coords and (max_x, min_y) in pixel_coords and \
+           (max_x, max_y) in pixel_coords and (min_x, max_y) in pixel_coords:
+            return {
+                'type': DRAW_COMMANDS['SIMPLE_RECTANGLE'],
+                'x': min_x,
+                'y': min_y,
+                'width': max_x - min_x,
+                'height': max_y - min_y
+            }
+    
+    # Detectar triángulo
+    if len(pixel_coords) == 3:
+        return {
+            'type': DRAW_COMMANDS['SIMPLE_TRIANGLE'],
+            'x1': pixel_coords[0][0],
+            'y1': pixel_coords[0][1],
+            'x2': pixel_coords[1][0],
+            'y2': pixel_coords[1][1],
+            'x3': pixel_coords[2][0],
+            'y3': pixel_coords[2][1]
+        }
+    
+    # Detectar círculo aproximado
+    if len(pixel_coords) >= 8:  # Círculo necesita al menos 8 puntos
+        px_coords = [p[0] for p in pixel_coords]
+        py_coords = [p[1] for p in pixel_coords]
+        center_x = sum(px_coords) // len(px_coords)
+        center_y = sum(py_coords) // len(py_coords)
+        
+        # Calcular radio promedio
+        distances = [((x - center_x)**2 + (y - center_y)**2)**0.5 for x, y in pixel_coords]
+        avg_radius = sum(distances) / len(distances)
+        
+        # Verificar si es aproximadamente circular (variación del radio < 20%)
+        radius_variation = max(distances) - min(distances)
+        if radius_variation < avg_radius * 0.2:
+            return {
+                'type': DRAW_COMMANDS['SIMPLE_CIRCLE'],
+                'center_x': center_x,
+                'center_y': center_y,
+                'radius': int(avg_radius)
+            }
+    
+    return None
+
+
+def get_layer_from_priority(tags: Dict[str, str]) -> int:
+    """Obtiene la capa basada en la prioridad del features.json"""
+    # Si no hay configuración cargada, usar lógica simple
+    if not hasattr(Config, 'FEATURES_CONFIG') or not Config.FEATURES_CONFIG:
+        # Lógica simple basada en el tipo de feature
+        if 'building' in tags:
+            return RENDER_LAYERS['BUILDINGS']
+        elif 'highway' in tags:
+            return RENDER_LAYERS['ROADS']
+        elif 'natural' in tags or 'water' in tags:
+            return RENDER_LAYERS['WATER']
+        else:
+            return RENDER_LAYERS['TERRAIN']
+    
+    # Buscar coincidencia en features.json
+    for key, value in tags.items():
+        keyval = f"{key}={value}"
+        if keyval in Config.FEATURES_CONFIG:
+            priority = Config.FEATURES_CONFIG[keyval].get('priority', 5)
+            # Mapear prioridad a capa basado en el análisis del features.json
+            if priority <= 2:  # Terreno y agua de fondo
+                return RENDER_LAYERS['TERRAIN']
+            elif priority <= 6:  # Agua y elementos naturales
+                return RENDER_LAYERS['WATER']
+            elif priority <= 9:  # Edificios y estructuras
+                return RENDER_LAYERS['BUILDINGS']
+            elif priority <= 25:  # Carreteras y transporte
+                return RENDER_LAYERS['ROADS']
+            else:  # Etiquetas y elementos de texto
+                return RENDER_LAYERS['LABELS']
+        
+        # Buscar solo por key
+        if key in Config.FEATURES_CONFIG:
+            priority = Config.FEATURES_CONFIG[key].get('priority', 5)
+            if priority <= 2:
+                return RENDER_LAYERS['TERRAIN']
+            elif priority <= 6:
+                return RENDER_LAYERS['WATER']
+            elif priority <= 9:
+                return RENDER_LAYERS['BUILDINGS']
+            elif priority <= 25:
+                return RENDER_LAYERS['ROADS']
+            else:
+                return RENDER_LAYERS['LABELS']
+    
+    # Fallback
+    return RENDER_LAYERS['TERRAIN']
+
+def hex_to_rgb332(hex_color: str) -> int:
+    """Convierte color hex a RGB332 optimizado"""
+    hex_color = hex_color.lstrip('#')
+    r = int(hex_color[0:2], 16) >> 5  # 3 bits
+    g = int(hex_color[2:4], 16) >> 5  # 3 bits  
+    b = int(hex_color[4:6], 16) >> 6  # 2 bits
+    return (r << 5) | (g << 2) | b
+
+
+# Inicializar configuración
+try:
+    Config.FEATURES_CONFIG = json.load(open('features.json', 'r'))
+except FileNotFoundError:
+    logger.warning("features.json not found, using default configuration")
+    Config.FEATURES_CONFIG = {}
+
 def tile_worker(args):
     start_time = time.time()
     x, y, feats, zoom, output_dir, max_file_size, simplify_tolerance = args
 
-    ordered_feats = sorted(feats, key=lambda f: f.get("priority", 5))
+    # Agrupar features por capa para orden correcto de renderizado
+    features_by_layer = {}
+    for feat in feats:
+        layer = get_layer_from_priority(feat.get("tags", {}))
+        if layer not in features_by_layer:
+            features_by_layer[layer] = []
+        features_by_layer[layer].append(feat)
+    
+    # Ordenar features dentro de cada capa por prioridad
+    for layer in features_by_layer:
+        features_by_layer[layer].sort(key=lambda f: f.get("priority", 5))
 
     all_commands = []
-    for feat in ordered_feats:
-        # Get hex color if available
-        hex_color = feat.get("color_hex")
-        cmds = geometry_to_draw_commands(
-            feat["geom"], feat["color"], feat["tags"], zoom, x, y, 
-            simplify_tolerance=simplify_tolerance, hex_color=hex_color
-        )
-        all_commands.extend(cmds)
+    
+    # Procesar capas en orden de renderizado (0=TERRAIN, 1=WATER, 2=BUILDINGS, etc.)
+    for layer in sorted(features_by_layer.keys()):
+        layer_features = features_by_layer[layer]
+        
+        for feat in layer_features:
+            # Get hex color if available
+            hex_color = feat.get("color_hex")
+            cmds = geometry_to_draw_commands(
+                feat["geom"], feat["color"], feat["tags"], zoom, x, y, 
+                simplify_tolerance=simplify_tolerance, hex_color=hex_color
+            )
+            all_commands.extend(cmds)
 
     # Apply palette optimization to all commands
     optimized_commands, bytes_saved = insert_palette_commands(all_commands)
@@ -1964,54 +2453,35 @@ def tile_worker(args):
 
     tile_size = len(buffer)
     
-    del all_commands, optimized_commands, ordered_feats, buffer, feats
+    del all_commands, optimized_commands, buffer, feats
     gc.collect()
     
     elapsed = time.time() - start_time
     return tile_size, elapsed
 
 def write_tile_batch(batch, output_dir, zoom, max_file_size, simplify_tolerance):
-    """Write a batch of tiles with dynamic memory-aware processing"""
+    """Write a batch of tiles with simple parallel processing"""
     tile_sizes = []
-    
-    # Calculate optimal worker count based on batch complexity
-    total_features = sum(len(features) for _, _, features, _, _, _, _ in batch)
-    avg_features_per_tile = total_features / len(batch) if batch else 0
     
     # Monitor memory and get optimal settings
     optimal_workers, optimal_batch_size, memory_pressure = monitor_memory_and_adjust()
     
-    # Adjust worker count based on complexity AND memory pressure
-    if avg_features_per_tile <= Config.TILE_COMPLEXITY_THRESHOLD:
-        # Simple tiles: use more workers (up to optimal_workers)
-        batch_workers = min(optimal_workers, len(batch))
-    elif avg_features_per_tile <= Config.TILE_COMPLEXITY_THRESHOLD * 2:
-        # Medium tiles: use moderate workers (half of optimal_workers)
-        batch_workers = min(max(1, optimal_workers // 2), len(batch))
-    else:
-        # Complex tiles: use fewer workers to avoid memory issues
-        batch_workers = min(2, len(batch))
-    
-    # Ensure we have at least 1 worker
+    # Use simple worker count based on memory pressure
+    batch_workers = min(optimal_workers, len(batch), Config.MAX_WORKERS)
     batch_workers = max(1, batch_workers)
     
     logger.info(f"Processing batch of {len(batch)} tiles with {batch_workers} workers "
-               f"(avg features: {avg_features_per_tile:.1f}, memory pressure: {memory_pressure}, "
-               f"optimal workers: {optimal_workers})")
+               f"(memory pressure: {memory_pressure})")
     
-    # Use ProcessPoolExecutor for balanced parallelization
+    # Use ProcessPoolExecutor for parallelization
     with ProcessPoolExecutor(max_workers=batch_workers) as executor:
         futures = [executor.submit(tile_worker, job) for job in batch]
         for i, future in enumerate(as_completed(futures)):
             tile_size, _ = future.result()
             tile_sizes.append(tile_size)
             
-            # Adaptive garbage collection based on memory pressure
-            if memory_pressure == 'critical' and i % 5 == 0:
-                gc.collect()
-            elif memory_pressure == 'high' and i % 10 == 0:
-                gc.collect()
-            elif memory_pressure in ['medium', 'low'] and i % 20 == 0:
+            # Simple garbage collection
+            if i % 10 == 0:
                 gc.collect()
     
     return tile_sizes
@@ -2046,7 +2516,7 @@ def generate_tiles_from_database(db_path: str, output_dir: str, zoom: int, max_f
             logger.info(f"Memory status before batch creation: {memory_info['used']:.1f}MB used "
                        f"({memory_info['percent']:.1f}%), {memory_info['available']:.1f}MB available")
             
-            # Create optimized batches based on complexity and memory
+            # Create simple batches
             optimized_batches = create_optimized_tile_batches(all_tile_data)
             
             # Pre-create directory structure for all tiles

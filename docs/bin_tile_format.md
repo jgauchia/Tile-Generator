@@ -62,11 +62,12 @@ Commands are separated into **state commands** and **geometry commands**:
 | HORIZONTAL_LINE     | 0x05  | Horizontal line (from x1 to x2 at y)                 |
 | VERTICAL_LINE       | 0x06  | Vertical line (from y1 to y2 at x)                   |
 
-### State Commands (0x80-0x81)
+### State Commands (0x80-0x81, 0x88)
 | Name                | Value | Description                                           |
 |---------------------|-------|------------------------------------------------------|
 | SET_COLOR           | 0x80  | Set current color using RGB332 direct value (fallback) |
 | SET_COLOR_INDEX     | 0x81  | Set current color using dynamic palette index        |
+| SET_LAYER           | 0x88  | Set rendering layer for proper draw order           |
 
 ### Feature-Optimized Commands (0x82-0x84)
 | Name                | Value | Description                                           |
@@ -75,15 +76,33 @@ Commands are separated into **state commands** and **geometry commands**:
 | STRAIGHT_LINE       | 0x83  | Optimized straight line for highways                  |
 | HIGHWAY_SEGMENT     | 0x84  | Highway segment with continuity                       |
 
-### Advanced Pattern Commands (0x85-0x8A)
+### Advanced Pattern Commands (0x85-0x8B)
 | Name                | Value | Description                                           |
 |---------------------|-------|------------------------------------------------------|
 | GRID_PATTERN        | 0x85  | Urban grid pattern                                    |
 | BLOCK_PATTERN       | 0x86  | City block pattern                                    |
 | CIRCLE              | 0x87  | Circle/roundabout                                     |
-| RELATIVE_MOVE       | 0x88  | Relative coordinate movement                          |
-| PREDICTED_LINE      | 0x89  | Predictive line based on pattern                     |
-| COMPRESSED_POLYLINE | 0x8A  | Huffman-compressed polyline                          |
+| RELATIVE_MOVE       | 0x89  | Relative coordinate movement                          |
+| PREDICTED_LINE      | 0x8A  | Predictive line based on pattern                     |
+| COMPRESSED_POLYLINE | 0x8B  | Huffman-compressed polyline                          |
+
+### Optimized Geometry Commands (0x8C-0x90)
+| Name                | Value | Description                                           |
+|---------------------|-------|------------------------------------------------------|
+| OPTIMIZED_POLYGON  | 0x8C  | Optimized polygon (contour only, fill decided by viewer) |
+| HOLLOW_POLYGON     | 0x8D  | Polygon outline only (optimized for boundaries)      |
+| OPTIMIZED_TRIANGLE | 0x8E  | Optimized triangle (contour only, fill decided by viewer) |
+| OPTIMIZED_RECTANGLE| 0x8F  | Optimized rectangle (contour only, fill decided by viewer) |
+| OPTIMIZED_CIRCLE   | 0x90  | Optimized circle (contour only, fill decided by viewer) |
+
+### Simple Shape Commands (0x96-0x9A)
+| Name                | Value | Description                                           |
+|---------------------|-------|------------------------------------------------------|
+| SIMPLE_RECTANGLE    | 0x96  | Simple rectangle (x, y, width, height)               |
+| SIMPLE_CIRCLE       | 0x97  | Simple circle (center_x, center_y, radius)          |
+| SIMPLE_TRIANGLE     | 0x98  | Simple triangle (x1, y1, x2, y2, x3, y3)            |
+| DASHED_LINE         | 0x99  | Dashed line with pattern                             |
+| DOTTED_LINE         | 0x9A  | Dotted line with pattern                             |
 
 ---
 
@@ -109,7 +128,17 @@ Sets the current color using a dynamic palette index. This is the primary method
 Encoded as:
 - varint(color_index)
 
-**Note**: The dynamic palette is built automatically from the `features.json` configuration file. Each unique color receives an index 0-N in alphabetical order.
+### SET_LAYER (type 0x88)
+Sets the rendering layer for proper draw order. Commands are grouped by layer and rendered in ascending order (lower layers first).
+
+| Field       | Type    | Description                              |
+|-------------|---------|------------------------------------------|
+| layer       | varint  | Layer number (0-255, lower layers drawn first) |
+
+Encoded as:
+- varint(layer)
+
+**Usage**: Establishes rendering order for complex tiles with multiple feature types. Essential for proper visual layering on ESP32.
 
 ---
 
@@ -201,7 +230,156 @@ Encoded as:
 
 ---
 
-## Advanced Pattern Command Parameters
+## Optimized Geometry Command Parameters
+
+### OPTIMIZED_POLYGON (type 0x8C)
+Optimized polygon command for complex shapes. Uses contour-only rendering with fill decision deferred to the viewer.
+
+| Field       | Type    | Description                            |
+|-------------|---------|----------------------------------------|
+| num_points  | varint  | Number of points                       |
+| points[]    | int32   | Sequence of (x, y)                     |
+
+Encoded as:
+- varint(num_points)
+- zigzag(x0), zigzag(y0) – first point absolute
+- zigzag(x1 - x0), zigzag(y1 - y0) – delta encoding for subsequent points
+
+**Optimization**: 30-50% reduction compared to STROKE_POLYGON for complex shapes.
+
+### HOLLOW_POLYGON (type 0x8D)
+Specialized polygon outline command optimized for boundary rendering.
+
+| Field       | Type    | Description                            |
+|-------------|---------|----------------------------------------|
+| num_points  | varint  | Number of points                       |
+| points[]    | int32   | Sequence of (x, y)                     |
+
+Encoded as:
+- varint(num_points)
+- zigzag(x0), zigzag(y0) – first point absolute
+- zigzag(x1 - x0), zigzag(y1 - y0) – delta encoding for subsequent points
+
+**Optimization**: Optimized for boundary-only rendering with minimal overhead.
+
+### OPTIMIZED_TRIANGLE (type 0x8E)
+Optimized triangle command for triangular features.
+
+| Field       | Type    | Description                            |
+|-------------|---------|----------------------------------------|
+| x1, y1      | int32   | First vertex                           |
+| x2, y2      | int32   | Second vertex                          |
+| x3, y3      | int32   | Third vertex                           |
+
+Encoded as:
+- zigzag(x1), zigzag(y1), zigzag(x2 - x1), zigzag(y2 - y1), zigzag(x3 - x2), zigzag(y3 - y2)
+
+**Optimization**: 40-60% reduction compared to OPTIMIZED_POLYGON for triangular shapes.
+
+### OPTIMIZED_RECTANGLE (type 0x8F)
+Optimized rectangle command with enhanced compression.
+
+| Field       | Type    | Description                              |
+|-------------|---------|------------------------------------------|
+| x1, y1      | int32   | Top-left corner                          |
+| x2, y2      | int32   | Bottom-right corner                      |
+
+Encoded as:
+- zigzag(x1), zigzag(y1), zigzag(x2 - x1), zigzag(y2 - y1)
+
+**Optimization**: Enhanced version of RECTANGLE with improved compression.
+
+### OPTIMIZED_CIRCLE (type 0x90)
+Optimized circle command with enhanced precision.
+
+| Field       | Type    | Description                              |
+|-------------|---------|------------------------------------------|
+| center_x    | int32   | Circle center x coordinate               |
+| center_y    | int32   | Circle center y coordinate               |
+| radius      | int32   | Circle radius                            |
+
+Encoded as:
+- zigzag(center_x), zigzag(center_y), zigzag(radius)
+
+**Optimization**: Enhanced version of CIRCLE with improved precision and compression.
+
+---
+
+## Simple Shape Command Parameters
+
+### SIMPLE_RECTANGLE (type 0x96)
+Simple rectangle command using width/height format.
+
+| Field       | Type    | Description                              |
+|-------------|---------|------------------------------------------|
+| x, y        | int32   | Top-left corner                          |
+| width       | int32   | Rectangle width                          |
+| height      | int32   | Rectangle height                         |
+
+Encoded as:
+- zigzag(x), zigzag(y), zigzag(width), zigzag(height)
+
+**Usage**: Alternative rectangle format for width/height-based rendering.
+
+### SIMPLE_CIRCLE (type 0x97)
+Simple circle command with standard parameters.
+
+| Field       | Type    | Description                              |
+|-------------|---------|------------------------------------------|
+| center_x    | int32   | Circle center x coordinate               |
+| center_y    | int32   | Circle center y coordinate               |
+| radius      | int32   | Circle radius                            |
+
+Encoded as:
+- zigzag(center_x), zigzag(center_y), zigzag(radius)
+
+**Usage**: Standard circle format for consistent rendering.
+
+### SIMPLE_TRIANGLE (type 0x98)
+Simple triangle command with three vertices.
+
+| Field       | Type    | Description                            |
+|-------------|---------|----------------------------------------|
+| x1, y1      | int32   | First vertex                           |
+| x2, y2      | int32   | Second vertex                          |
+| x3, y3      | int32   | Third vertex                           |
+
+Encoded as:
+- zigzag(x1), zigzag(y1), zigzag(x2), zigzag(y2), zigzag(x3), zigzag(y3)
+
+**Usage**: Standard triangle format for consistent rendering.
+
+### DASHED_LINE (type 0x99)
+Dashed line command with configurable pattern.
+
+| Field       | Type    | Description                              |
+|-------------|---------|------------------------------------------|
+| x1, y1      | int32   | Starting coordinates                    |
+| x2, y2      | int32   | Ending coordinates                       |
+| dash_length | int32   | Length of each dash segment              |
+| gap_length  | int32   | Length of each gap segment               |
+
+Encoded as:
+- zigzag(x1), zigzag(y1), zigzag(x2 - x1), zigzag(y2 - y1), zigzag(dash_length), zigzag(gap_length)
+
+**Usage**: Renders dashed lines for roads, boundaries, and other features requiring dashed patterns.
+
+### DOTTED_LINE (type 0x9A)
+Dotted line command with configurable pattern.
+
+| Field       | Type    | Description                              |
+|-------------|---------|------------------------------------------|
+| x1, y1      | int32   | Starting coordinates                    |
+| x2, y2      | int32   | Ending coordinates                       |
+| dot_size    | int32   | Size of each dot                         |
+| gap_length  | int32   | Length of each gap segment               |
+
+Encoded as:
+- zigzag(x1), zigzag(y1), zigzag(x2 - x1), zigzag(y2 - y1), zigzag(dot_size), zigzag(gap_length)
+
+**Usage**: Renders dotted lines for trails, boundaries, and other features requiring dotted patterns.
+
+---
 
 ### GRID_PATTERN (type 0x85)
 Optimized command for urban grid patterns (perpendicular streets). Detects and compresses regular street layouts.
@@ -275,7 +453,7 @@ Encoded as:
 
 **Optimization**: 30-50% reduction for predictable paths like continuous roads.
 
-### COMPRESSED_POLYLINE (type 0x8A)
+### COMPRESSED_POLYLINE (type 0x8B)
 Polyline with Huffman-compressed coordinates. Used for complex paths with repetitive patterns.
 
 | Field           | Type    | Description                              |
@@ -346,35 +524,55 @@ PREDICTED_LINE end=(600,250)
 - varint(0x89), zigzag(600), zigzag(250)
 ```
 
-### Complete Tile Example
+### Complete Tile Example with Layer Ordering
 ```
 # Tile header
-varint(8)  # 8 commands total
+varint(12)  # 12 commands total
 
-# Set primary color (buildings)
-SET_COLOR_INDEX 1
-- varint(0x81), varint(1)
+# Layer 0: Background features (water, natural areas)
+SET_LAYER 0
+- varint(0x88), varint(0)
 
-# Multiple buildings as rectangles
-RECTANGLE (100,100) to (150,130)
-RECTANGLE (160,100) to (210,130)
-RECTANGLE (100,140) to (150,170)
+SET_COLOR_INDEX 2
+- varint(0x81), varint(2)
 
-# Change color for roads
+# Water polygon (optimized)
+OPTIMIZED_POLYGON 4 points: (0,0), (100,0), (100,50), (0,50)
+- varint(0x8C), varint(4), zigzag(0), zigzag(0), zigzag(100), zigzag(0), zigzag(0), zigzag(50), zigzag(-100), zigzag(0)
+
+# Layer 1: Roads and infrastructure
+SET_LAYER 1
+- varint(0x88), varint(1)
+
 SET_COLOR_INDEX 5
 - varint(0x81), varint(5)
 
-# Urban grid for streets
-GRID_PATTERN at (0,95), width=300, spacing=40, 5 lines, horizontal
-- varint(0x85), zigzag(0), zigzag(95), zigzag(300), zigzag(40), varint(5), uint8(1)
+# Main highway (straight line)
+STRAIGHT_LINE (200,100) to (400,100)
+- varint(0x83), zigzag(200), zigzag(100), zigzag(200), zigzag(0)
 
-# Roundabout intersection
-CIRCLE center=(200,200), radius=25
-- varint(0x87), zigzag(200), zigzag(200), zigzag(25)
+# Dashed boundary line
+DASHED_LINE (300,150) to (500,150), dash=10, gap=5
+- varint(0x99), zigzag(300), zigzag(150), zigzag(200), zigzag(0), zigzag(10), zigzag(5)
 
-# Highway continuation
-STRAIGHT_LINE (300,200) to (400,200)
-- varint(0x83), zigzag(300), zigzag(200), zigzag(100), zigzag(0)
+# Layer 2: Buildings and structures
+SET_LAYER 2
+- varint(0x88), varint(2)
+
+SET_COLOR_INDEX 1
+- varint(0x81), varint(1)
+
+# Multiple buildings as optimized rectangles
+OPTIMIZED_RECTANGLE (150,200) to (200,250)
+- varint(0x8F), zigzag(150), zigzag(200), zigzag(50), zigzag(50)
+
+# Circular building
+OPTIMIZED_CIRCLE center=(300,225), radius=25
+- varint(0x90), zigzag(300), zigzag(225), zigzag(25)
+
+# Simple triangle building
+SIMPLE_TRIANGLE (400,200), (450,200), (425,250)
+- varint(0x98), zigzag(400), zigzag(200), zigzag(450), zigzag(200), zigzag(425), zigzag(250)
 ```
 
 ---
@@ -382,14 +580,24 @@ STRAIGHT_LINE (300,200) to (400,200)
 ## Optimization Benefits
 
 ### Feature-Specific Optimizations
-- **Buildings**: RECTANGLE command reduces polygon data by 60-80%
+- **Buildings**: RECTANGLE and OPTIMIZED_RECTANGLE commands reduce polygon data by 60-80%
 - **Highways**: STRAIGHT_LINE eliminates unnecessary polyline points
 - **Connected roads**: HIGHWAY_SEGMENT uses coordinate continuity
+- **Complex polygons**: OPTIMIZED_POLYGON provides 30-50% reduction for complex shapes
+- **Triangular features**: OPTIMIZED_TRIANGLE offers 40-60% reduction for triangular shapes
+- **Circular features**: OPTIMIZED_CIRCLE provides enhanced precision and compression
 
 ### Advanced Pattern Recognition
 - **Urban grids**: GRID_PATTERN compresses regular street layouts by 70-85%
-- **Circles**: CIRCLE command compresses roundabouts by 50-70%
+- **Circles**: CIRCLE and OPTIMIZED_CIRCLE commands compress roundabouts by 50-70%
 - **Predictions**: PREDICTED_LINE reduces coordinate data by 30-50%
+- **Pattern lines**: DASHED_LINE and DOTTED_LINE provide efficient pattern rendering
+
+### Layer-Based Rendering
+- **Proper ordering**: SET_LAYER ensures correct visual layering
+- **Grouped commands**: Commands are grouped by layer for efficient rendering
+- **ESP32 optimization**: Essential for proper draw order on embedded systems
+- **Memory efficiency**: Layer grouping reduces state changes during rendering
 
 ### Dynamic Palette System
 - **Primary optimization**: Replaces RGB332 values with compact indices
@@ -424,6 +632,10 @@ while (commands_remaining > 0) {
             uint32_t index = read_varint();
             current_color = palette[index];
             break;
+            
+        case 0x88: // SET_LAYER
+            current_layer = read_varint();
+            break;
         
         // Basic geometry
         case 0x01: case 0x02: case 0x03: case 0x05: case 0x06:
@@ -456,16 +668,58 @@ while (commands_remaining > 0) {
             render_circle(current_color);
             break;
             
-        case 0x88: // RELATIVE_MOVE
+        case 0x89: // RELATIVE_MOVE
             update_relative_position(&current_position);
             break;
             
-        case 0x89: // PREDICTED_LINE
+        case 0x8A: // PREDICTED_LINE
             render_predicted_line(current_color, &current_position);
             break;
             
-        case 0x8A: // COMPRESSED_POLYLINE
+        case 0x8B: // COMPRESSED_POLYLINE
             render_compressed_polyline(current_color);
+            break;
+            
+        // Optimized geometry commands
+        case 0x8C: // OPTIMIZED_POLYGON
+            render_optimized_polygon(current_color);
+            break;
+            
+        case 0x8D: // HOLLOW_POLYGON
+            render_hollow_polygon(current_color);
+            break;
+            
+        case 0x8E: // OPTIMIZED_TRIANGLE
+            render_optimized_triangle(current_color);
+            break;
+            
+        case 0x8F: // OPTIMIZED_RECTANGLE
+            render_optimized_rectangle(current_color);
+            break;
+            
+        case 0x90: // OPTIMIZED_CIRCLE
+            render_optimized_circle(current_color);
+            break;
+            
+        // Simple shape commands
+        case 0x96: // SIMPLE_RECTANGLE
+            render_simple_rectangle(current_color);
+            break;
+            
+        case 0x97: // SIMPLE_CIRCLE
+            render_simple_circle(current_color);
+            break;
+            
+        case 0x98: // SIMPLE_TRIANGLE
+            render_simple_triangle(current_color);
+            break;
+            
+        case 0x99: // DASHED_LINE
+            render_dashed_line(current_color);
+            break;
+            
+        case 0x9A: // DOTTED_LINE
+            render_dotted_line(current_color);
             break;
             
         default:
@@ -537,15 +791,18 @@ void render_circle(uint32_t color) {
 
 ### Version Compatibility
 - **Basic parsers**: Can safely ignore commands ≥ 0x82
-- **Advanced parsers**: Support all optimization commands
+- **Advanced parsers**: Support all optimization commands (0x82-0x9A)
 - **Fallback rendering**: Unknown commands can be skipped
-- **State preservation**: Color state persists across unknown commands
+- **State preservation**: Color and layer state persists across unknown commands
 
 ### Implementation Guidelines
-- Always implement basic commands (0x01-0x06, 0x80-0x81)
-- Advanced commands (0x82-0x8A) are optional but recommended
+- Always implement basic commands (0x01-0x06, 0x80-0x81, 0x88)
+- Feature-optimized commands (0x82-0x84) are recommended for buildings and roads
+- Advanced pattern commands (0x85-0x8B) provide significant compression benefits
+- Optimized geometry commands (0x8C-0x90) offer enhanced rendering efficiency
+- Simple shape commands (0x96-0x9A) provide alternative rendering formats
 - Unknown command types should be skipped gracefully
-- Maintain color and position state across all commands
+- Maintain color, position, and layer state across all commands
 
 ---
 
@@ -553,17 +810,20 @@ void render_circle(uint32_t color) {
 
 ### Basic Implementation Requirements
 1. Read the file and parse the initial varint (`num_commands`)
-2. Initialize `current_color = 0xFF`, `current_position = {0, 0}`
+2. Initialize `current_color = 0xFF`, `current_position = {0, 0}`, `current_layer = 0`
 3. Load dynamic palette from `features.json`
-4. Implement state command handlers (SET_COLOR, SET_COLOR_INDEX)
+4. Implement state command handlers (SET_COLOR, SET_COLOR_INDEX, SET_LAYER)
 5. Implement basic geometry commands (LINE, POLYLINE, STROKE_POLYGON, etc.)
 
 ### Advanced Implementation (Recommended)
-1. Add feature-optimized command handlers (RECTANGLE, STRAIGHT_LINE)
-2. Implement pattern commands (GRID_PATTERN, CIRCLE)
+1. Add feature-optimized command handlers (RECTANGLE, STRAIGHT_LINE, HIGHWAY_SEGMENT)
+2. Implement pattern commands (GRID_PATTERN, CIRCLE, BLOCK_PATTERN)
 3. Add coordinate prediction support (PREDICTED_LINE, RELATIVE_MOVE)
-4. Optimize rendering pipeline for grouped commands
-5. Cache pattern expansions for repeated tiles
+4. Implement optimized geometry commands (OPTIMIZED_POLYGON, OPTIMIZED_TRIANGLE, etc.)
+5. Add simple shape commands (SIMPLE_RECTANGLE, SIMPLE_CIRCLE, SIMPLE_TRIANGLE)
+6. Implement pattern line commands (DASHED_LINE, DOTTED_LINE)
+7. Optimize rendering pipeline for grouped commands and layer ordering
+8. Cache pattern expansions for repeated tiles
 
 ### Error Handling
 - Invalid command types should be skipped gracefully
