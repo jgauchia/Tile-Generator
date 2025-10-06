@@ -2371,11 +2371,16 @@ def get_layer_from_priority(tags: Dict[str, str]) -> int:
 
 def hex_to_rgb332(hex_color: str) -> int:
     """Convierte color hex a RGB332 optimizado"""
-    hex_color = hex_color.lstrip('#')
-    r = int(hex_color[0:2], 16) >> 5  # 3 bits
-    g = int(hex_color[2:4], 16) >> 5  # 3 bits  
-    b = int(hex_color[4:6], 16) >> 6  # 2 bits
-    return (r << 5) | (g << 2) | b
+    try:
+        if not hex_color or not isinstance(hex_color, str) or not hex_color.startswith("#"):
+            return 0xFF
+        r = int(hex_color[1:3], 16)
+        g = int(hex_color[3:5], 16)
+        b = int(hex_color[5:7], 16)
+        return ((r & 0xE0) | ((g & 0xE0) >> 3) | (b >> 6))
+    except (ValueError, TypeError) as e:
+        # Invalid color format - use default white color
+        return 0xFF
 
 
 # Inicializar configuración
@@ -2607,9 +2612,13 @@ def write_palette_bin(output_dir):
     palette_path = os.path.join(output_dir, "palette.bin")
     logger.info(f"Writing palette to {palette_path} ({len(GLOBAL_INDEX_TO_RGB332)} colors)")
     
-    # Pre-build palette data for optimized write
-    palette_data = bytes(GLOBAL_INDEX_TO_RGB332)
-    optimized_file_write(palette_path, palette_data)
+    # Pre-build palette data for optimized write - write RGB332 values in sequential order
+    palette_data = bytearray(256)  # Always 256 bytes for palette
+    for index, rgb332_value in GLOBAL_INDEX_TO_RGB332.items():
+        if index < 256:  # Safety check
+            palette_data[index] = rgb332_value
+    
+    optimized_file_write(palette_path, bytes(palette_data))
     
     logger.info("Palette written successfully")
 

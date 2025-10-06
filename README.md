@@ -435,4 +435,3 @@ This project is open source and available under the MIT License.
 
 ---
 
-*Last updated: December 2024*

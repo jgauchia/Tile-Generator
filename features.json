@@ -3,8 +3,8 @@
   "viewport_size": 768,
   "toolbar_width": 160,
   "statusbar_height": 40,
-  "max_cache_size": 1000,
-  "thread_pool_size": 4,
+  "max_cache_size": 5000,
+  "thread_pool_size": 8,
   "background_colors": [
     [
       0,
