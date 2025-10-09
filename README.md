@@ -1,21 +1,21 @@
 # OSM Vector Tile Generator
 
-This repository contains a Python script for generating vector map tiles from OpenStreetMap (OSM) data in a highly optimized custom binary format.
+This repository contains a highly optimized Python script for generating vector map tiles from OpenStreetMap (OSM) data using a custom binary format.
 
-The generated tiles are extremely compact and optimized for fast rendering in custom map applications, featuring advanced compression techniques, dynamic color palette optimization, feature-specific optimizations, and state-based command architecture.
+The generated tiles are extremely compact and optimized for fast rendering in custom map applications, featuring advanced compression techniques, dynamic color palette optimization, memory pooling, streaming database operations, and intelligent resource allocation.
 
 ---
 
 ## What Does the Script Do?
 
 - **Direct PBF processing** using Pyosmium for maximum performance (no temporary files)
-- **Streaming OSM feature processing** with real-time geometry extraction and filtering
-- **Builds dynamic color palette** automatically from `features.json` configuration
-- **Memory-optimized processing** with single-pass feature reading for all zoom levels
-- **SQLite database storage** for efficient feature management and retrieval
-- **Zoom-accumulative rendering** - features appear in all zoom levels above their minimum
-- **Generates compact binary tiles** with efficient coordinate encoding
-- **Advanced polygon rendering** with intelligent border detection and styling
+- **Dynamic resource allocation** based on 70% of total system memory
+- **Memory pooling** for object reuse and reduced garbage collection
+- **Streaming database operations** with LZ4 compression for optimal I/O
+- **Batch geometry processing** for improved performance
+- **Real-time progress tracking** with feature counts and processing statistics
+- **Intelligent worker allocation** based on system capabilities and memory pressure
+- **Generates compact binary tiles** with efficient coordinate encoding and palette optimization
 
 ---
 
@@ -68,22 +68,23 @@ The script implements a comprehensive set of drawing commands for efficient tile
 ## Processing Performance
 
 - **Pyosmium streaming**: Direct PBF processing without temporary files
-- **Multi-core processing**: Utilizes all available CPU cores for feature extraction
-- **Memory optimization**: Constant memory usage regardless of zoom level count
-- **Batch processing**: Configurable batch sizes for optimal memory management
-- **Zoom-accumulative logic**: Features appear in all zoom levels above their minimum
+- **Dynamic resource allocation**: Automatically adjusts workers and batch sizes based on system memory
+- **Memory pooling**: Reuses objects to minimize garbage collection overhead
+- **LZ4 compression**: Reduces database storage and I/O operations
+- **Streaming operations**: Processes data in chunks to maintain constant memory usage
+- **Real-time monitoring**: Tracks memory pressure and adjusts processing parameters dynamically
 
 ---
 
 ## Script Features
 
 ### Advanced Optimization Suite
-- **Database optimization**: Composite indexes, WAL mode, batch operations
-- **Geometry optimization**: Real-time simplification, pre-filtering, smart clipping
-- **Memory optimization**: Streaming processing, smart GC, efficient data structures
-- **Parallelization optimization**: Intelligent work distribution, adaptive workers
-- **I/O optimization**: Buffered operations, directory pre-creation, error handling
-- **Algorithm optimization**: Mathematical caching, coordinate transformation caching
+- **Database optimization**: Composite indexes, WAL mode, LZ4 compression, streaming operations
+- **Memory pooling**: Object reuse for points, commands, coordinates, and features
+- **Dynamic resource allocation**: Automatic adjustment based on 70% of total system memory
+- **Batch processing**: Intelligent grouping of geometries by type for efficient processing
+- **Memory pressure monitoring**: Real-time adjustment of workers and batch sizes
+- **Streaming I/O**: Processes data in chunks to maintain constant memory usage
 
 ### Dynamic Color Palette
 ```
@@ -98,38 +99,86 @@ Palette written successfully
 ```
 
 ### Comprehensive Statistics
-The script provides detailed processing reports:
+The script provides detailed processing reports with real-time progress tracking:
 ```
+Validating input parameters...
+All input parameters validated successfully
+System information:
+  CPU cores: 8
+  Max workers: 8
+  DB batch size: 210,000
+  Tile batch size: 70,000
+  Total memory: 16384.0MB
+  Allocated memory: 11468.8MB (70% of total)
+  Worker memory limit: 1433.6MB per worker
+  Memory pressure: low
+
+Analyzing colors from features.json to build dynamic palette
+Dynamic color palette created:
+  - Total unique colors: 39
+  - Palette indices: 0-38
+  - Memory saving potential: 39 colors -> compact indices
+Dynamic palette ready with 39 colors from your features.json
+Writing palette to tiles/palette.bin (39 colors)
+Palette written successfully
+
 Processing PBF directly to database using Pyosmium (maximum performance)
-Config requires these fields: amenity, background_colors, building, config_file, fill_polygons, fps_limit, highway, landuse, leisure, log_level, max_cache_size, natural, place, railway, statusbar_height, thread_pool_size, tile_size, toolbar_width, viewport_size, waterway
+Config requires these fields: amenity, building, highway, landuse, leisure, natural, place, railway, waterway
 Compiled 79 tag patterns for Pyosmium processing
 Starting Pyosmium processing...
-Pyosmium processing completed in 165.52s
+📊 Progress: 125,430 scanned, 54,482 filtered, 1,250 features/s, 100.3s elapsed
+Pyosmium processing completed in 100.3s
 Total processed: 54482 features directly from PBF
-Zoom 6: 870 features stored
-Zoom 7: 870 features stored
-Zoom 8: 1627 features stored
-Zoom 9: 1648 features stored
-Zoom 10: 1649 features stored
-Zoom 11: 1661 features stored
-Zoom 12: 5483 features stored
-Zoom 13: 5774 features stored
-Zoom 14: 9482 features stored
-Zoom 15: 25418 features stored
+
+┌──────┬─────────┬─────────────┐
+│ Zoom │ Features│ Description │
+├──────┼─────────┼─────────────┤
+│    6 │     870 │ Level 6     │
+│    7 │     870 │ Level 7     │
+│    8 │   1,627 │ Level 8     │
+│    9 │   1,648 │ Level 9     │
+│   10 │   1,649 │ Level 10    │
+│   11 │   1,661 │ Level 11    │
+│   12 │   5,483 │ Level 12    │
+│   13 │   5,774 │ Level 13    │
+│   14 │   9,482 │ Level 14    │
+│   15 │  25,418 │ Level 15    │
+│TOTAL │  52,872 │ All levels  │
+└──────┴─────────┴─────────────┘
+
 Processing zoom level 6 from database
 Found 1 tiles for zoom 6
 Writing tiles (zoom 6): 100%|█████████████████████| 1/1 [00:00<00:00,  1.61s/it]
-Zoom 6: 1 tiles, average size = 3778.00 bytes
+
+┌──────┬───────┬─────────────────┐
+│ Zoom │ Tiles │ Avg Size (bytes)│
+├──────┼───────┼─────────────────┤
+│    6 │     1 │         3,778.00│
+│    7 │     1 │         3,778.00│
+│    8 │     4 │         4,125.50│
+│    9 │     4 │         4,125.50│
+│   10 │     4 │         4,125.50│
+│   11 │     4 │         4,125.50│
+│   12 │    16 │         4,250.00│
+│   13 │    16 │         4,250.00│
+│   14 │    25 │         4,300.00│
+│   15 │    64 │         4,500.00│
+│TOTAL │   139 │               - │
+└──────┴───────┴─────────────────┘
+
 Process completed successfully
 Cleaning up temporary files and database...
 Cleaned up database file: features.db
+
+⏱️  Total execution time: 00d 00:02:45
 ```
 
 ### Performance Monitoring
-- Real-time memory usage tracking
-- Processing time measurement per zoom level
-- Progress bars for all major processing steps
-- Detailed statistics and reporting
+- **Real-time progress tracking**: Shows scanned/filtered features with processing speed
+- **Memory pressure monitoring**: Automatically adjusts workers and batch sizes
+- **System resource display**: Shows CPU cores, memory allocation, and worker limits
+- **Tabulated statistics**: Clean tables for features per zoom and tile generation stats
+- **Execution time tracking**: Total time displayed in dd hh:mm:ss format
 
 ---
 
@@ -154,11 +203,11 @@ python tile_generator.py planet.osm.pbf tiles/ features.json --zoom 6-17 --max-f
 
 The optimized version provides significant memory improvements:
 
-- **Streaming processing**: Direct PBF processing without temporary files
-- **Smart garbage collection**: Memory-aware GC with pressure monitoring
-- **Cache management**: Automatic cache clearing and optimization
-- **Memory monitoring**: Real-time memory usage tracking and optimization
-- **Scalability**: Handles large datasets without memory overflow
+- **Dynamic resource allocation**: Uses 70% of total system memory for optimal performance
+- **Memory pooling**: Reuses objects (points, commands, coordinates, features) to reduce GC overhead
+- **LZ4 compression**: Reduces database storage footprint and I/O operations
+- **Streaming operations**: Processes data in chunks to maintain constant memory usage
+- **Memory pressure monitoring**: Real-time adjustment of workers and batch sizes based on available memory
 
 ---
 
@@ -187,9 +236,6 @@ The script automatically detects feature types from your configuration:
 
 ```json
 {
-  "tile_size": 256,
-  "viewport_size": 768,
-  "fill_polygons": true,
   "highway=primary": {
     "color": "#DC143C", 
     "priority": 6,
@@ -199,17 +245,21 @@ The script automatically detects feature types from your configuration:
     "color": "#8B4513",
     "priority": 5, 
     "zoom": 12
+  },
+  "waterway=river": {
+    "color": "#4169E1",
+    "priority": 3,
+    "zoom": 6
   }
 }
 ```
 
 **Configuration Features:**
-- **System parameters**: Control tile generation and viewer behavior
-- **Feature definitions**: Colors, priorities, and zoom levels
-- **Polygon rendering**: Control fill behavior and border styling
-- **Colors automatically indexed** into optimal palette
-- **Zoom-based filtering** reduces processing overhead
-- **Priority-based rendering order** optimization
+- **Feature definitions**: Colors, priorities, and zoom levels for OSM features
+- **Dynamic palette generation**: Colors automatically indexed into optimal palette
+- **Priority-based rendering**: Features rendered in order based on priority values
+- **Zoom-based filtering**: Features only appear at their minimum zoom level and above
+- **Tag pattern matching**: Supports both exact matches (`key=value`) and key-only matches
 
 ---
 
@@ -217,10 +267,12 @@ The script automatically detects feature types from your configuration:
 
 ### Required Packages
 ```
-shapely  
-ijson
+shapely
 tqdm
 osmium
+tabulate
+lz4
+psutil
 ```
 
 ### System Requirements
@@ -231,7 +283,7 @@ osmium
 ### Installation
 ```bash
 # Python packages
-pip install shapely ijson tqdm osmium
+pip install shapely tqdm osmium tabulate lz4 psutil
 
 # Pyosmium system dependencies (Ubuntu/Debian)
 sudo apt-get install libosmium-dev python3-dev
@@ -253,19 +305,20 @@ python tile_generator.py region.osm.pbf tiles/ features.json --zoom 13-17
 ```
 
 ### Custom Optimization Tuning
-- **Color palette optimization**: Script automatically creates optimal color palette from your `features.json`
-- **Memory optimization**: Streaming processing and efficient data structures
-- **Geometry optimization**: Real-time simplification and pre-filtering
-- **Parallelization optimization**: Automatic worker allocation based on system capabilities
-- **I/O optimization**: Automatic buffering and directory pre-creation
-- **Algorithm optimization**: Mathematical operation caching for optimal performance
+- **Dynamic resource allocation**: Automatically adjusts based on 70% of total system memory
+- **Memory pooling**: Reuses objects to minimize garbage collection overhead
+- **LZ4 compression**: Reduces database storage and improves I/O performance
+- **Batch geometry processing**: Groups similar geometries for efficient processing
+- **Memory pressure monitoring**: Real-time adjustment of workers and batch sizes
+- **Streaming operations**: Processes data in chunks to maintain constant memory usage
 
 ### Performance Monitoring
 The script provides comprehensive monitoring:
-- **Memory usage tracking**: Real-time memory usage monitoring during processing
-- **Processing time measurements**: Detailed timing for each optimization layer
-- **Feature statistics**: Per-zoom-level feature counts and processing metrics
-- **Optimization statistics**: Performance metrics and efficiency reports
+- **Real-time progress tracking**: Shows scanned/filtered features with processing speed
+- **Memory pressure monitoring**: Automatically adjusts workers and batch sizes
+- **System resource display**: Shows CPU cores, memory allocation, and worker limits
+- **Tabulated statistics**: Clean tables for features per zoom and tile generation stats
+- **Execution time tracking**: Total time displayed in dd hh:mm:ss format
 
 ---
 
@@ -289,9 +342,9 @@ Each `.bin` file contains optimized drawing commands with variable-length encodi
 
 ## Documentation
 
-- [Binary Tile File Format](bin_tile_format.md) - Complete specification of drawing commands
-- [Features JSON Format](features_json_format.md) - Configuration format details
-- [Tile Viewer Documentation](tile_viewer.md) - Tile viewer with command support
+- [Binary Tile File Format](docs/bin_tile_format.md) - Complete specification of drawing commands
+- [Features JSON Format](docs/features_json_format.md) - Configuration format details
+- [Tile Viewer Documentation](docs/tile_viewer.md) - Tile viewer with command support
 
 ---
 
@@ -307,75 +360,76 @@ Each `.bin` file contains optimized drawing commands with variable-length encodi
 - **Automatic palette generation**: Analyzes `features.json` and creates optimal color palette
 - **Indexed colors**: Each unique color gets compact index (0-N) for maximum compression
 - **Smart state management**: SET_COLOR_INDEX and SET_COLOR commands minimize redundancy
-- **Adaptive encoding**: Most frequent colors get optimal indices
+- **RGB888 palette format**: 3-byte colors with 4-byte header for tile viewer compatibility
 
-### Compression Techniques
-- **Variable-length encoding**: Efficient coordinate compression with varint/zigzag
-- **Delta encoding**: Coordinate differences for compact storage
-- **RGB332 color format**: 8-bit color encoding for efficient storage
-- **Boundary optimization**: Cross-tile geometries optimized to reduce duplication
+### Memory Pool Optimization
+- **Object reuse**: Reuses points, commands, coordinates, and features to reduce GC overhead
+- **Memory pooling**: Maintains pools of reusable objects with configurable size limits
+- **Periodic cleanup**: Clears pools every 100 tiles to prevent memory buildup
+- **Efficient allocation**: Reduces object creation and destruction overhead
 
 ### Database Optimization
+- **LZ4 compression**: Compresses feature data to reduce storage and I/O operations
 - **Composite indexes**: Multi-column indexes for optimal query performance
 - **WAL mode**: Write-Ahead Logging for better concurrency and crash recovery
+- **Streaming operations**: Generator-based data retrieval for memory efficiency
 - **Batch operations**: Efficient bulk inserts and updates with executemany
-- **Connection optimization**: Optimized SQLite connection settings
 
-### Geometry Optimization
-- **Real-time simplification**: Douglas-Peucker algorithm with zoom-appropriate tolerances
-- **Pre-filtering**: Bounding box checks to avoid expensive intersection operations
-- **Tile clipping**: Geometries clipped to tile boundaries for optimal rendering
-- **Zoom-accumulative logic**: Features appear in all zoom levels above their minimum
+### Dynamic Resource Allocation
+- **Memory-based calculation**: Uses 70% of total system memory for optimal performance
+- **Adaptive workers**: Automatically adjusts worker count based on available memory
+- **Dynamic batch sizes**: Calculates optimal batch sizes based on system resources
+- **Memory pressure monitoring**: Real-time adjustment of processing parameters
 
-### Memory Optimization
-- **Streaming processing**: Direct PBF processing without temporary files
-- **Smart garbage collection**: Memory-aware GC with pressure monitoring
-- **Efficient data structures**: Optimized for memory usage and performance
-- **Batch processing**: Process features in optimized chunks
-
-### Polygon Rendering
-- **Intelligent border detection**: Distinguishes between tile border and interior segments
-- **Conditional styling**: Different colors for border vs interior segments
-- **Fill control**: Configurable polygon filling with `fill_polygons` parameter
-- **Visual optimization**: Enhanced visual appearance with smart border handling
+### Batch Geometry Processing
+- **Type-based grouping**: Groups polygons, linestrings, and other geometries separately
+- **Efficient processing**: Processes similar geometries in batches for better performance
+- **Memory optimization**: Reduces function call overhead and improves cache locality
+- **Layer ordering**: Maintains correct rendering order within each batch
 
 ---
 
 ## Recent Updates
 
-### Pyosmium Integration
-- **Replaced ogr2ogr**: Direct PBF processing using Pyosmium for maximum performance
-- **Eliminated temporary files**: No more GeoJSON intermediate files
-- **Improved performance**: Significantly faster processing of large PBF files
-- **Better memory usage**: Streaming processing without memory overflow
+### Memory Pool Optimization
+- **Object reuse system**: Reuses points, commands, coordinates, and features to reduce GC overhead
+- **Configurable pool sizes**: Adjustable pool limits based on system memory
+- **Periodic cleanup**: Automatic pool clearing every 100 tiles to prevent memory buildup
+- **Performance improvement**: Significant reduction in object allocation overhead
 
-### Enhanced Polygon Rendering
-- **Smart border detection**: Automatic detection of polygon segments on tile borders
-- **Conditional styling**: Different rendering for border vs interior segments
-- **Configurable filling**: Control polygon fill behavior via `features.json`
-- **Visual improvements**: Better visual distinction between tile borders and polygon interiors
+### Dynamic Resource Allocation
+- **Memory-based calculation**: Uses 70% of total system memory for optimal performance
+- **Adaptive worker allocation**: Automatically adjusts workers based on available memory
+- **Dynamic batch sizing**: Calculates optimal batch sizes based on system resources
+- **Memory pressure monitoring**: Real-time adjustment of processing parameters
 
-### Zoom Accumulative Logic
-- **Cumulative rendering**: Features appear in all zoom levels above their minimum
-- **Efficient processing**: Single-pass processing for all zoom levels
-- **Memory optimization**: Shared geometry data across zoom levels
-- **Performance improvement**: Reduced processing time and memory usage
+### LZ4 Database Compression
+- **Feature data compression**: Compresses stored feature data using LZ4 for better I/O
+- **Storage optimization**: Reduces database file size and improves read/write performance
+- **Transparent compression**: Automatic compression/decompression during database operations
+- **Memory efficiency**: Reduces memory usage during database operations
+
+### Batch Geometry Processing
+- **Type-based grouping**: Groups similar geometries for efficient processing
+- **Memory optimization**: Reduces function call overhead and improves cache locality
+- **Layer ordering**: Maintains correct rendering order within each batch
+- **Performance improvement**: Faster processing of large numbers of geometries
 
 ---
 
 ## Performance Comparison
 
-### Before Pyosmium Integration
-- **Processing method**: ogr2ogr with temporary GeoJSON files
-- **Memory usage**: High due to temporary files
-- **Processing time**: Slower due to file I/O overhead
-- **Scalability**: Limited by temporary file size
+### Before Optimization
+- **Memory usage**: High due to object allocation overhead
+- **Database I/O**: Uncompressed data storage and retrieval
+- **Processing**: Individual geometry processing without batching
+- **Resource allocation**: Fixed worker and batch sizes
 
-### After Pyosmium Integration
-- **Processing method**: Direct PBF streaming with Pyosmium
-- **Memory usage**: Low and constant regardless of file size
-- **Processing time**: Significantly faster due to direct processing
-- **Scalability**: Excellent, handles planet-scale files efficiently
+### After Optimization
+- **Memory usage**: Reduced through object pooling and reuse
+- **Database I/O**: LZ4 compression reduces storage and improves performance
+- **Processing**: Batch geometry processing for improved efficiency
+- **Resource allocation**: Dynamic adjustment based on 70% of system memory
 
 ---
 
@@ -390,22 +444,23 @@ Each `.bin` file contains optimized drawing commands with variable-length encodi
    ```
 
 2. **Memory issues with large files**:
+   - The script automatically adjusts based on available memory
    - Use smaller zoom ranges: `--zoom 6-12`
-   - Reduce batch size in configuration
    - Ensure sufficient RAM (4-8GB recommended)
 
 3. **Slow processing**:
    - Ensure Pyosmium is properly installed
    - Check system resources (CPU, RAM)
    - Verify PBF file is not corrupted
+   - The script automatically optimizes based on system capabilities
 
 ### Performance Tips
 
 - **Use SSD storage** for better I/O performance
-- **Allocate sufficient RAM** for large datasets
-- **Process in zoom ranges** for very large files
-- **Monitor memory usage** during processing
-- **Use appropriate simplification tolerances** for your use case
+- **The script automatically optimizes** based on available system resources
+- **Process in zoom ranges** for very large files if needed
+- **Memory monitoring is automatic** - the script adjusts parameters dynamically
+- **System requirements**: 4-8GB RAM recommended for planet files
 
 ---
 
@@ -413,9 +468,9 @@ Each `.bin` file contains optimized drawing commands with variable-length encodi
 
 This project is actively maintained and optimized for performance. Contributions are welcome, especially:
 
-- **Performance optimizations**: Memory usage, processing speed
-- **New drawing commands**: Additional geometric primitives
-- **Format improvements**: Better compression, encoding
+- **Memory optimizations**: Further improvements to memory pooling and resource allocation
+- **New drawing commands**: Additional geometric primitives for tile rendering
+- **Database optimizations**: Better compression, indexing, or query performance
 - **Documentation**: Examples, tutorials, best practices
 
 ---
@@ -432,6 +487,8 @@ This project is open source and available under the MIT License.
 - **Pyosmium**: For the excellent PBF processing library
 - **Shapely**: For robust geometric operations
 - **SQLite**: For efficient data storage and retrieval
+- **LZ4**: For fast compression and decompression
+- **Tabulate**: For beautiful table formatting in console output
 
 ---
 

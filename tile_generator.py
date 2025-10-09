@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+"""
+Optimized tile generator for OSM PBF files with dynamic resource allocation,
+memory pooling, and streaming database operations.
+"""
+
 from shapely.geometry import (
     LineString, MultiLineString, Polygon, MultiPolygon, GeometryCollection, box, shape
 )
@@ -6,18 +11,18 @@ import math
 import struct
 import json
 import os
-from collections import Counter
-from tqdm import tqdm
-import argparse
-import subprocess
-import sys
 import gc
 import time
 import sqlite3
 import pickle
-
-import ijson
+import lz4.frame
+from collections import deque, Counter
+from tqdm import tqdm
+import argparse
+import sys
 import logging
+import atexit
+import psutil
 
 # Try to import osmium for PBF processing
 try:
@@ -25,21 +30,82 @@ try:
     OSM_PYOSMIUM_AVAILABLE = True
 except ImportError:
     OSM_PYOSMIUM_AVAILABLE = False
-import atexit
-import psutil
 
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from tabulate import tabulate
 from typing import List, Dict, Tuple, Optional, Union, Set, Any, Iterator, TYPE_CHECKING
+from contextlib import contextmanager, ExitStack
 
 if TYPE_CHECKING:
     from shapely.geometry.base import BaseGeometry as Geometry
-from contextlib import contextmanager, ExitStack
+
+# Memory pool for object reuse
+class MemoryPool:
+    """Memory pool for reusing objects to reduce garbage collection"""
+    
+    def __init__(self, max_size: int = 1000):
+        self.max_size = max_size
+        self.point_pool = deque(maxlen=max_size)
+        self.command_pool = deque(maxlen=max_size)
+        self.coord_pool = deque(maxlen=max_size)
+        self.feature_pool = deque(maxlen=max_size)
+        
+    def get_point(self) -> Tuple[int, int]:
+        """Get a point tuple from pool or create new one"""
+        if self.point_pool:
+            return self.point_pool.popleft()
+        return (0, 0)
+    
+    def return_point(self, point: Tuple[int, int]):
+        """Return a point tuple to the pool"""
+        if len(self.point_pool) < self.max_size:
+            self.point_pool.append(point)
+    
+    def get_command(self) -> Dict:
+        """Get a command dict from pool or create new one"""
+        if self.command_pool:
+            return self.command_pool.popleft()
+        return {}
+    
+    def return_command(self, command: Dict):
+        """Return a command dict to the pool"""
+        if len(self.command_pool) < self.max_size:
+            command.clear()  # Clear the dict for reuse
+            self.command_pool.append(command)
+    
+    def get_coords(self) -> List[Tuple[int, int]]:
+        """Get a coords list from pool or create new one"""
+        if self.coord_pool:
+            return self.coord_pool.popleft()
+        return []
+    
+    def return_coords(self, coords: List[Tuple[int, int]]):
+        """Return a coords list to the pool"""
+        if len(self.coord_pool) < self.max_size:
+            coords.clear()  # Clear the list for reuse
+            self.coord_pool.append(coords)
+    
+    def get_feature(self) -> Dict:
+        """Get a feature dict from pool or create new one"""
+        if self.feature_pool:
+            return self.feature_pool.popleft()
+        return {}
+    
+    def return_feature(self, feature: Dict):
+        """Return a feature dict to the pool"""
+        if len(self.feature_pool) < self.max_size:
+            feature.clear()  # Clear the dict for reuse
+            self.feature_pool.append(feature)
+
+# Global memory pool instance
+memory_pool = MemoryPool(max_size=2000)
 
 # Drawing command codes
+# Global variables
 DRAW_COMMANDS = {
     'LINE': 1,
     'POLYLINE': 2,
-    'STROKE_POLYGON': 3,  # Polígono solo contorno (sin relleno)
+    'STROKE_POLYGON': 3,  # Polygon outline only (no fill)
     'HORIZONTAL_LINE': 5,
     'VERTICAL_LINE': 6,
     'SET_COLOR': 0x80,  # State command for direct RGB332 color
@@ -66,7 +132,7 @@ DRAW_COMMANDS = {
     'DOTTED_LINE': 0x9A,  # Dotted line with pattern
 }
 
-# Rendering layers (orden de renderizado de abajo hacia arriba)
+# Rendering layers (rendering order from bottom to top)
 RENDER_LAYERS = {
     'TERRAIN': 0,      # Background terrain, water bodies
     'WATER': 1,        # Rivers, lakes, oceans
@@ -179,7 +245,35 @@ class Config:
 _db_file_to_cleanup = None
 _temp_files_to_cleanup = set()
 
-# Memory monitoring and management
+def calculate_dynamic_resources() -> Dict[str, Any]:
+    """Calculate dynamic resources based on total system memory (70% usage)"""
+    memory_info = psutil.virtual_memory()
+    cpu_count = os.cpu_count() or 4
+    
+    # Use 70% of total memory (convert bytes to MB)
+    total_memory_mb = memory_info.total / (1024 * 1024)
+    available_memory_mb = total_memory_mb * 0.7
+    
+    # Calculate optimal workers (use all cores for Pyosmium processing)
+    max_workers = cpu_count
+    
+    # Calculate batch sizes based on available memory (more aggressive)
+    db_batch_size = min(100000, max(10000, int(available_memory_mb * 3)))  # 3MB worth of features per batch
+    tile_batch_size = min(2000, max(1000, int(available_memory_mb * 1)))   # 1MB worth of tiles per batch
+    
+    # Calculate worker memory limit (70% of available memory per worker)
+    worker_memory_limit = int(available_memory_mb / max_workers)
+    
+    return {
+        'max_workers': max_workers,
+        'db_batch_size': db_batch_size,
+        'tile_batch_size': tile_batch_size,
+        'worker_memory_limit': worker_memory_limit,
+        'available_memory_mb': available_memory_mb,
+        'total_memory_mb': total_memory_mb,
+        'memory_usage_percent': memory_info.percent
+    }
+
 def get_memory_usage() -> Dict[str, float]:
     """
     Get current memory usage information.
@@ -214,6 +308,8 @@ def get_memory_pressure() -> str:
         return 'high'
     else:
         return 'critical'
+
+# Memory monitoring and management
 
 def calculate_optimal_workers(memory_pressure: str, base_workers: int) -> int:
     """
@@ -270,9 +366,12 @@ def force_memory_cleanup():
     
     logger.debug("Memory cleanup completed")
 
-def monitor_memory_and_adjust():
+def monitor_memory_and_adjust(resources: Dict[str, Any] = None):
     """
     Monitor memory usage and adjust processing parameters dynamically.
+    
+    Args:
+        resources: Dynamic resources calculated from system memory (70% of total)
     
     Returns:
         Tuple of (adjusted_workers, adjusted_batch_size, memory_pressure)
@@ -283,12 +382,18 @@ def monitor_memory_and_adjust():
     logger.debug(f"Memory: {memory_info['used']:.1f}MB used ({memory_info['percent']:.1f}%), "
                 f"{memory_info['available']:.1f}MB available, pressure: {memory_pressure}")
     
+    # Use dynamic resources if provided, otherwise fall back to config
+    if resources:
+        base_workers = resources['max_workers']
+        base_batch_size = resources['tile_batch_size']
+    else:
+        base_workers = Config.MAX_WORKERS
+        base_batch_size = Config.TILE_BATCH_SIZE
+    
     # Adjust workers based on memory pressure
-    base_workers = Config.MAX_WORKERS
     optimal_workers = calculate_optimal_workers(memory_pressure, base_workers)
     
     # Adjust batch size based on memory pressure
-    base_batch_size = Config.TILE_BATCH_SIZE
     optimal_batch_size = calculate_optimal_batch_size(memory_pressure, base_batch_size)
     
     # Force cleanup if memory pressure is critical
@@ -464,6 +569,26 @@ class FeatureDatabase:
             ON features(zoom_level)
         """)
         
+        # Additional optimized indexes for specific query patterns
+        self.conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_tile_coords 
+            ON features(tile_x, tile_y, zoom_level)
+        """)
+        self.conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_priority_zoom 
+            ON features(priority, zoom_level)
+        """)
+        self.conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_zoom_tile_distinct 
+            ON features(zoom_level, tile_x, tile_y) 
+            WHERE zoom_level IS NOT NULL
+        """)
+        self.conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_zoom_count 
+            ON features(zoom_level) 
+            WHERE zoom_level IS NOT NULL
+        """)
+        
         # Prepare statements for better performance
         self._prepare_statements()
         
@@ -478,11 +603,12 @@ class FeatureDatabase:
         self.select_sql = """
             SELECT feature_data, priority FROM features 
             WHERE zoom_level = ? AND tile_x = ? AND tile_y = ?
-            ORDER BY priority
+            ORDER BY priority ASC
         """
         self.tiles_sql = """
             SELECT DISTINCT tile_x, tile_y FROM features 
             WHERE zoom_level = ?
+            ORDER BY tile_x, tile_y
         """
         self.count_sql = """
             SELECT COUNT(*) FROM features WHERE zoom_level = ?
@@ -490,14 +616,27 @@ class FeatureDatabase:
         self.clear_sql = """
             DELETE FROM features WHERE zoom_level = ?
         """
+        self.tile_stats_sql = """
+            SELECT tile_x, tile_y, COUNT(*) as feature_count, 
+                   AVG(LENGTH(feature_data)) as avg_size
+            FROM features 
+            WHERE zoom_level = ?
+            GROUP BY tile_x, tile_y
+            ORDER BY tile_x, tile_y
+        """
     
     def insert_feature(self, zoom_level, tile_x, tile_y, feature_data, priority=5):
-        """Insert a feature into the database using optimized SQL"""
+        """Insert a feature into the database using optimized SQL with compression"""
         # Convert Shapely geometry to WKT for serialization
         serializable_data = feature_data.copy()
         if 'geom' in serializable_data and hasattr(serializable_data['geom'], 'wkt'):
             serializable_data['geom'] = serializable_data['geom'].wkt
-        self.conn.execute(self.insert_sql, (zoom_level, tile_x, tile_y, pickle.dumps(serializable_data), priority))
+        
+        # Serialize and compress data
+        serialized_data = pickle.dumps(serializable_data)
+        compressed_data = compress_feature_data(serialized_data)
+        
+        self.conn.execute(self.insert_sql, (zoom_level, tile_x, tile_y, compressed_data, priority))
     
     def insert_features_batch(self, features_batch: List[Tuple[int, int, int, Dict[str, Any], int]]):
         """Insert multiple features in a single transaction for better performance"""
@@ -505,14 +644,18 @@ class FeatureDatabase:
             return
         
         try:
-            # Use executemany for batch insert
+            # Use executemany for batch insert with compression
             data = []
             for zoom_level, tile_x, tile_y, feature_data, priority in features_batch:
                 # Convert Shapely geometry to WKT for serialization
                 serializable_data = feature_data.copy()
                 if 'geom' in serializable_data and hasattr(serializable_data['geom'], 'wkt'):
                     serializable_data['geom'] = serializable_data['geom'].wkt
-                data.append((zoom_level, tile_x, tile_y, pickle.dumps(serializable_data), priority))
+                
+                # Serialize and compress data
+                serialized_data = pickle.dumps(serializable_data)
+                compressed_data = compress_feature_data(serialized_data)
+                data.append((zoom_level, tile_x, tile_y, compressed_data, priority))
             
             self.conn.executemany(self.insert_sql, data)
         except Exception as e:
@@ -523,11 +666,17 @@ class FeatureDatabase:
     
     def get_features_for_tile(self, zoom_level, tile_x, tile_y):
         """Get all features for a specific tile using optimized SQL"""
+        # Use row factory for better performance
+        self.conn.row_factory = sqlite3.Row
         cursor = self.conn.execute(self.select_sql, (zoom_level, tile_x, tile_y))
         
         features = []
-        for row in cursor.fetchall():
-            feature_data = pickle.loads(row[0])
+        for row in cursor:
+            # Decompress and deserialize data
+            compressed_data = row['feature_data']
+            decompressed_data = decompress_feature_data(compressed_data)
+            feature_data = pickle.loads(decompressed_data)
+            
             # Convert WKT back to Shapely geometry if needed
             if 'geom' in feature_data and isinstance(feature_data['geom'], str):
                 try:
@@ -537,22 +686,76 @@ class FeatureDatabase:
                     # Fallback if shapely.wkt is not available
                     pass
             features.append(feature_data)
+        
+        # Reset row factory to default
+        self.conn.row_factory = None
         return features
     
     def get_tiles_for_zoom(self, zoom_level):
         """Get all tile coordinates for a specific zoom level using optimized SQL"""
+        # Use row factory for better performance
+        self.conn.row_factory = sqlite3.Row
         cursor = self.conn.execute(self.tiles_sql, (zoom_level,))
-        return cursor.fetchall()
+        tiles = [(row['tile_x'], row['tile_y']) for row in cursor]
+        
+        # Reset row factory to default
+        self.conn.row_factory = None
+        return tiles
     
     def count_features_for_zoom(self, zoom_level):
         """Count total features for a zoom level using optimized SQL"""
         cursor = self.conn.execute(self.count_sql, (zoom_level,))
         return cursor.fetchone()[0]
     
-    def clear_zoom(self, zoom_level):
-        """Clear all features for a specific zoom level using optimized SQL"""
-        self.conn.execute(self.clear_sql, (zoom_level,))
-        self.conn.commit()
+    def get_tile_statistics(self, zoom_level):
+        """Get tile statistics for a zoom level using optimized SQL"""
+        # Use row factory for better performance
+        self.conn.row_factory = sqlite3.Row
+        cursor = self.conn.execute(self.tile_stats_sql, (zoom_level,))
+        stats = [(row['tile_x'], row['tile_y'], row['feature_count'], row['avg_size']) for row in cursor]
+        
+        # Reset row factory to default
+        self.conn.row_factory = None
+        return stats
+    
+    def stream_features_for_tile(self, zoom_level, tile_x, tile_y):
+        """Stream features for a specific tile using generator for memory efficiency"""
+        # Use row factory for better performance
+        self.conn.row_factory = sqlite3.Row
+        cursor = self.conn.execute(self.select_sql, (zoom_level, tile_x, tile_y))
+        
+        try:
+            for row in cursor:
+                # Decompress and deserialize data
+                compressed_data = row['feature_data']
+                decompressed_data = decompress_feature_data(compressed_data)
+                feature_data = pickle.loads(decompressed_data)
+                
+                # Convert WKT back to Shapely geometry if needed
+                if 'geom' in feature_data and isinstance(feature_data['geom'], str):
+                    try:
+                        from shapely import wkt
+                        feature_data['geom'] = wkt.loads(feature_data['geom'])
+                    except ImportError:
+                        # Fallback if shapely.wkt is not available
+                        pass
+                yield feature_data
+        finally:
+            # Reset row factory to default
+            self.conn.row_factory = None
+    
+    def stream_tiles_for_zoom(self, zoom_level):
+        """Stream tile coordinates for a specific zoom level using generator for memory efficiency"""
+        # Use row factory for better performance
+        self.conn.row_factory = sqlite3.Row
+        cursor = self.conn.execute(self.tiles_sql, (zoom_level,))
+        
+        try:
+            for row in cursor:
+                yield (row['tile_x'], row['tile_y'])
+        finally:
+            # Reset row factory to default
+            self.conn.row_factory = None
     
     def close(self) -> None:
         """Close the database connection"""
@@ -614,7 +817,8 @@ def coords_to_pixel_coords_uint16(coords: List[Tuple[float, float]], zoom: int, 
         List of (x, y) pixel coordinates relative to the tile (0-65535 range)
     """
     n = 2.0 ** zoom
-    uint16_coords = []
+    # Get coords list from pool
+    uint16_coords = memory_pool.get_coords()
     
     for lon, lat in coords:
         # Calculate pixel coordinates within the tile
@@ -738,9 +942,6 @@ def get_style_for_tags(tags: Dict[str, str], config: Dict[str, Any]) -> Tuple[Di
             return config[k], k
     return {}, None
 
-def tile_latlon_bounds(tile_x: int, tile_y: int, zoom: int, pixel_margin: int = 0) -> Tuple[float, float, float, float]:
-    """Get lat/lon bounds for a tile (optimized version)"""
-    return optimized_tile_latlon_bounds(tile_x, tile_y, zoom, pixel_margin)
 
 def is_area(tags: Dict[str, str]) -> bool:
     """
@@ -824,7 +1025,7 @@ def get_tile_bbox_cached(tile_x: int, tile_y: int, zoom: int) -> 'box':
     
     cache_key = (tile_x, tile_y, zoom)
     if cache_key not in TILE_BBOX_CACHE:
-        lon_min, lat_min, lon_max, lat_max = tile_latlon_bounds(tile_x, tile_y, zoom)
+        lon_min, lat_min, lon_max, lat_max = optimized_tile_latlon_bounds(tile_x, tile_y, zoom)
         TILE_BBOX_CACHE[cache_key] = box(lon_min, lat_min, lon_max, lat_max)
     
     return TILE_BBOX_CACHE[cache_key]
@@ -881,6 +1082,48 @@ def clear_all_caches():
 
 
 
+def compress_feature_data(data: bytes) -> bytes:
+    """Compress feature data using lz4 for better I/O performance"""
+    try:
+        return lz4.frame.compress(data)
+    except Exception as e:
+        logger.debug(f"Compression failed, using original data: {e}")
+        return data
+
+def decompress_feature_data(data: bytes) -> bytes:
+    """Decompress feature data using lz4"""
+    try:
+        return lz4.frame.decompress(data)
+    except Exception as e:
+        logger.debug(f"Decompression failed, using original data: {e}")
+        return data
+
+def precompute_tile_bounds_for_zoom(zoom_level: int, bounds: Tuple[float, float, float, float]) -> Set[Tuple[int, int]]:
+    """
+    Pre-compute all valid tile coordinates for a zoom level within given bounds.
+    
+    Args:
+        zoom_level: Zoom level to compute tiles for
+        bounds: (min_lon, min_lat, max_lon, max_lat) bounds
+    
+    Returns:
+        Set of (tile_x, tile_y) coordinates
+    """
+    min_lon, min_lat, max_lon, max_lat = bounds
+    
+    # Calculate tile bounds
+    min_tile_x, max_tile_y = deg2num(max_lat, min_lon, zoom_level)
+    max_tile_x, min_tile_y = deg2num(min_lat, max_lon, zoom_level)
+    
+    # Generate all tile coordinates within bounds
+    tiles = set()
+    for tile_x in range(min_tile_x, max_tile_x + 1):
+        for tile_y in range(min_tile_y, max_tile_y + 1):
+            tiles.add((tile_x, tile_y))
+    
+    return tiles
+
+
 def optimized_file_write(filepath: str, data: bytes, buffer_size: int = None) -> None:
     """
     Optimized file write with buffering and error handling.
@@ -921,7 +1164,6 @@ def create_directory_structure(base_path: str, tile_coords: List[Tuple[int, int]
 
 
 
-def optimized_tile_latlon_bounds(tile_x: int, tile_y: int, zoom: int, pixel_margin: int = 0) -> Tuple[float, float, float, float]:
     """
     Calculate tile bounds for lat/lon coordinates.
     
@@ -958,37 +1200,6 @@ def optimized_tile_latlon_bounds(tile_x: int, tile_y: int, zoom: int, pixel_marg
     
     return (lon_min, lat_min, lon_max, lat_max)
 
-
-def optimized_coords_to_pixel_coords_uint16(coords: List[Tuple[float, float]], zoom: int, tile_x: int, tile_y: int) -> List[Tuple[int, int]]:
-    """
-    Convert coordinates to pixel coordinates within a tile.
-    
-    Args:
-        coords: List of (lon, lat) coordinate tuples
-        zoom: Zoom level
-        tile_x: Tile X coordinate
-        tile_y: Tile Y coordinate
-        
-    Returns:
-        List of (x, y) pixel coordinate tuples
-    """
-    n = 2.0 ** zoom
-    pixel_coords = []
-    
-    for coord in coords:
-        lon, lat = coord
-        
-        # Calculate pixel coordinates
-        x = int(((lon + 180.0) / 360.0 * n - tile_x) * Config.TILE_SIZE)
-        y = int(((1.0 - math.log(math.tan(math.radians(lat)) + 1 / math.cos(math.radians(lat))) / math.pi) / 2.0 * n - tile_y) * Config.TILE_SIZE)
-        
-        # Clamp coordinates to tile bounds
-        x = max(0, min(Config.TILE_SIZE - 1, x))
-        y = max(0, min(Config.TILE_SIZE - 1, y))
-        
-        pixel_coords.append((x, y))
-    
-    return pixel_coords
 
 
 def clear_algorithm_caches():
@@ -1360,10 +1571,11 @@ def ensure_closed_ring(ring):
     return ring
 
 def geometry_to_draw_commands(geom, color, tags, zoom, tile_x, tile_y, simplify_tolerance=None, hex_color=None):
-    commands = []
+    # Get commands list from pool
+    commands = memory_pool.get_coords()  # Reuse coords pool for commands list
     
     def process_geom(g):
-        local_cmds = []
+        local_cmds = memory_pool.get_coords()  # Reuse coords pool for local commands
         if g.is_empty:
             return local_cmds
         
@@ -1373,18 +1585,20 @@ def geometry_to_draw_commands(geom, color, tags, zoom, tile_x, tile_y, simplify_
             exterior_pixels = coords_to_pixel_coords_uint16(exterior, zoom, tile_x, tile_y)
             exterior_pixels = ensure_closed_ring(exterior_pixels)
             if len(set(exterior_pixels)) >= 3:
-                # Intentar detectar formas simples primero
+                # Try to detect simple shapes first
                 simple_shape = detect_simple_shapes(g, exterior_pixels)
                 if simple_shape:
-                    # Usar comando optimizado para forma simple
-                    cmd = simple_shape.copy()
+                    # Use optimized command for simple shape
+                    cmd = memory_pool.get_command()
+                    cmd.update(simple_shape)
                     cmd['color'] = color
                     if hex_color:
                         cmd['color_hex'] = hex_color
                     local_cmds.append(cmd)
                 else:
-                    # Usar STROKE_POLYGON para polígonos sin relleno (solo contorno)
-                    cmd = {'type': DRAW_COMMANDS['STROKE_POLYGON'], 'points': exterior_pixels, 'color': color}
+                    # Use STROKE_POLYGON for polygons without fill (contour only)
+                    cmd = memory_pool.get_command()
+                    cmd.update({'type': DRAW_COMMANDS['STROKE_POLYGON'], 'points': exterior_pixels, 'color': color})
                     if hex_color:
                         cmd['color_hex'] = hex_color
                 local_cmds.append(cmd)
@@ -1394,18 +1608,20 @@ def geometry_to_draw_commands(geom, color, tags, zoom, tile_x, tile_y, simplify_
                 exterior_pixels = coords_to_pixel_coords_uint16(exterior, zoom, tile_x, tile_y)
                 exterior_pixels = ensure_closed_ring(exterior_pixels)
                 if len(set(exterior_pixels)) >= 3:
-                    # Intentar detectar formas simples primero
+                    # Try to detect simple shapes first
                     simple_shape = detect_simple_shapes(poly, exterior_pixels)
                     if simple_shape:
-                        # Usar comando optimizado para forma simple
-                        cmd = simple_shape.copy()
+                        # Use optimized command for simple shape
+                        cmd = memory_pool.get_command()
+                        cmd.update(simple_shape)
                         cmd['color'] = color
                         if hex_color:
                             cmd['color_hex'] = hex_color
                         local_cmds.append(cmd)
                     else:
-                        # Usar STROKE_POLYGON para polígonos sin relleno (solo contorno)
-                        cmd = {'type': DRAW_COMMANDS['STROKE_POLYGON'], 'points': exterior_pixels, 'color': color}
+                        # Use STROKE_POLYGON for polygons without fill (contour only)
+                        cmd = memory_pool.get_command()
+                        cmd.update({'type': DRAW_COMMANDS['STROKE_POLYGON'], 'points': exterior_pixels, 'color': color})
                         if hex_color:
                             cmd['color_hex'] = hex_color
                     local_cmds.append(cmd)
@@ -1419,8 +1635,9 @@ def geometry_to_draw_commands(geom, color, tags, zoom, tile_x, tile_y, simplify_
             is_closed = coords[0] == coords[-1]
             if is_closed and is_area(tags):
                 if len(set(pixel_coords)) >= 3:
-                    # Usar STROKE_POLYGON para líneas cerradas que son áreas (sin relleno)
-                    cmd = {'type': DRAW_COMMANDS['STROKE_POLYGON'], 'points': pixel_coords, 'color': color}
+                    # Use STROKE_POLYGON for closed lines that are areas (without fill)
+                    cmd = memory_pool.get_command()
+                    cmd.update({'type': DRAW_COMMANDS['STROKE_POLYGON'], 'points': pixel_coords, 'color': color})
                 if hex_color:
                     cmd['color_hex'] = hex_color
                 local_cmds.append(cmd)
@@ -1428,7 +1645,8 @@ def geometry_to_draw_commands(geom, color, tags, zoom, tile_x, tile_y, simplify_
                 if len(pixel_coords) == 2:
                     x1, y1 = pixel_coords[0]
                     x2, y2 = pixel_coords[1]
-                    cmd = {'color': color}
+                    cmd = memory_pool.get_command()
+                    cmd.update({'color': color})
                     if hex_color:
                         cmd['color_hex'] = hex_color
                     if y1 == y2:
@@ -1439,7 +1657,8 @@ def geometry_to_draw_commands(geom, color, tags, zoom, tile_x, tile_y, simplify_
                         cmd.update({'type': DRAW_COMMANDS['LINE'], 'x1': x1, 'y1': y1, 'x2': x2, 'y2': y2})
                     local_cmds.append(cmd)
                 else:
-                    cmd = {'type': DRAW_COMMANDS['POLYLINE'], 'points': pixel_coords, 'color': color}
+                    cmd = memory_pool.get_command()
+                    cmd.update({'type': DRAW_COMMANDS['POLYLINE'], 'points': pixel_coords, 'color': color})
                     if hex_color:
                         cmd['color_hex'] = hex_color
                     local_cmds.append(cmd)
@@ -1453,29 +1672,18 @@ def geometry_to_draw_commands(geom, color, tags, zoom, tile_x, tile_y, simplify_
     
     if hasattr(geom, "is_valid") and not geom.is_empty:
         # Add layer command at the beginning (using priority from features.json)
-        layer_cmd = {
+        layer_cmd = memory_pool.get_command()
+        layer_cmd.update({
             'type': DRAW_COMMANDS['SET_LAYER'],  # SET_LAYER
             'layer': get_layer_from_priority(tags)
-        }
+        })
         commands.append(layer_cmd)
         
         commands.extend(process_geom(geom))
     return commands
 
-def build_ogr2ogr_where_clause_from_config(config, allowed_fields):
-    conds = []
-    for k, v in config.items():
-        if "=" in k:
-            key, val = k.split("=", 1)
-            if key in allowed_fields:
-                conds.append(f'("{key}" = \'{val}\')')
-        else:
-            if k in allowed_fields:
-                conds.append(f'("{k}" IS NOT NULL)')
-    where_clause = " OR ".join(conds)
-    return where_clause
-
 def get_config_fields(config):
+    """Extract field names from configuration"""
     fields = set()
     for k in config.keys():
         if "=" in k:
@@ -1921,7 +2129,7 @@ def process_layer_streaming_from_pbf(pbf_file: str, layer: str, where_clause: st
             except Exception as e:
                 logger.debug(f"Could not remove temporary file {tmp_filename}: {e}")
 
-def process_pbf_directly_to_database(pbf_file: str, config: Dict[str, Any], db_path: str, zoom_levels: List[int]) -> int:
+def process_pbf_directly_to_database(pbf_file: str, config: Dict[str, Any], db_path: str, zoom_levels: List[int], resources: Dict[str, Any] = None) -> int:
     """Process PBF directly to database using Pyosmium for maximum performance"""
     logger.info("Processing PBF directly to database using Pyosmium (maximum performance)")
     
@@ -1951,18 +2159,28 @@ def process_pbf_directly_to_database(pbf_file: str, config: Dict[str, Any], db_p
                 total_features_processed = handler.features_processed
                 logger.info(f"Pyosmium processing completed in {processing_time:.2f}s")
                 logger.info(f"Total processed: {total_features_processed} features directly from PBF")
-                
-                # Print statistics for each zoom level
-                for zoom in zoom_levels:
-                    count = db.count_features_for_zoom(zoom)
-                    logger.info(f"Zoom {zoom}: {count} features stored")
-                
-                return total_features_processed
-                
             except Exception as e:
-                logger.error(f"Pyosmium processing failed: {e}")
-                logger.info("Falling back to ogr2ogr method...")
-                return process_pbf_directly_to_database_fallback(pbf_file, config, db_path, zoom_levels)
+                logger.error(f"Error during PBF processing: {e}")
+                raise
+            
+            # Print statistics for each zoom level with table
+            table_data = []
+            total_features = 0
+            for zoom in sorted(zoom_levels):
+                count = db.count_features_for_zoom(zoom)
+                total_features += count
+                table_data.append([zoom, f"{count:,}", f"Level {zoom}"])
+            
+            # Add total row
+            table_data.append(["TOTAL", f"{total_features:,}", "All levels combined"])
+            
+            print(tabulate(table_data, 
+                         headers=["Zoom", "Features", "Description"], 
+                         tablefmt="grid", 
+                         stralign="left", 
+                         numalign="right"))
+            
+            return total_features_processed
 
 class OSMFeatureHandler:
     """Pyosmium handler for processing OSM features directly from PBF files"""
@@ -1975,6 +2193,13 @@ class OSMFeatureHandler:
         self.features_processed = 0
         self.batch_features = []
         self.batch_size = 1000  # Process in batches for memory efficiency
+        
+        # Progress tracking
+        self.total_features_scanned = 0
+        self.total_features_filtered = 0
+        self.start_time = time.time()
+        self.last_progress_time = time.time()
+        self.progress_interval = 1.0  # Show progress every 1 second
         
         # Pre-compile tag patterns for performance
         self.tag_patterns = self._compile_tag_patterns()
@@ -2012,6 +2237,16 @@ class OSMFeatureHandler:
         self.batch_features = []
         self.features_processed = 0
     
+    def _update_progress(self):
+        """Update and display progress information"""
+        current_time = time.time()
+        if current_time - self.last_progress_time >= self.progress_interval:
+            elapsed_time = current_time - self.start_time
+            features_per_second = self.total_features_scanned / elapsed_time if elapsed_time > 0 else 0
+            
+            print(f"\r📊 Progress: {self.total_features_scanned:,} scanned, {self.total_features_filtered:,} filtered, {features_per_second:.0f} features/s, {elapsed_time:.1f}s elapsed", end='', flush=True)
+            self.last_progress_time = current_time
+    
     def _should_process_feature(self, tags: Dict[str, str]) -> Optional[Dict[str, Any]]:
         """Check if feature should be processed based on tags and config"""
         for pattern_key, pattern in self.tag_patterns.items():
@@ -2041,6 +2276,9 @@ class OSMFeatureHandler:
     
     def way(self, w):
         """Process OSM way (lines, polygons)"""
+        # Update progress counter
+        self.total_features_scanned += 1
+        
         if not w.tags:
             return
         
@@ -2051,6 +2289,12 @@ class OSMFeatureHandler:
         style_config = self._should_process_feature(tags)
         if not style_config:
             return
+        
+        # Update filtered counter
+        self.total_features_filtered += 1
+        
+        # Update progress display
+        self._update_progress()
         
         # Filter tags to only include config fields
         filtered_tags = {k: v for k, v in tags.items() if k in self.config_fields}
@@ -2109,6 +2353,9 @@ class OSMFeatureHandler:
     
     def relation(self, r):
         """Process OSM relation (multipolygons, etc.)"""
+        # Update progress counter
+        self.total_features_scanned += 1
+        
         if not r.tags:
             return
         
@@ -2119,6 +2366,12 @@ class OSMFeatureHandler:
         style_config = self._should_process_feature(tags)
         if not style_config:
             return
+        
+        # Update filtered counter
+        self.total_features_filtered += 1
+        
+        # Update progress display
+        self._update_progress()
         
         # Filter tags to only include config fields
         filtered_tags = {k: v for k, v in tags.items() if k in self.config_fields}
@@ -2213,6 +2466,12 @@ class OSMFeatureHandler:
         
         # Process any remaining features in batch
         self._process_feature_batch()
+        
+        # Final progress message with 100% completion
+        elapsed_time = time.time() - self.start_time
+        features_per_second = self.total_features_scanned / elapsed_time if elapsed_time > 0 else 0
+        print(f"\r📊 Progress: {self.total_features_scanned:,} scanned, {self.total_features_filtered:,} filtered (100.0%), {features_per_second:.0f} features/s, {elapsed_time:.1f}s elapsed", end='', flush=True)
+        print()  # New line after final progress
 
 def process_pbf_directly_to_database_fallback(pbf_file: str, config: Dict[str, Any], db_path: str, zoom_levels: List[int]) -> int:
     """Fallback method using ogr2ogr (original implementation)"""
@@ -2254,27 +2513,39 @@ def process_pbf_directly_to_database_fallback(pbf_file: str, config: Dict[str, A
             
             logger.info(f"Total processed: {total_features_processed} features directly from PBF")
             
-            # Print statistics for each zoom level
-            for zoom in zoom_levels:
+            # Print statistics for each zoom level with table
+            table_data = []
+            total_features = 0
+            for zoom in sorted(zoom_levels):
                 count = db.count_features_for_zoom(zoom)
-                logger.info(f"Zoom {zoom}: {count} features stored")
+                total_features += count
+                table_data.append([zoom, f"{count:,}", f"Level {zoom}"])
+            
+            # Add total row
+            table_data.append(["TOTAL", f"{total_features:,}", "All levels combined"])
+            
+            print(tabulate(table_data, 
+                         headers=["Zoom", "Features", "Description"], 
+                         tablefmt="grid", 
+                         stralign="left", 
+                         numalign="right"))
             
             return total_features_processed
 
 
 def detect_simple_shapes(geometry, pixel_coords: List[Tuple[int, int]]) -> Optional[Dict]:
-    """Detecta formas simples que pueden usar comandos optimizados"""
+    """Detect simple shapes that can use optimized commands"""
     if len(pixel_coords) < 3:
         return None
     
-    # Detectar rectángulo
+    # Detect rectangle
     if len(pixel_coords) == 4:
         px_coords = [p[0] for p in pixel_coords]
         py_coords = [p[1] for p in pixel_coords]
         min_x, max_x = min(px_coords), max(px_coords)
         min_y, max_y = min(py_coords), max(py_coords)
         
-        # Verificar si es un rectángulo perfecto
+        # Check if it's a perfect rectangle
         if (min_x, min_y) in pixel_coords and (max_x, min_y) in pixel_coords and \
            (max_x, max_y) in pixel_coords and (min_x, max_y) in pixel_coords:
             return {
@@ -2285,7 +2556,7 @@ def detect_simple_shapes(geometry, pixel_coords: List[Tuple[int, int]]) -> Optio
                 'height': max_y - min_y
             }
     
-    # Detectar triángulo
+    # Detect triangle
     if len(pixel_coords) == 3:
         return {
             'type': DRAW_COMMANDS['SIMPLE_TRIANGLE'],
@@ -2297,18 +2568,18 @@ def detect_simple_shapes(geometry, pixel_coords: List[Tuple[int, int]]) -> Optio
             'y3': pixel_coords[2][1]
         }
     
-    # Detectar círculo aproximado
-    if len(pixel_coords) >= 8:  # Círculo necesita al menos 8 puntos
+    # Detect approximate circle
+    if len(pixel_coords) >= 8:  # Circle needs at least 8 points
         px_coords = [p[0] for p in pixel_coords]
         py_coords = [p[1] for p in pixel_coords]
         center_x = sum(px_coords) // len(px_coords)
         center_y = sum(py_coords) // len(py_coords)
         
-        # Calcular radio promedio
+        # Calculate average radius
         distances = [((x - center_x)**2 + (y - center_y)**2)**0.5 for x, y in pixel_coords]
         avg_radius = sum(distances) / len(distances)
         
-        # Verificar si es aproximadamente circular (variación del radio < 20%)
+        # Check if it's approximately circular (radius variation < 20%)
         radius_variation = max(distances) - min(distances)
         if radius_variation < avg_radius * 0.2:
             return {
@@ -2322,10 +2593,10 @@ def detect_simple_shapes(geometry, pixel_coords: List[Tuple[int, int]]) -> Optio
 
 
 def get_layer_from_priority(tags: Dict[str, str]) -> int:
-    """Obtiene la capa basada en la prioridad del features.json"""
-    # Si no hay configuración cargada, usar lógica simple
+    """Get layer based on priority from features.json"""
+    # If no configuration is loaded, use simple logic
     if not hasattr(Config, 'FEATURES_CONFIG') or not Config.FEATURES_CONFIG:
-        # Lógica simple basada en el tipo de feature
+        # Simple logic based on feature type
         if 'building' in tags:
             return RENDER_LAYERS['BUILDINGS']
         elif 'highway' in tags:
@@ -2369,32 +2640,143 @@ def get_layer_from_priority(tags: Dict[str, str]) -> int:
     # Fallback
     return RENDER_LAYERS['TERRAIN']
 
-def hex_to_rgb332(hex_color: str) -> int:
-    """Convierte color hex a RGB332 optimizado"""
-    try:
-        if not hex_color or not isinstance(hex_color, str) or not hex_color.startswith("#"):
-            return 0xFF
-        r = int(hex_color[1:3], 16)
-        g = int(hex_color[3:5], 16)
-        b = int(hex_color[5:7], 16)
-        return ((r & 0xE0) | ((g & 0xE0) >> 3) | (b >> 6))
-    except (ValueError, TypeError) as e:
-        # Invalid color format - use default white color
-        return 0xFF
-
-
-# Inicializar configuración
+# Initialize configuration
 try:
     Config.FEATURES_CONFIG = json.load(open('features.json', 'r'))
 except FileNotFoundError:
     logger.warning("features.json not found, using default configuration")
     Config.FEATURES_CONFIG = {}
 
+def process_geometry_batch(geometries: List[Dict], zoom: int, tile_x: int, tile_y: int, simplify_tolerance: float) -> List[Dict]:
+    """
+    Process a batch of geometries efficiently, maintaining layer order and priorities.
+    
+    Args:
+        geometries: List of geometry dictionaries with 'geom', 'color', 'tags', 'priority', 'color_hex'
+        zoom: Zoom level
+        tile_x: Tile X coordinate
+        tile_y: Tile Y coordinate
+        simplify_tolerance: Simplify tolerance for zoom level
+        
+    Returns:
+        List of draw commands
+    """
+    batch_commands = []
+    
+    # Group geometries by type for efficient processing
+    polygons = []
+    linestrings = []
+    other_geoms = []
+    
+    for geom_data in geometries:
+        geom = geom_data['geom']
+        if geom.geom_type == "Polygon":
+            polygons.append(geom_data)
+        elif geom.geom_type == "LineString":
+            linestrings.append(geom_data)
+        else:
+            other_geoms.append(geom_data)
+    
+    # Process polygons in batch (most common and expensive)
+    if polygons:
+        polygon_commands = process_polygon_batch(polygons, zoom, tile_x, tile_y, simplify_tolerance)
+        batch_commands.extend(polygon_commands)
+    
+    # Process linestrings in batch
+    if linestrings:
+        linestring_commands = process_linestring_batch(linestrings, zoom, tile_x, tile_y, simplify_tolerance)
+        batch_commands.extend(linestring_commands)
+    
+    # Process other geometries individually (less common)
+    for geom_data in other_geoms:
+        cmds = geometry_to_draw_commands(
+            geom_data["geom"], geom_data["color"], geom_data["tags"], zoom, tile_x, tile_y,
+            simplify_tolerance=simplify_tolerance, hex_color=geom_data.get("color_hex")
+        )
+        batch_commands.extend(cmds)
+    
+    return batch_commands
+
+def process_polygon_batch(polygons: List[Dict], zoom: int, tile_x: int, tile_y: int, simplify_tolerance: float) -> List[Dict]:
+    """Process a batch of polygons efficiently"""
+    commands = []
+    
+    for geom_data in polygons:
+        geom = geom_data['geom']
+        color = geom_data['color']
+        hex_color = geom_data.get('color_hex')
+        
+        if geom.is_empty:
+            continue
+            
+        # Process exterior ring
+        exterior = remove_duplicate_points(list(geom.exterior.coords))
+        exterior_pixels = coords_to_pixel_coords_uint16(exterior, zoom, tile_x, tile_y)
+        exterior_pixels = ensure_closed_ring(exterior_pixels)
+        
+        if len(set(exterior_pixels)) >= 3:
+            # Try to detect simple shapes first
+            simple_shape = detect_simple_shapes(geom, exterior_pixels)
+            if simple_shape:
+                # Use optimized command for simple shape
+                cmd = simple_shape.copy()
+                cmd['color'] = color
+                if hex_color:
+                    cmd['color_hex'] = hex_color
+                commands.append(cmd)
+            else:
+                # Use STROKE_POLYGON for polygons without fill (contour only)
+                cmd = {'type': DRAW_COMMANDS['STROKE_POLYGON'], 'points': exterior_pixels, 'color': color}
+                if hex_color:
+                    cmd['color_hex'] = hex_color
+                commands.append(cmd)
+    
+    return commands
+
+def process_linestring_batch(linestrings: List[Dict], zoom: int, tile_x: int, tile_y: int, simplify_tolerance: float) -> List[Dict]:
+    """Process a batch of linestrings efficiently"""
+    commands = []
+    
+    for geom_data in linestrings:
+        geom = geom_data['geom']
+        color = geom_data['color']
+        hex_color = geom_data.get('color_hex')
+        
+        if geom.is_empty:
+            continue
+            
+        coords = remove_duplicate_points(list(geom.coords))
+        pixel_coords = coords_to_pixel_coords_uint16(coords, zoom, tile_x, tile_y)
+        
+        if len(pixel_coords) >= 2:
+            # Try to detect simple lines (horizontal/vertical)
+            if len(pixel_coords) == 2:
+                x1, y1 = pixel_coords[0]
+                x2, y2 = pixel_coords[1]
+                cmd = {'color': color}
+                if hex_color:
+                    cmd['color_hex'] = hex_color
+                    
+                if y1 == y2:
+                    cmd.update({'type': DRAW_COMMANDS['HORIZONTAL_LINE'], 'x1': x1, 'x2': x2, 'y': y1})
+                elif x1 == x2:
+                    cmd.update({'type': DRAW_COMMANDS['VERTICAL_LINE'], 'x': x1, 'y1': y1, 'y2': y2})
+                else:
+                    cmd.update({'type': DRAW_COMMANDS['LINE'], 'x1': x1, 'y1': y1, 'x2': x2, 'y2': y2})
+                commands.append(cmd)
+            else:
+                cmd = {'type': DRAW_COMMANDS['POLYLINE'], 'points': pixel_coords, 'color': color}
+                if hex_color:
+                    cmd['color_hex'] = hex_color
+                commands.append(cmd)
+    
+    return commands
+
 def tile_worker(args):
     start_time = time.time()
     x, y, feats, zoom, output_dir, max_file_size, simplify_tolerance = args
 
-    # Agrupar features por capa para orden correcto de renderizado
+    # Group features by layer for correct rendering order
     features_by_layer = {}
     for feat in feats:
         layer = get_layer_from_priority(feat.get("tags", {}))
@@ -2402,24 +2784,19 @@ def tile_worker(args):
             features_by_layer[layer] = []
         features_by_layer[layer].append(feat)
     
-    # Ordenar features dentro de cada capa por prioridad
+    # Sort features within each layer by priority
     for layer in features_by_layer:
         features_by_layer[layer].sort(key=lambda f: f.get("priority", 5))
 
     all_commands = []
     
-    # Procesar capas en orden de renderizado (0=TERRAIN, 1=WATER, 2=BUILDINGS, etc.)
+    # Process layers in rendering order (0=TERRAIN, 1=WATER, 2=BUILDINGS, etc.)
     for layer in sorted(features_by_layer.keys()):
         layer_features = features_by_layer[layer]
         
-        for feat in layer_features:
-            # Get hex color if available
-            hex_color = feat.get("color_hex")
-            cmds = geometry_to_draw_commands(
-                feat["geom"], feat["color"], feat["tags"], zoom, x, y, 
-                simplify_tolerance=simplify_tolerance, hex_color=hex_color
-            )
-            all_commands.extend(cmds)
+        # Process layer as a batch for better performance
+        layer_commands = process_geometry_batch(layer_features, zoom, x, y, simplify_tolerance)
+        all_commands.extend(layer_commands)
 
     # Apply palette optimization to all commands
     optimized_commands, bytes_saved = insert_palette_commands(all_commands)
@@ -2458,25 +2835,33 @@ def tile_worker(args):
 
     tile_size = len(buffer)
     
+    # Clean up memory pool periodically
+    if tile_size % 100 == 0:  # Every 100 tiles
+        memory_pool.point_pool.clear()
+        memory_pool.command_pool.clear()
+        memory_pool.coord_pool.clear()
+        memory_pool.feature_pool.clear()
+    
     del all_commands, optimized_commands, buffer, feats
     gc.collect()
     
     elapsed = time.time() - start_time
     return tile_size, elapsed
 
-def write_tile_batch(batch, output_dir, zoom, max_file_size, simplify_tolerance):
+def write_tile_batch(batch, output_dir, zoom, max_file_size, simplify_tolerance, resources=None):
     """Write a batch of tiles with simple parallel processing"""
     tile_sizes = []
     
     # Monitor memory and get optimal settings
-    optimal_workers, optimal_batch_size, memory_pressure = monitor_memory_and_adjust()
+    optimal_workers, optimal_batch_size, memory_pressure = monitor_memory_and_adjust(resources)
     
     # Use simple worker count based on memory pressure
     batch_workers = min(optimal_workers, len(batch), Config.MAX_WORKERS)
     batch_workers = max(1, batch_workers)
     
-    logger.info(f"Processing batch of {len(batch)} tiles with {batch_workers} workers "
-               f"(memory pressure: {memory_pressure})")
+    # Use debug level to avoid cluttering the progress bar
+    logger.debug(f"Processing batch of {len(batch)} tiles with {batch_workers} workers "
+                f"(memory pressure: {memory_pressure})")
     
     # Use ProcessPoolExecutor for parallelization
     with ProcessPoolExecutor(max_workers=batch_workers) as executor:
@@ -2491,61 +2876,59 @@ def write_tile_batch(batch, output_dir, zoom, max_file_size, simplify_tolerance)
     
     return tile_sizes
 
-def generate_tiles_from_database(db_path: str, output_dir: str, zoom: int, max_file_size: int = 65536) -> None:
+def generate_tiles_from_database(db_path: str, output_dir: str, zoom: int, max_file_size: int = 65536, resources: Dict[str, Any] = None) -> dict:
     """Generate tiles for a specific zoom level from the database"""
     logger.info(f"Processing zoom level {zoom} from database")
     
     with managed_database(db_path) as db:
         with memory_management():
-            # Get all tiles for this zoom level
-            tiles = db.get_tiles_for_zoom(zoom)
-            if not tiles:
+            # Get tile count for progress tracking
+            tile_count = len(db.get_tiles_for_zoom(zoom))
+            if tile_count == 0:
                 logger.warning(f"No tiles found for zoom {zoom}")
-                return
+                return {'tiles': 0, 'avg_size': 0}
             
-            logger.info(f"Found {len(tiles)} tiles for zoom {zoom}")
+            logger.info(f"Found {tile_count} tiles for zoom {zoom}")
             
-            # Load all tile data first for complexity analysis
-            all_tile_data = []
-            for (tile_x, tile_y) in tiles:
-                features = db.get_features_for_tile(zoom, tile_x, tile_y)
-                if features:
-                    all_tile_data.append((tile_x, tile_y, features))
-            
-            if not all_tile_data:
-                logger.warning(f"No features found for zoom {zoom}")
-                return
-            
-            # Monitor memory before creating batches
-            memory_info = get_memory_usage()
-            logger.info(f"Memory status before batch creation: {memory_info['used']:.1f}MB used "
-                       f"({memory_info['percent']:.1f}%), {memory_info['available']:.1f}MB available")
-            
-            # Create simple batches
-            optimized_batches = create_optimized_tile_batches(all_tile_data)
-            
-            # Pre-create directory structure for all tiles
-            tile_coords = [(x, y) for x, y, _ in all_tile_data]
-            create_directory_structure(os.path.join(output_dir, str(zoom)), tile_coords)
-            
-            # Process optimized batches
+            # Process tiles in streaming batches to reduce memory usage
             all_tile_sizes = []
-            total_tiles = len(all_tile_data)
+            processed_tiles = 0
             
-            with tqdm(total=total_tiles, desc=f"Writing tiles (zoom {zoom})") as pbar:
-                for batch_idx, batch_tile_data in enumerate(optimized_batches):
-                    # Convert tile data to job format
+            # Create batches of tiles for processing
+            tile_batch_size = resources.get('tile_batch_size', 1000) if resources else 1000
+            tile_batches = []
+            current_batch = []
+            
+            # Stream tiles and create batches
+            for (tile_x, tile_y) in db.stream_tiles_for_zoom(zoom):
+                current_batch.append((tile_x, tile_y))
+                if len(current_batch) >= tile_batch_size:
+                    tile_batches.append(current_batch)
+                    current_batch = []
+            
+            # Add remaining tiles
+            if current_batch:
+                tile_batches.append(current_batch)
+            
+            # Process tiles in streaming batches
+            with tqdm(total=tile_count, desc=f"Writing tiles (zoom {zoom})") as pbar:
+                for batch_idx, tile_batch in enumerate(tile_batches):
+                    # Process each batch of tiles
                     batch_jobs = []
-                    for (tile_x, tile_y, features) in batch_tile_data:
-                        batch_jobs.append((tile_x, tile_y, features, zoom, output_dir, max_file_size, None))
+                    for (tile_x, tile_y) in tile_batch:
+                        # Stream features for this tile
+                        features = list(db.stream_features_for_tile(zoom, tile_x, tile_y))
+                        if features:
+                            batch_jobs.append((tile_x, tile_y, features, zoom, output_dir, max_file_size, None))
                     
                     if batch_jobs:
-                        # Write this optimized batch
+                        # Write this batch
                         with resource_monitor():
-                            batch_sizes = write_tile_batch(batch_jobs, output_dir, zoom, max_file_size, None)
+                            batch_sizes = write_tile_batch(batch_jobs, output_dir, zoom, max_file_size, None, resources)
                         all_tile_sizes.extend(batch_sizes)
+                        processed_tiles += len(batch_jobs)
                     
-                    pbar.update(len(batch_tile_data))
+                    pbar.update(len(tile_batch))
                     
                     # Monitor memory after each batch
                     if batch_idx % 5 == 0:  # Check every 5 batches
@@ -2560,7 +2943,8 @@ def generate_tiles_from_database(db_path: str, output_dir: str, zoom: int, max_f
                         pass
             
             avg_tile_size = sum(all_tile_sizes) / len(all_tile_sizes) if all_tile_sizes else 0
-            logger.info(f"Zoom {zoom}: {len(all_tile_sizes)} tiles, average size = {avg_tile_size:.2f} bytes")
+            # Return statistics
+            return {'tiles': len(all_tile_sizes), 'avg_size': avg_tile_size}
 
 def precompute_global_color_palette(config: Dict[str, Any]) -> int:
     global GLOBAL_COLOR_PALETTE, GLOBAL_INDEX_TO_RGB332
@@ -2612,11 +2996,27 @@ def write_palette_bin(output_dir):
     palette_path = os.path.join(output_dir, "palette.bin")
     logger.info(f"Writing palette to {palette_path} ({len(GLOBAL_INDEX_TO_RGB332)} colors)")
     
-    # Pre-build palette data for optimized write - write RGB332 values in sequential order
-    palette_data = bytearray(256)  # Always 256 bytes for palette
-    for index, rgb332_value in GLOBAL_INDEX_TO_RGB332.items():
-        if index < 256:  # Safety check
-            palette_data[index] = rgb332_value
+    # Write palette in the format expected by tile_viewer.py:
+    # 4 bytes: number of colors (little-endian)
+    # 3 bytes per color: RGB888 values
+    num_colors = len(GLOBAL_INDEX_TO_RGB332)
+    
+    # Create palette data
+    palette_data = bytearray()
+    palette_data.extend(struct.pack('<I', num_colors))  # Header: number of colors
+    
+    # Write RGB888 colors in index order
+    for index in range(num_colors):
+        if index in GLOBAL_INDEX_TO_RGB332:
+            rgb332 = GLOBAL_INDEX_TO_RGB332[index]
+            # Convert RGB332 to RGB888 (proper bit expansion)
+            r = (rgb332 & 0xE0) | ((rgb332 & 0xE0) >> 3) | ((rgb332 & 0xE0) >> 6)  # Expand 3 bits to 8
+            g = ((rgb332 & 0x1C) << 3) | ((rgb332 & 0x1C) >> 2) | ((rgb332 & 0x1C) << 1)  # Expand 3 bits to 8
+            b = ((rgb332 & 0x03) << 6) | ((rgb332 & 0x03) << 4) | ((rgb332 & 0x03) << 2) | (rgb332 & 0x03)  # Expand 2 bits to 8
+            palette_data.extend([r, g, b])
+        else:
+            # Default color if index not found
+            palette_data.extend([255, 255, 255])
     
     optimized_file_write(palette_path, bytes(palette_data))
     
@@ -2641,6 +3041,7 @@ def main() -> None:
     Example:
         python tile_generator_direct.py data.osm.pbf tiles/ features.json --zoom 6-17
     """
+    script_start_time = time.time()
     parser = argparse.ArgumentParser(description="OSM vector tile generator (direct processing with database)")
     parser.add_argument("pbf_file", help="Path to .pbf file")
     parser.add_argument("output_dir", help="Output directory")
@@ -2662,17 +3063,24 @@ def main() -> None:
         
         logger.info("All input parameters validated successfully")
         
-        # Display initial system information
+        # Display initial system information with dynamic resource allocation
         memory_info = get_memory_usage()
-        cpu_count = os.cpu_count() or 4
-        max_workers = Config.MAX_WORKERS
+        
+        # Calculate dynamic resources based on 70% of total system memory
+        resources = calculate_dynamic_resources()
+        max_workers = resources['max_workers']
+        db_batch_size = resources['db_batch_size']
+        tile_batch_size = resources['tile_batch_size']
+        worker_memory_limit = resources['worker_memory_limit']
         
         logger.info(f"System information:")
-        logger.info(f"  CPU cores: {cpu_count}")
+        logger.info(f"  CPU cores: {max_workers}")
         logger.info(f"  Max workers: {max_workers}")
-        logger.info(f"  Total memory: {memory_info['total']:.1f}MB")
-        logger.info(f"  Available memory: {memory_info['available']:.1f}MB")
-        logger.info(f"  Memory usage: {memory_info['percent']:.1f}%")
+        logger.info(f"  DB batch size: {db_batch_size:,}")
+        logger.info(f"  Tile batch size: {tile_batch_size:,}")
+        logger.info(f"  Total memory: {resources['total_memory_mb']:.1f}MB")
+        logger.info(f"  Allocated memory: {resources['available_memory_mb']:.1f}MB (70% of total)")
+        logger.info(f"  Worker memory limit: {worker_memory_limit:.1f}MB per worker")
         logger.info(f"  Memory pressure: {get_memory_pressure()}")
         
     except (FileNotFoundError, ValueError, PermissionError) as e:
@@ -2706,12 +3114,37 @@ def main() -> None:
     write_palette_bin(args.output_dir)
 
     # Process features directly from PBF to database (no intermediate GeoJSON)
-    process_pbf_directly_to_database(args.pbf_file, config, args.db_path, zoom_levels)
+    process_pbf_directly_to_database(args.pbf_file, config, args.db_path, zoom_levels, resources)
 
-    # Generate tiles for each zoom level from database
+    # Generate tiles for each zoom level from database and collect statistics
+    all_zoom_stats = {}
     for zoom in zoom_levels:
-        generate_tiles_from_database(args.db_path, args.output_dir, zoom, max_file_size)
+        stats = generate_tiles_from_database(args.db_path, args.output_dir, zoom, max_file_size, resources)
+        all_zoom_stats[zoom] = stats
         gc.collect()
+    
+    # Print final statistics table
+    table_data = []
+    total_tiles = 0
+    for zoom in sorted(zoom_levels):
+        stats = all_zoom_stats.get(zoom, {'tiles': 0, 'avg_size': 0})
+        tiles = stats['tiles']
+        avg_size = stats['avg_size']
+        total_tiles += tiles
+        
+        if tiles > 0:
+            table_data.append([zoom, f"{tiles:,}", f"{avg_size:.2f}"])
+        else:
+            table_data.append([zoom, "0", "N/A"])
+    
+    # Add total row
+    table_data.append(["TOTAL", f"{total_tiles:,}", "-"])
+    
+    print(tabulate(table_data, 
+                 headers=["Zoom", "Tiles", "Avg Size (bytes)"], 
+                 tablefmt="grid", 
+                 stralign="left", 
+                 numalign="right"))
     
     logger.info("Process completed successfully")
     
@@ -2724,6 +3157,16 @@ def main() -> None:
     
     del config
     smart_gc_collect()
+    
+    # Calculate and display total execution time
+    total_elapsed = time.time() - script_start_time
+    days = int(total_elapsed // 86400)
+    hours = int((total_elapsed % 86400) // 3600)
+    minutes = int((total_elapsed % 3600) // 60)
+    seconds = int(total_elapsed % 60)
+    
+    print(f"\n⏱️  Total execution time: {days:02d}d {hours:02d}:{minutes:02d}:{seconds:02d}")
+    logger.info(f"Script completed in {total_elapsed:.2f} seconds ({days:02d}d {hours:02d}:{minutes:02d}:{seconds:02d})")
 
 if __name__ == "__main__":
     main()
