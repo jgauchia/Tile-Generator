@@ -1009,6 +1009,43 @@ def get_simplify_tolerance_for_zoom(zoom: int) -> float:
         return Config.SIMPLIFY_TOLERANCES["high_zoom"]
 
 
+def optimized_tile_latlon_bounds(tile_x: int, tile_y: int, zoom: int, pixel_margin: int = 0) -> Tuple[float, float, float, float]:
+    """
+    Calculate tile bounds for lat/lon coordinates.
+    
+    Args:
+        tile_x: Tile X coordinate
+        tile_y: Tile Y coordinate
+        zoom: Zoom level
+        pixel_margin: Pixel margin for bounds
+        
+    Returns:
+        Tuple of (lon_min, lat_min, lon_max, lat_max)
+    """
+    n = 2.0 ** zoom
+    
+    # Calculate latitude bounds
+    lat_max = math.degrees(math.atan(math.sinh(math.pi * (1 - 2 * tile_y / n))))
+    lat_min = math.degrees(math.atan(math.sinh(math.pi * (1 - 2 * (tile_y + 1) / n))))
+    
+    # Calculate longitude bounds
+    lon_min = tile_x / n * 360.0 - 180.0
+    lon_max = (tile_x + 1) / n * 360.0 - 180.0
+    
+    # Apply pixel margin if provided
+    if pixel_margin > 0:
+        lat_range = lat_max - lat_min
+        lon_range = lon_max - lon_min
+        lat_margin = lat_range * pixel_margin / Config.TILE_SIZE
+        lon_margin = lon_range * pixel_margin / Config.TILE_SIZE
+        
+        lat_min -= lat_margin
+        lat_max += lat_margin
+        lon_min -= lon_margin
+        lon_max += lon_margin
+    
+    return (lon_min, lat_min, lon_max, lat_max)
+
 def get_tile_bbox_cached(tile_x: int, tile_y: int, zoom: int) -> 'box':
     """
     Get tile bounding box with caching.
@@ -1160,46 +1197,6 @@ def create_directory_structure(base_path: str, tile_coords: List[Tuple[int, int]
     
     for dir_path in dirs_to_create:
         os.makedirs(dir_path, exist_ok=True)
-
-
-
-
-    """
-    Calculate tile bounds for lat/lon coordinates.
-    
-    Args:
-        tile_x: Tile X coordinate
-        tile_y: Tile Y coordinate
-        zoom: Zoom level
-        pixel_margin: Pixel margin for bounds
-        
-    Returns:
-        Tuple of (lon_min, lat_min, lon_max, lat_max)
-    """
-    n = 2.0 ** zoom
-    
-    # Calculate latitude bounds
-    lat_max = math.degrees(math.atan(math.sinh(math.pi * (1 - 2 * tile_y / n))))
-    lat_min = math.degrees(math.atan(math.sinh(math.pi * (1 - 2 * (tile_y + 1) / n))))
-    
-    # Calculate longitude bounds
-    lon_min = tile_x / n * 360.0 - 180.0
-    lon_max = (tile_x + 1) / n * 360.0 - 180.0
-    
-    # Apply pixel margin
-    if pixel_margin > 0:
-        lat_range = lat_max - lat_min
-        lon_range = lon_max - lon_min
-        lat_margin = lat_range * pixel_margin / Config.TILE_SIZE
-        lon_margin = lon_range * pixel_margin / Config.TILE_SIZE
-        
-        lat_min -= lat_margin
-        lat_max += lat_margin
-        lon_min -= lon_margin
-        lon_max += lon_margin
-    
-    return (lon_min, lat_min, lon_max, lat_max)
-
 
 
 def clear_algorithm_caches():
@@ -1715,9 +1712,9 @@ def validate_pbf_file(pbf_file: str) -> None:
     if not os.path.isfile(pbf_file):
         raise ValueError(f"Path is not a file: {pbf_file}")
     
-    if not pbf_file.lower().endswith(Config.PBF_EXTENSION):
-        raise ValueError(f"File must have {Config.PBF_EXTENSION} extension: {pbf_file}")
-    
+    # Only accept .gol extensions
+    if not pbf_file.lower().endswith(".gol"):
+        raise ValueError(f"File must have .gol extension: {pbf_file}")
     if not os.access(pbf_file, os.R_OK):
         raise PermissionError(f"Cannot read PBF file: {pbf_file}")
     
@@ -1857,96 +1854,20 @@ def validate_db_path(db_path: str) -> None:
     
     logger.debug(f"Database path validation passed: {db_path}")
 
-def get_layer_fields_from_pbf(pbf_file: str, layer: str) -> Set[str]:
-    """Get available fields from a PBF layer"""
-    cmd = ["ogrinfo", "-so", pbf_file, layer]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        logger.warning(f"Could not get fields for layer {layer}: {result.stderr}")
-        return set()
-    
-    fields = set()
-    for line in result.stdout.split('\n'):
-        if ':' in line and not line.strip().startswith('Geometry'):
-            field_name = line.split(':')[0].strip()
-            if field_name and not field_name.startswith('FID'):
-                fields.add(field_name)
-    
-    logger.debug(f"Available fields for layer {layer}: {sorted(fields)}")
-    return fields
-
-def check_pbf_layers(pbf_file: str) -> List[str]:
-    """Check what layers are available in the PBF file"""
-    cmd = ["ogrinfo", pbf_file]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        logger.error(f"Could not read PBF file: {result.stderr}")
-        return []
-    
-    layers = []
-    for line in result.stdout.split('\n'):
-        # Look for lines like "1: points (Point)" or "2: lines (Line String)"
-        if ':' in line and not line.startswith('INFO:'):
-            parts = line.split(':')
-            if len(parts) >= 2:
-                layer_name = parts[1].strip().split(' ')[0]  # Get just the layer name before the parentheses
-                if layer_name and layer_name not in ['Open', 'using', 'driver']:
-                    layers.append(layer_name)
-    
-    logger.info(f"Available layers in PBF: {layers}")
-    return layers
-
-def extract_layer_to_temp_file(pbf_file: str, layer: str, where_clause: str, select_fields: str) -> Optional[str]:
-    """Extract layer data from PBF to temporary GeoJSON file"""
-    
-    # Create temporary file name manually (don't use context manager yet)
-    import uuid
-    tmp_filename = f"tmp_{layer}_{uuid.uuid4().hex[:8]}.geojson"
-    
-    # Register for cleanup
-    global _temp_files_to_cleanup
-    _temp_files_to_cleanup.add(tmp_filename)
-    
-    cmd = [
-        "ogr2ogr",
-        "-f", "GeoJSON",
-        "-nlt", "PROMOTE_TO_MULTI",
-        "-where", where_clause,
-        "-select", select_fields,
-        tmp_filename,
-        pbf_file,
-        layer
-    ]
-    
-    with resource_monitor():
-        result = subprocess.run(cmd, capture_output=True, text=True)
-    
-    if result.returncode != 0:
-        # ogr2ogr command failed - layer might be empty or invalid
-        logger.warning(f"ogr2ogr failed for layer {layer}")
-        return None
-    
-    # Check if file was created and has content
-    if not os.path.exists(tmp_filename):
-        logger.warning(f"Output file not created for layer {layer}")
-        return None
-        
-    file_size = os.path.getsize(tmp_filename)
-    if file_size == 0:
-        logger.warning(f"Empty output file for layer {layer}")
-        return None
-    
-    # Return the filename (it will be cleaned up manually later)
-    return tmp_filename
 
 def process_feature_for_zoom_levels(feat: Dict[str, Any], config: Dict[str, Any], config_fields: Set[str], zoom_levels: List[int], db: 'FeatureDatabase', batch_features: List[Tuple[int, int, int, Dict[str, Any], int]]) -> int:
     """Process a single feature for all relevant zoom levels"""
-    feat['properties'] = {k: v for k, v in feat['properties'].items() if k in config_fields}
-    
+    # Keep all properties, don't filter them yet
     tags = feat['properties']
+    
+    # First check if this feature matches any style
     style, stylekey = get_style_for_tags(tags, config)
     if not style:
         return 0
+    
+    # Now filter properties to only include config_fields for storage
+    feat['properties'] = {k: v for k, v in feat['properties'].items() if k in config_fields}
+    tags = feat['properties']
     
     try:
         geom = shape(feat['geometry'])
@@ -2007,531 +1928,6 @@ def process_feature_for_zoom_levels(feat: Dict[str, Any], config: Dict[str, Any]
                         gc.collect()
     
     return features_added
-
-def process_layer_directly_to_database(pbf_file: str, layer: str, config: Dict[str, Any], db: 'FeatureDatabase', zoom_levels: List[int], config_fields: Set[str], LAYER_FIELDS: Dict[str, Set[str]]) -> int:
-    """Process a single layer directly from PBF to database using Pyosmium"""
-    logger.info(f"Processing layer {layer} directly with Pyosmium (no temporary files)")
-    
-    if not OSM_PYOSMIUM_AVAILABLE:
-        logger.warning("Pyosmium not available, falling back to ogr2ogr with temporary files")
-        return process_layer_streaming_from_pbf(pbf_file, layer, "", "", config, config_fields, zoom_levels, db)
-    
-    # Create Pyosmium handler for this specific layer
-    handler = OSMFeatureHandler(config, db, zoom_levels, config_fields)
-    
-    # Filter handler to only process this layer type
-    original_way = handler.way
-    original_relation = handler.relation
-    
-    def filtered_way(w):
-        if not w.tags:
-            return
-        
-        # Convert tags to dict
-        tags = {tag.k: tag.v for tag in w.tags}
-        
-        # Check if this way matches the layer
-        layer_matches = False
-        for pattern_key, pattern in handler.tag_patterns.items():
-            if pattern['type'] == 'tag_value':
-                if pattern['key'] in tags and tags[pattern['key']] == pattern['value']:
-                    layer_matches = True
-                    break
-            elif pattern['type'] == 'tag_exists':
-                if pattern['key'] in tags:
-                    layer_matches = True
-                    break
-        
-        if layer_matches:
-            original_way(w)
-    
-    def filtered_relation(r):
-        if not r.tags:
-            return
-        
-        # Convert tags to dict
-        tags = {tag.k: tag.v for tag in r.tags}
-        
-        # Check if this relation matches the layer
-        layer_matches = False
-        for pattern_key, pattern in handler.tag_patterns.items():
-            if pattern['type'] == 'tag_value':
-                if pattern['key'] in tags and tags[pattern['key']] == pattern['value']:
-                    layer_matches = True
-                    break
-            elif pattern['type'] == 'tag_exists':
-                if pattern['key'] in tags:
-                    layer_matches = True
-                    break
-        
-        if layer_matches:
-            original_relation(r)
-    
-    # Apply filtered handlers
-    handler.way = filtered_way
-    handler.relation = filtered_relation
-    
-    # Process the file
-    handler.apply_file(pbf_file)
-    
-    return handler.features_processed
-
-def process_layer_streaming_from_pbf(pbf_file: str, layer: str, where_clause: str, select_fields: str, config: Dict[str, Any], config_fields: Set[str], zoom_levels: List[int], db: 'FeatureDatabase') -> int:
-    """Process PBF layer using optimized temporary file approach"""
-    # Use temporary file but with optimized processing
-    tmp_filename = extract_layer_to_temp_file(pbf_file, layer, where_clause, select_fields)
-    if not tmp_filename:
-        logger.warning(f"No features found in layer {layer}")
-        return 0
-    
-    try:
-        features_processed = 0
-        batch_features = []
-        
-        with open(tmp_filename, "r", encoding="utf-8", buffering=Config.GEOJSON_READ_BUFFER_SIZE) as f:
-            # Use ijson for streaming JSON parsing
-            for feat in ijson.items(f, "features.item"):
-                features_added = process_feature_for_zoom_levels(
-                    feat, config, config_fields, zoom_levels, db, batch_features
-                )
-                features_processed += features_added
-                
-                # Batch insert to avoid memory buildup
-                if len(batch_features) >= Config.DB_BATCH_SIZE:
-                    db.insert_features_batch(batch_features)
-                    db.commit()
-                    batch_features.clear()
-                    gc.collect()
-                
-                # Periodic memory management
-                if features_processed % 10000 == 0:
-                    clear_geometry_caches()
-                    clear_algorithm_caches()
-        
-        # Insert remaining features
-        if batch_features:
-            db.insert_features_batch(batch_features)
-            db.commit()
-        
-        logger.info(f"Processed {features_processed} features from layer {layer}")
-        return features_processed
-        
-    except Exception as e:
-        logger.error(f"Error processing layer {layer}: {e}")
-        return 0
-    finally:
-        # Clean up temporary file
-        if tmp_filename and os.path.exists(tmp_filename):
-            try:
-                os.remove(tmp_filename)
-                _temp_files_to_cleanup.discard(tmp_filename)
-                logger.debug(f"Cleaned up temporary file: {tmp_filename}")
-            except Exception as e:
-                logger.debug(f"Could not remove temporary file {tmp_filename}: {e}")
-
-def process_pbf_directly_to_database(pbf_file: str, config: Dict[str, Any], db_path: str, zoom_levels: List[int], resources: Dict[str, Any] = None) -> int:
-    """Process PBF directly to database using Pyosmium for maximum performance"""
-    logger.info("Processing PBF directly to database using Pyosmium (maximum performance)")
-    
-    try:
-        import osmium
-    except ImportError:
-        logger.error("Pyosmium not installed. Install with: pip install osmium")
-        logger.info("Falling back to ogr2ogr method...")
-        return process_pbf_directly_to_database_fallback(pbf_file, config, db_path, zoom_levels)
-    
-    with managed_database(db_path) as db:
-        with memory_management():
-            config_fields = get_config_fields(config)
-            logger.info(f"Config requires these fields: {', '.join(sorted(config_fields))}")
-            
-            # Create Pyosmium handler
-            handler = OSMFeatureHandler(config, db, zoom_levels, config_fields)
-            
-            # Process PBF file with Pyosmium
-            logger.info("Starting Pyosmium processing...")
-            start_time = time.time()
-            
-            try:
-                handler.apply_file(pbf_file)
-                processing_time = time.time() - start_time
-                
-                total_features_processed = handler.features_processed
-                logger.info(f"Pyosmium processing completed in {processing_time:.2f}s")
-                logger.info(f"Total processed: {total_features_processed} features directly from PBF")
-            except Exception as e:
-                logger.error(f"Error during PBF processing: {e}")
-                raise
-            
-            # Print statistics for each zoom level with table
-            table_data = []
-            total_features = 0
-            for zoom in sorted(zoom_levels):
-                count = db.count_features_for_zoom(zoom)
-                total_features += count
-                table_data.append([zoom, f"{count:,}", f"Level {zoom}"])
-            
-            # Add total row
-            table_data.append(["TOTAL", f"{total_features:,}", "All levels combined"])
-            
-            print(tabulate(table_data, 
-                         headers=["Zoom", "Features", "Description"], 
-                         tablefmt="grid", 
-                         stralign="left", 
-                         numalign="right"))
-            
-            return total_features_processed
-
-class OSMFeatureHandler:
-    """Pyosmium handler for processing OSM features directly from PBF files"""
-    
-    def __init__(self, config: Dict[str, Any], db: 'FeatureDatabase', zoom_levels: List[int], config_fields: Set[str]):
-        self.config = config
-        self.db = db
-        self.zoom_levels = zoom_levels
-        self.config_fields = config_fields
-        self.features_processed = 0
-        self.batch_features = []
-        self.batch_size = 1000  # Process in batches for memory efficiency
-        
-        # Progress tracking
-        self.total_features_scanned = 0
-        self.total_features_filtered = 0
-        self.start_time = time.time()
-        self.last_progress_time = time.time()
-        self.progress_interval = 1.0  # Show progress every 1 second
-        
-        # Pre-compile tag patterns for performance
-        self.tag_patterns = self._compile_tag_patterns()
-        
-        # Initialize batch processing
-        self._init_batch_processing()
-    
-    def _compile_tag_patterns(self) -> Dict[str, Dict[str, Any]]:
-        """Pre-compile tag patterns from config for fast matching"""
-        patterns = {}
-        
-        for key, value in self.config.items():
-            if isinstance(value, dict) and 'zoom' in value:
-                # Parse tag pattern (e.g., "highway=motorway" or "building")
-                if '=' in key:
-                    tag_key, tag_value = key.split('=', 1)
-                    patterns[key] = {
-                        'type': 'tag_value',
-                        'key': tag_key,
-                        'value': tag_value,
-                        'config': value
-                    }
-                else:
-                    patterns[key] = {
-                        'type': 'tag_exists',
-                        'key': key,
-                        'config': value
-                    }
-        
-        logger.info(f"Compiled {len(patterns)} tag patterns for Pyosmium processing")
-        return patterns
-    
-    def _init_batch_processing(self):
-        """Initialize batch processing variables"""
-        self.batch_features = []
-        self.features_processed = 0
-    
-    def _update_progress(self):
-        """Update and display progress information"""
-        current_time = time.time()
-        if current_time - self.last_progress_time >= self.progress_interval:
-            elapsed_time = current_time - self.start_time
-            features_per_second = self.total_features_scanned / elapsed_time if elapsed_time > 0 else 0
-            
-            print(f"\r📊 Progress: {self.total_features_scanned:,} scanned, {self.total_features_filtered:,} filtered, {features_per_second:.0f} features/s, {elapsed_time:.1f}s elapsed", end='', flush=True)
-            self.last_progress_time = current_time
-    
-    def _should_process_feature(self, tags: Dict[str, str]) -> Optional[Dict[str, Any]]:
-        """Check if feature should be processed based on tags and config"""
-        for pattern_key, pattern in self.tag_patterns.items():
-            if pattern['type'] == 'tag_value':
-                if pattern['key'] in tags and tags[pattern['key']] == pattern['value']:
-                    return pattern['config']
-            elif pattern['type'] == 'tag_exists':
-                if pattern['key'] in tags:
-                    return pattern['config']
-        
-        return None
-    
-    def _process_feature_batch(self):
-        """Process accumulated features in batch"""
-        if self.batch_features:
-            self.db.insert_features_batch(self.batch_features)
-            self.db.commit()
-            self.batch_features = []
-    
-    def _add_feature_to_batch(self, feature_data: Tuple[int, int, int, Dict[str, Any], int]):
-        """Add feature to batch for processing"""
-        self.batch_features.append(feature_data)
-        
-        # Process batch when it reaches batch_size
-        if len(self.batch_features) >= self.batch_size:
-            self._process_feature_batch()
-    
-    def way(self, w):
-        """Process OSM way (lines, polygons)"""
-        # Update progress counter
-        self.total_features_scanned += 1
-        
-        if not w.tags:
-            return
-        
-        # Convert tags to dict
-        tags = {tag.k: tag.v for tag in w.tags}
-        
-        # Check if this way should be processed
-        style_config = self._should_process_feature(tags)
-        if not style_config:
-            return
-        
-        # Update filtered counter
-        self.total_features_filtered += 1
-        
-        # Update progress display
-        self._update_progress()
-        
-        # Filter tags to only include config fields
-        filtered_tags = {k: v for k, v in tags.items() if k in self.config_fields}
-        
-        # Get geometry from way
-        try:
-            # Convert way to geometry
-            if len(w.nodes) < 2:
-                return
-            
-            # Create geometry from way nodes
-            coords = []
-            for node in w.nodes:
-                try:
-                    # Check if node has valid location
-                    if hasattr(node, 'location') and node.location.valid():
-                        coords.append([node.location.lon, node.location.lat])
-                    else:
-                        # Skip this way if any node is invalid
-                        if self.features_processed < 5:
-                            logger.debug(f"❌ Way {w.id} has invalid node, skipping")
-                        return
-                except Exception as e:
-                    # Skip this way if any node is invalid
-                    if self.features_processed < 5:
-                        logger.debug(f"❌ Way {w.id} node error: {e}, skipping")
-                    return
-            
-            if len(coords) < 2:
-                if self.features_processed < 5:
-                    logger.debug(f"❌ Way {w.id} has insufficient coordinates: {len(coords)}")
-                return
-            
-            # Determine if it's a polygon or line
-            is_polygon = coords[0] == coords[-1] and len(coords) > 3
-            
-            
-            if is_polygon:
-                # Create polygon geometry
-                from shapely.geometry import Polygon
-                geom = Polygon(coords)
-            else:
-                # Create line geometry
-                from shapely.geometry import LineString
-                geom = LineString(coords)
-            
-            if not geom.is_valid or geom.is_empty:
-                return
-            
-            # Process for all relevant zoom levels
-            self._process_geometry_for_zoom_levels(geom, tags, style_config, w.id)
-            
-        except Exception as e:
-            logger.debug(f"Error processing way {w.id}: {e}")
-            return
-    
-    def relation(self, r):
-        """Process OSM relation (multipolygons, etc.)"""
-        # Update progress counter
-        self.total_features_scanned += 1
-        
-        if not r.tags:
-            return
-        
-        # Convert tags to dict
-        tags = {tag.k: tag.v for tag in r.tags}
-        
-        # Check if this relation should be processed
-        style_config = self._should_process_feature(tags)
-        if not style_config:
-            return
-        
-        # Update filtered counter
-        self.total_features_filtered += 1
-        
-        # Update progress display
-        self._update_progress()
-        
-        # Filter tags to only include config fields
-        filtered_tags = {k: v for k, v in tags.items() if k in self.config_fields}
-        
-        # Process relation geometry (simplified for now)
-        # In a full implementation, you'd need to handle multipolygons
-        # For now, we'll skip complex relations
-        logger.debug(f"Skipping complex relation {r.id}")
-    
-    def _process_geometry_for_zoom_levels(self, geom, tags: Dict[str, str], style_config: Dict[str, Any], osm_id: int):
-        """Process geometry for all relevant zoom levels"""
-        zoom_filter = style_config.get("zoom", 6)
-        priority = style_config.get("priority", 5)
-        hex_color = style_config.get("color", "#FFFFFF")
-        color = hex_to_rgb332_direct(hex_color)
-        
-        for zoom in self.zoom_levels:
-            if zoom < zoom_filter:
-                continue
-            
-            # Simplify geometry for zoom level
-            tolerance = get_simplify_tolerance_for_zoom(zoom)
-            simplified_geom = geom.simplify(tolerance, preserve_topology=True)
-            
-            if simplified_geom.is_empty or not simplified_geom.is_valid:
-                continue
-            
-            # Calculate tile bounds for this zoom level
-            minx, miny, maxx, maxy = simplified_geom.bounds
-            xtile_min, ytile_min = deg2num(float(miny), float(minx), zoom)
-            xtile_max, ytile_max = deg2num(float(maxy), float(maxx), zoom)
-            
-            # Store feature for each tile it intersects
-            for xt in range(min(xtile_min, xtile_max), max(xtile_min, xtile_max) + 1):
-                for yt in range(min(ytile_min, ytile_max), max(ytile_min, ytile_max) + 1):
-                    # Use optimized intersection with pre-filtering
-                    # Convert tile coordinates to lat/lon bounds
-                    n = 2.0 ** zoom
-                    lon_min = xt / n * 360.0 - 180.0
-                    lat_max = math.degrees(math.atan(math.sinh(math.pi * (1 - 2 * yt / n))))
-                    lon_max = (xt + 1) / n * 360.0 - 180.0
-                    lat_min = math.degrees(math.atan(math.sinh(math.pi * (1 - 2 * (yt + 1) / n))))
-                    
-                    clipped_geom = simplified_geom.intersection(
-                        box(lon_min, lat_min, lon_max, lat_max)
-                    )
-                    
-                    if clipped_geom.is_empty or not clipped_geom.is_valid:
-                        continue
-                    
-                    # Create feature data
-                    feature_data = {
-                        'geom': clipped_geom,
-                        'color': color,
-                        'color_hex': hex_color,
-                        'tags': tags,
-                        'priority': priority
-                    }
-                    
-                    # Add to batch
-                    self._add_feature_to_batch((zoom, xt, yt, feature_data, priority))
-                    self.features_processed += 1
-    
-    def apply_file(self, pbf_file: str):
-        """Apply the handler to a PBF file"""
-        if not OSM_PYOSMIUM_AVAILABLE:
-            raise ImportError("Pyosmium not available")
-        
-        # Create a SimpleHandler and use it to process the file
-        class PyosmiumHandler(osmium.SimpleHandler):
-            def __init__(self, parent_handler):
-                super().__init__()
-                self.parent = parent_handler
-            
-            def way(self, w):
-                self.parent.way(w)
-            
-            def relation(self, r):
-                self.parent.relation(r)
-        
-        # Create and use the handler
-        handler = PyosmiumHandler(self)
-        
-        # Try to process with node locations first
-        try:
-            # Use apply_file with locations=True to load node coordinates
-            handler.apply_file(pbf_file, locations=True)
-        except Exception as e:
-            logger.warning(f"Failed to process with locations=True: {e}")
-            # Fallback to regular processing
-            handler.apply_file(pbf_file)
-        
-        # Process any remaining features in batch
-        self._process_feature_batch()
-        
-        # Final progress message with 100% completion
-        elapsed_time = time.time() - self.start_time
-        features_per_second = self.total_features_scanned / elapsed_time if elapsed_time > 0 else 0
-        print(f"\r📊 Progress: {self.total_features_scanned:,} scanned, {self.total_features_filtered:,} filtered (100.0%), {features_per_second:.0f} features/s, {elapsed_time:.1f}s elapsed", end='', flush=True)
-        print()  # New line after final progress
-
-def process_pbf_directly_to_database_fallback(pbf_file: str, config: Dict[str, Any], db_path: str, zoom_levels: List[int]) -> int:
-    """Fallback method using ogr2ogr (original implementation)"""
-    logger.info("Processing PBF directly to database (fallback with minimal temporary files)")
-    
-    # First, check what layers are available in the PBF file
-    available_layers = check_pbf_layers(pbf_file)
-    if not available_layers:
-        logger.error("No layers found in PBF file")
-        return 0
-    
-    with managed_database(db_path) as db:
-        with memory_management():
-            config_fields = get_config_fields(config)
-            
-            logger.info(f"Config requires these fields: {', '.join(sorted(config_fields))}")
-            
-            total_features_processed = 0
-            
-            # Process each layer separately and immediately clean up
-            for i, layer in enumerate(Config.PROCESSING_LAYERS):
-                if layer not in available_layers:
-                    logger.warning(f"Layer {layer} not found in PBF file, skipping")
-                    continue
-                    
-                logger.info(f"[{i+1}/{len(Config.PROCESSING_LAYERS)}] Processing layer: {layer} directly to database")
-                
-                with resource_monitor():
-                    layer_features = process_layer_directly_to_database(
-                        pbf_file, layer, config, db, zoom_levels, config_fields, Config.LAYER_FIELDS
-                    )
-                
-                total_features_processed += layer_features
-                logger.info(f"Layer {layer}: {layer_features} features processed")
-                
-                # Memory management between layers
-                with memory_management():
-                    pass
-            
-            logger.info(f"Total processed: {total_features_processed} features directly from PBF")
-            
-            # Print statistics for each zoom level with table
-            table_data = []
-            total_features = 0
-            for zoom in sorted(zoom_levels):
-                count = db.count_features_for_zoom(zoom)
-                total_features += count
-                table_data.append([zoom, f"{count:,}", f"Level {zoom}"])
-            
-            # Add total row
-            table_data.append(["TOTAL", f"{total_features:,}", "All levels combined"])
-            
-            print(tabulate(table_data, 
-                         headers=["Zoom", "Features", "Description"], 
-                         tablefmt="grid", 
-                         stralign="left", 
-                         numalign="right"))
-            
-            return total_features_processed
-
 
 def detect_simple_shapes(geometry, pixel_coords: List[Tuple[int, int]]) -> Optional[Dict]:
     """Detect simple shapes that can use optimized commands"""
@@ -2946,6 +2342,100 @@ def generate_tiles_from_database(db_path: str, output_dir: str, zoom: int, max_f
             # Return statistics
             return {'tiles': len(all_tile_sizes), 'avg_size': avg_tile_size}
 
+def compress_goql_queries(config: Dict[str, Any]) -> str:
+    """
+    Build GOQL queries from config with value compression.
+    
+    GOQL selectors:
+    - n[...] = nodes only
+    - w[...] = ways (lines) only
+    - a[...] = areas (polygons) only
+    - na[...] = nodes OR areas (polygons OR points)
+    
+    According to GOQL documentation, multiple values can be combined:
+    - na[amenity=restaurant,pub,cafe] groups multiple values
+    
+    We use:
+    - w[...] for lines (highway, railway, waterway)
+    - na[...] for areas and nodes (natural, landuse, amenity, place, building, leisure)
+    
+    Args:
+        config: Feature configuration dictionary
+        
+    Returns:
+        Compressed GOQL query string
+    """
+    # Categories by tag type
+    LINE_TAGS = ['highway', 'railway', 'waterway']
+    AREA_NODE_TAGS = ['natural', 'landuse', 'leisure', 'amenity', 'place', 'building']
+    
+    # Group values by tag key
+    line_queries = {}  # tag_key -> [values]
+    area_node_queries = {}  # tag_key -> [values]
+    other_queries = []  # other features
+    
+    for key in config.keys():
+        if key.startswith('#'):
+            continue
+            
+        if '=' in key:
+            tag_key, tag_value = key.split('=', 1)
+            
+            # Group by tag type
+            if tag_key in LINE_TAGS:
+                if tag_key not in line_queries:
+                    line_queries[tag_key] = []
+                line_queries[tag_key].append(tag_value)
+            elif tag_key in AREA_NODE_TAGS:
+                if tag_key not in area_node_queries:
+                    area_node_queries[tag_key] = []
+                area_node_queries[tag_key].append(tag_value)
+            else:
+                # Use w[...] or na[...] for unknown tag types
+                if tag_key in ['highway', 'railway', 'waterway']:
+                    other_queries.append(f'w[{key}]')
+                else:
+                    other_queries.append(f'na[{key}]')
+        else:
+            # Key without value (just presence): key
+            # Check if it's in our categories
+            if key in LINE_TAGS:
+                other_queries.append(f'w[{key}]')
+            elif key in AREA_NODE_TAGS:
+                other_queries.append(f'na[{key}]')
+            else:
+                other_queries.append(f'na[{key}]')
+    
+    # Build compressed queries
+    goql_queries = []
+    
+    # Lines: compress multiple values into w[key=val1,val2,val3]
+    for tag_key, values in sorted(line_queries.items()):
+        if len(values) == 1:
+            goql_queries.append(f'w[{tag_key}={values[0]}]')
+        else:
+            # Group multiple values: w[natural=water,forest,wood]
+            values_str = ','.join(sorted(values))
+            goql_queries.append(f'w[{tag_key}={values_str}]')
+    
+    # Areas/nodes: compress multiple values into na[key=val1,val2,val3]
+    for tag_key, values in sorted(area_node_queries.items()):
+        if len(values) == 1:
+            goql_queries.append(f'na[{tag_key}={values[0]}]')
+        else:
+            # Group multiple values: na[natural=water,forest,wood]
+            values_str = ','.join(sorted(values))
+            goql_queries.append(f'na[{tag_key}={values_str}]')
+    
+    # Other features
+    goql_queries.extend(other_queries)
+    
+    query_str = ", ".join(goql_queries) if goql_queries else "*"
+    
+    logger.info(f"GOQL query compressed: {len(config.keys())} features -> {len(goql_queries)} selectors")
+    
+    return query_str
+
 def precompute_global_color_palette(config: Dict[str, Any]) -> int:
     global GLOBAL_COLOR_PALETTE, GLOBAL_INDEX_TO_RGB332
     
@@ -3113,8 +2603,92 @@ def main() -> None:
 
     write_palette_bin(args.output_dir)
 
-    # Process features directly from PBF to database (no intermediate GeoJSON)
-    process_pbf_directly_to_database(args.pbf_file, config, args.db_path, zoom_levels, resources)
+    # Process GOL with gol CLI
+    logger.info("Processing GOL file with gol CLI directly")
+    import subprocess
+    import ijson
+    
+    gol_cmd = "/gol" if os.path.exists("/gol") else "gol"
+    
+    # Query GOL file directly using gol CLI with filtering from features.json
+    logger.info("Querying GOL features using gol CLI with features.json filtering...")
+    
+    # Build GOQL query from config features
+    config_fields = get_config_fields(config)
+    
+    # Build GOQL query from config
+    query_str = compress_goql_queries(config)
+    
+    # Start gol query process with streaming stdout
+    logger.info("Starting gol query with streaming output...")
+    
+    # Note: You can add bbox filtering with: -b W,S,E,N
+    # Example: -b 2.0,41.0,3.0,42.0 for Catalonia
+    gol_args = [gol_cmd, "query", args.pbf_file, query_str, "-f", "geojson"]
+    
+    with subprocess.Popen(
+        gol_args,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1  # Line buffered for streaming
+    ) as process:
+        
+        with managed_database(args.db_path) as db:
+            with memory_management():
+                config_fields = get_config_fields(config)
+                
+                features_processed = 0  # Total instances (features * tiles * zoom_levels)
+                features_extracted = 0   # Unique features from GOL
+                batch_features = []
+                start_time = time.time()
+                
+                logger.info("Streaming features from gol query output...")
+                
+                # Stream process from gol's stdout with error handling for truncated JSON
+                try:
+                    # Use process.stdout directly instead of StringIO
+                    for feature in ijson.items(process.stdout, "features.item"):
+                        features_extracted += 1
+                        
+                        features_added = process_feature_for_zoom_levels(
+                            feature, config, config_fields, zoom_levels, db, batch_features
+                        )
+                        features_processed += features_added
+                        
+                        # Batch size based on available memory from resources
+                        batch_size = resources.get('db_batch_size', 5000) if resources else 5000
+                        if len(batch_features) >= batch_size:
+                            db.insert_features_batch(batch_features)
+                            db.commit()
+                            batch_features.clear()
+                            
+                            # Calculate features/second
+                            elapsed_time = time.time() - start_time
+                            features_per_sec = features_extracted / elapsed_time if elapsed_time > 0 else 0
+                            print(f"\r  Extracted {features_extracted} features ({features_per_sec:.0f} f/s)...", end='', flush=True)
+                    
+                    # Final batch
+                    if batch_features:
+                        db.insert_features_batch(batch_features)
+                        db.commit()
+                    
+                    logger.info(f"Total extracted: {features_extracted} unique features from GOL")
+                    logger.info(f"Total instances: {features_processed} (features × tiles × zoom_levels)")
+                except ijson.common.IncompleteJSONError as e:
+                    logger.warning(f"JSON truncated (expected): Extracted {features_extracted} features before EOF")
+                    # Insert any remaining features
+                    if batch_features:
+                        db.insert_features_batch(batch_features)
+                        db.commit()
+                    logger.info(f"Total extracted: {features_extracted} unique features from GOL (truncated JSON)")
+                    logger.info(f"Total instances: {features_processed} (features × tiles × zoom_levels)")
+                
+                # Check if gol process failed
+                if process.wait() != 0:
+                    stderr = process.stderr.read()
+                    logger.error(f"gol query failed: {stderr}")
+                    raise RuntimeError(f"gol query failed: {stderr}")
 
     # Generate tiles for each zoom level from database and collect statistics
     all_zoom_stats = {}
