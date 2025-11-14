@@ -2,6 +2,7 @@
 
 # Script to generate tiles from PBF using Docker
 # Converts PBF -> GOL -> Tiles automatically
+# Optimized version with minimal dependencies 
 
 set -e
 
@@ -15,7 +16,7 @@ NC='\033[0m' # No Color
 # Banner
 echo -e "${BLUE}"
 echo "╔════════════════════════════════════════╗"
-echo "║   PBF → GOL → Tiles (Docker)           ║"
+echo "║   PBF → GOL → Tiles Generator          ║"
 echo "╚════════════════════════════════════════╝"
 echo -e "${NC}"
 
@@ -61,12 +62,12 @@ if [ -z "$INPUT_PBF" ] || [ -z "$OUTPUT_DIR" ] || [ -z "$CONFIG_FILE" ]; then
     echo ""
     echo "Options:"
     echo "  --clean-docker      Force rebuild of Docker image"
-    echo "  --zoom N-M           Zoom range (e.g., 6-17)"
-    echo "  --max-file-size KB   Maximum tile file size in KB"
+    echo "  --zoom N-M          Zoom range (e.g., 6-17)"
+    echo "  --max-file-size KB  Maximum tile file size in KB"
     echo ""
     echo "Example:"
     echo "  $0 map.osm.pbf tiles features.json --zoom 6-17"
-    echo "  $0 map.osm.pbf tiles features.json --clean-docker --zoom 12 --max-file-size 512"
+    echo "  $0 map.osm.pbf tiles features.json --zoom 12 --max-file-size 512"
     exit 1
 fi
 
@@ -90,7 +91,7 @@ INPUT_NAME=$(basename "$INPUT_PBF")
 CONFIG_NAME=$(basename "$CONFIG_FILE")
 OUTPUT_NAME=$(basename "$OUTPUT_DIR")
 
-# Create output directory if it doesn't exist
+# Create output directory
 mkdir -p "$OUTPUT_ABS"
 echo -e "${GREEN}✓ Output directory ready:${NC} $OUTPUT_ABS"
 echo ""
@@ -118,76 +119,71 @@ fi
 
 echo -e "${YELLOW}Preparing Docker environment...${NC}"
 
-# Create optimized Dockerfile
-cat > /tmp/Dockerfile.tiles << 'EOF'
-FROM ubuntu:24.04
+# Create Dockerfile
+cat > /tmp/Dockerfile.tiles.light << 'EOF'
+FROM python:3.11-slim
 
-# Install system dependencies with retries
-RUN apt-get update --fix-missing && \
+# Install only essential dependencies
+RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-    python3 python3-pip python3-venv python3-dev \
     wget ca-certificates \
-    build-essential \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* >/dev/null 2>&1
 
-# Install Python dependencies globally to avoid reinstalling every time
-RUN pip3 install --no-cache-dir --break-system-packages \
-    --default-timeout=100 \
-    --retries=5 \
-    osmium \
-    geodesk \
-    lz4 \
-    tqdm \
-    tabulate \
-    shapely \
-    psutil \
-    ijson
+RUN pip install --no-cache-dir --upgrade pip >/dev/null 2>&1
+
+# Install minimal Python dependencies
+RUN pip install --no-cache-dir \
+    ijson==3.2.3 \
+    tqdm==4.66.1 \
+    psutil==5.9.8 >/dev/null 2>&1
 
 WORKDIR /work
+
+# Display installed packages for verification
+RUN pip list && \
+    echo "Docker image ready for tile generation"
 EOF
 
 # Handle --clean-docker option
 if [ "$FORCE_CLEAN" = true ]; then
-    echo -e "${YELLOW}--clean-docker flag detected: will rebuild Docker image${NC}"
-    IMAGE_EXISTS=$($DOCKER_CMD images tile-generator:latest -q 2>/dev/null || true)
+    echo -e "${YELLOW}--clean-docker flag: rebuilding Docker image${NC}"
+    IMAGE_EXISTS=$($DOCKER_CMD images tile-generator:light -q 2>/dev/null || true)
     if [ -n "$IMAGE_EXISTS" ]; then
-        echo "  Removing existing Docker image..."
-        $DOCKER_CMD rmi tile-generator:latest > /dev/null 2>&1 || true
+        echo "  Removing existing image..."
+        $DOCKER_CMD rmi tile-generator:light > /dev/null 2>&1 || true
         echo "  ✓ Existing image removed"
     fi
     echo ""
 fi
 
 # Check if Docker image exists
-IMAGE_EXISTS=$($DOCKER_CMD images tile-generator:latest -q 2>/dev/null || true)
+IMAGE_EXISTS=$($DOCKER_CMD images tile-generator:light -q 2>/dev/null || true)
 if [ -z "$IMAGE_EXISTS" ]; then
     echo -e "${YELLOW}Building Docker image${NC}"
     echo ""
-    echo "Steps that will be executed:"
-    echo "  1. Pull Ubuntu 24.04 base image"
-    echo "  2. Install Python 3 and development tools"
-    echo "  3. Install system dependencies"
-    echo ""
-    echo "This may take a few minutes. Downloading and installing packages..."
-    echo ""
     
-    $DOCKER_CMD build --progress=plain -t tile-generator:latest -f /tmp/Dockerfile.tiles .
+    #$DOCKER_CMD build --progress=plain -t tile-generator:light -f /tmp/Dockerfile.tiles.light . >/dev/null 2>&1
+    #$DOCKER_CMD build --progress=tty -t tile-generator:light -f /tmp/Dockerfile.tiles.light .
+    #DOCKER_BUILDKIT=1 \
+    #$DOCKER_CMD build --progress=plain -t tile-generator:light -f /tmp/Dockerfile.tiles.light .
+    DOCKER_BUILDKIT=1 \
+    $DOCKER_CMD build -t tile-generator:light -f /tmp/Dockerfile.tiles.light .
+
+
     
     echo ""
-    echo -e "${GREEN}✓ Docker image created successfully${NC}"
+    echo -e "${GREEN}✓ Docker image created${NC}"
     
     # Show image size
-    IMAGE_SIZE=$($DOCKER_CMD images tile-generator:latest --format "{{.Size}}" 2>/dev/null || echo "unknown")
+    IMAGE_SIZE=$($DOCKER_CMD images tile-generator:light --format "{{.Size}}" 2>/dev/null || echo "unknown")
     echo "  Image size: $IMAGE_SIZE"
 else
     echo -e "${GREEN}✓ Docker image already exists${NC}"
-    
-    # Show existing image size
-    IMAGE_SIZE=$($DOCKER_CMD images tile-generator:latest --format "{{.Size}}" 2>/dev/null || echo "unknown")
+    IMAGE_SIZE=$($DOCKER_CMD images tile-generator:light --format "{{.Size}}" 2>/dev/null || echo "unknown")
     echo "  Image size: $IMAGE_SIZE"
 fi
 
-rm -f /tmp/Dockerfile.tiles
+rm -f /tmp/Dockerfile.tiles.light
 
 echo ""
 
@@ -197,26 +193,26 @@ if command -v gol &> /dev/null; then
     GOL_PATH=$(which gol)
     echo -e "${GREEN}Using local gol:${NC} $GOL_PATH"
 else
-    echo -e "${RED}✗ gol CLI not found in system${NC}"
-    echo "Please install gol from: https://www.geodesk.com/download/"
+    echo -e "${RED}✗ gol CLI not found${NC}"
+    echo "Install from: https://www.geodesk.com/download/"
     exit 1
 fi
 
 echo ""
-echo "🚀 Starting tile generation..."
+echo "🚀 Starting tile generation ..."
 echo ""
 
 # Run in Docker
 $DOCKER_CMD run --rm \
-    -v "$INPUT_ABS:/input/$INPUT_NAME" \
-    -v "$CONFIG_ABS:/config/$CONFIG_NAME" \
+    -v "$INPUT_ABS:/input/$INPUT_NAME:ro" \
+    -v "$CONFIG_ABS:/config/$CONFIG_NAME:ro" \
     -v "$GOL_PATH:/gol:ro" \
     -v "$OUTPUT_ABS:/output" \
-    -v "$(pwd)/tile_generator.py:/work/tile_generator.py" \
-    tile-generator:latest bash -c "
+    -v "$(pwd)/tile_generator.py:/work/tile_generator.py:ro" \
+    tile-generator:light bash -c "
         set -e
         
-        echo '✓ Python dependencies already installed in image'
+        echo '✓ Python environment ready'
         echo ''
         
         # Step 1: Convert PBF to GOL
@@ -224,117 +220,80 @@ $DOCKER_CMD run --rm \
         echo \"  PBF: /input/$INPUT_NAME\"
         echo \"  GOL: input.gol\"
         echo ''
-        echo 'Building GOL file...'
         
-        # Start gol build in background and monitor progress (suppress all output)
-        /gol build input.gol /input/$INPUT_NAME >/dev/null 2>/dev/null &
+        # Build GOL with progress monitoring
+        /gol build input.gol /input/$INPUT_NAME >/dev/null 2>&1 &
         GOL_PID=\$!
         
-        # Monitor GOL file size while building
+        # Monitor progress
         while kill -0 \$GOL_PID 2>/dev/null; do
             if [ -f input.gol ]; then
                 SIZE=\$(du -h input.gol 2>/dev/null | cut -f1 || echo \"0B\")
                 echo -ne \"\\r  GOL size: \${SIZE} (building...)\"
-            else
-                echo -ne \"\\r  GOL size: 0B (building...)\"
             fi
             sleep 1
         done
         
-        # Wait for gol to finish
-        wait \$GOL_PID
-        GOL_EXIT=\$?
-        
         echo ''
-        
-        if [ \$GOL_EXIT -ne 0 ]; then
-            echo ''
-            echo '✗ Error converting PBF to GOL'
-            echo ''
-            echo 'Checking gol:'
-            /gol --version || echo 'gol not working'
-            exit 1
-        fi
+        wait \$GOL_PID
         
         if [ ! -f input.gol ]; then
             echo '✗ GOL file not created'
-            echo 'Files in /work:'
-            ls -lh /work/
             exit 1
         fi
         
         GOL_SIZE=\$(du -h input.gol | cut -f1)
-        GOL_SIZE_KB=\$(du -k input.gol | cut -f1)
-        PBF_SIZE_KB=\$(du -k /input/$INPUT_NAME | cut -f1)
-        COMPRESSION=\$(awk \"BEGIN {printf \\\"%.1f\\\", (\$GOL_SIZE_KB/\$PBF_SIZE_KB)*100}\" 2>/dev/null || echo \"?\")
-        echo ''
         echo '✓ GOL created successfully'
-        echo \"  GOL size: \$GOL_SIZE (\${COMPRESSION}% of PBF size)\"
+        echo \"  Size: \$GOL_SIZE\"
         echo ''
         
-        # Step 2: Generate tiles from GOL
-        echo '🗺️  Step 2/2: Generating tiles from GOL...'
-        echo ''
-        echo '  GOL: input.gol'
-        echo \"  Config: /config/$CONFIG_NAME\"
-        echo \"  Output: /output\"
-        echo \"  Options: $ZOOM_ARGS\"
+        # Step 2: Generate tiles 
+        echo '🗺️  Step 2/2: Generating tiles ...'
         echo ''
         
         python3 /work/tile_generator.py \
             input.gol \
             /output \
             /config/$CONFIG_NAME \
-            $ZOOM_ARGS || {
-            echo ''
-            echo 'Checking if config file exists:'
-            ls -lh /config/$CONFIG_NAME || echo 'Config not found'
-            echo ''
-            echo 'Checking /config directory:'
-            ls -lh /config/ || echo '/config not found'
-            exit 1
-        }
+            $ZOOM_ARGS
         
         echo ''
         
         # Show results
         if [ -d \"/output\" ]; then
-            TILE_COUNT=\$(find \"/output\" -name '*.bin' 2>/dev/null | wc -l)
-            TOTAL_SIZE=\$(du -sh \"/output\" 2>/dev/null | cut -f1)
-            echo '✓ Generation completed'
-            echo \"  Tiles generated: \$TILE_COUNT\"
-            echo \"  Total size: \$TOTAL_SIZE\"
+            echo '✓ Tiles generation completed'
         fi
-    "
+        "
 
-# Cleanup Docker resources
-# Default behavior: KEEP the image for reuse
-# Only clean if --clean-docker flag is set
+# Docker cleanup logic
 if [ "$FORCE_CLEAN" = true ]; then
     echo ""
     echo -e "${YELLOW}Cleaning up Docker resources...${NC}"
     
-    # Remove the Docker image created for this run
     if [ -n "$IMAGE_EXISTS" ]; then
-        echo "  Removing Docker image: tile-generator:latest"
-        $DOCKER_CMD rmi tile-generator:latest > /dev/null 2>&1
+        echo "  Removing Docker image: tile-generator:light"
+        $DOCKER_CMD rmi tile-generator:light > /dev/null 2>&1 || true
     fi
     
-    # Remove any dangling images
-    DANGLING_IMAGES=$($DOCKER_CMD images -f "dangling=true" -q 2>/dev/null | wc -l)
-    if [ "$DANGLING_IMAGES" -gt 0 ]; then
+    # Clean dangling images
+    DANGLING=$($DOCKER_CMD images -f "dangling=true" -q 2>/dev/null | wc -l)
+    if [ "$DANGLING" -gt 0 ]; then
         echo "  Removing dangling images..."
-        $DOCKER_CMD rmi $($DOCKER_CMD images -f "dangling=true" -q) > /dev/null 2>&1
+        $DOCKER_CMD rmi $($DOCKER_CMD images -f "dangling=true" -q) > /dev/null 2>&1 || true
     fi
     
     echo -e "${GREEN}✓ Docker cleanup completed${NC}"
 else
-    # Default behavior: Keep the image for future runs
     echo ""
-    echo -e "${GREEN}✓ Docker image kept for reuse (use --clean-docker to rebuild)${NC}"
-    IMAGE_SIZE=$($DOCKER_CMD images tile-generator:latest --format "{{.Size}}" 2>/dev/null || echo "unknown")
-    echo "  Image size: $IMAGE_SIZE"
+    echo -e "${GREEN}✓ Docker image kept for reuse${NC}"
+    echo "  Use --clean-docker to rebuild"
+    IMAGE_SIZE=$($DOCKER_CMD images tile-generator:light --format "{{.Size}}" 2>/dev/null || echo "unknown")
+    echo "  Image size: $IMAGE_SIZE "
 fi
-echo ""
 
+echo ""
 echo -e "${GREEN}✓ Tiles generated in: $OUTPUT_DIR${NC}"
+echo ""
+echo -e "${BLUE}Summary:${NC}"
+echo "  • Docker image kept for reuse"
+echo "  • Use --clean-docker to rebuild"

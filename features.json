@@ -25,474 +25,492 @@
     "zoom": 6,
     "color": "#0077FF",
     "description": "Coastlines",
-    "priority": 1
+    "priority": 100
   },
   "natural=water": {
     "zoom": 12,
     "color": "#3399FF",
     "description": "Water bodies",
-    "priority": 1
+    "priority": 100
   },
   "natural=bay": {
     "zoom": 12,
     "color": "#3399FF",
     "description": "Bay",
-    "priority": 1
+    "priority": 100
+  },
+  "waterway=riverbank": {
+    "zoom": 12,
+    "color": "#3399FF",
+    "description": "River areas",
+    "priority": 100
+  },
+  "waterway=dock": {
+    "zoom": 14,
+    "color": "#3399FF",
+    "description": "Docks",
+    "priority": 100
+  },
+  "waterway=boatyard": {
+    "zoom": 14,
+    "color": "#3399FF",
+    "description": "Boatyards",
+    "priority": 100
   },
   "natural=beach": {
     "zoom": 12,
     "color": "#FFD580",
     "description": "Beach",
-    "priority": 2
+    "priority": 90
   },
   "natural=sand": {
     "zoom": 12,
     "color": "#FFE4B5",
     "description": "Sand",
-    "priority": 2
+    "priority": 90
   },
   "natural=wetland": {
     "zoom": 12,
     "color": "#A0D8E8",
     "description": "Wetland",
-    "priority": 2
+    "priority": 90
   },
   "natural=wood": {
     "zoom": 12,
     "color": "#228B22",
     "description": "Woods",
-    "priority": 2
+    "priority": 90
   },
   "landuse=forest": {
     "zoom": 12,
     "color": "#228B22",
     "description": "Forest areas",
-    "priority": 2
+    "priority": 90
   },
   "natural=forest": {
     "zoom": 12,
     "color": "#228B22",
     "description": "Natural forests",
-    "priority": 2
+    "priority": 90
   },
   "natural=scrub": {
     "zoom": 12,
     "color": "#6BBF59",
     "description": "Scrub",
-    "priority": 2
+    "priority": 90
   },
   "natural=heath": {
     "zoom": 12,
     "color": "#C2B280",
     "description": "Heath",
-    "priority": 2
+    "priority": 90
   },
   "natural=grassland": {
     "zoom": 12,
     "color": "#B6FF99",
     "description": "Grassland",
-    "priority": 2
+    "priority": 90
   },
   "landuse=meadow": {
     "zoom": 14,
     "color": "#B6FF99",
     "description": "Meadows",
-    "priority": 2
+    "priority": 90
   },
   "landuse=grass": {
     "zoom": 14,
     "color": "#B6FF99",
     "description": "Grass areas",
-    "priority": 2
+    "priority": 90
   },
   "landuse=orchard": {
     "zoom": 14,
     "color": "#E1FFB5",
     "description": "Orchard",
-    "priority": 2
+    "priority": 90
   },
   "landuse=vineyard": {
     "zoom": 14,
     "color": "#E1FFB5",
     "description": "Vineyard",
-    "priority": 2
+    "priority": 90
   },
   "landuse=farmland": {
     "zoom": 12,
     "color": "#FFFACD",
     "description": "Farmland",
-    "priority": 2
+    "priority": 90
   },
   "landuse=cemetery": {
     "zoom": 14,
     "color": "#CCCCCC",
     "description": "Cemetery",
-    "priority": 3
+    "priority": 85
   },
   "landuse=allotments": {
     "zoom": 14,
     "color": "#CCCCCC",
     "description": "Allotments",
-    "priority": 3
+    "priority": 85
   },
   "landuse=park": {
     "zoom": 12,
     "color": "#66CC66",
     "description": "Park areas",
-    "priority": 3
+    "priority": 85
   },
   "leisure=park": {
     "zoom": 12,
     "color": "#66CC66",
     "description": "Park",
-    "priority": 3
+    "priority": 85
   },
   "leisure=pitch": {
     "zoom": 12,
     "color": "#98FB98",
     "description": "Pitch",
-    "priority": 3
+    "priority": 85
   },
   "leisure=golf_course": {
     "zoom": 12,
     "color": "#B6FF99",
     "description": "Golf course",
-    "priority": 3
+    "priority": 85
   },
   "leisure=stadium": {
     "zoom": 12,
     "color": "#808080",
     "description": "Stadium",
-    "priority": 3
+    "priority": 85
   },
   "leisure=sports_centre": {
     "zoom": 12,
     "color": "#808080",
     "description": "Sports centre",
-    "priority": 3
+    "priority": 85
   },
   "leisure=playground": {
     "zoom": 12,
     "color": "#FFD700",
     "description": "Playground",
-    "priority": 3
+    "priority": 85
   },
   "place=suburb": {
     "zoom": 14,
     "color": "#E6E6E6",
     "description": "Suburbs",
-    "priority": 4
+    "priority": 80
   },
   "landuse=residential": {
     "zoom": 12,
     "color": "#E6E6E6",
     "description": "Residential areas",
-    "priority": 4
+    "priority": 80
   },
   "landuse=commercial": {
     "zoom": 14,
     "color": "#FFE4B5",
     "description": "Commercial areas",
-    "priority": 4
+    "priority": 80
   },
   "landuse=retail": {
     "zoom": 14,
     "color": "#FFE4B5",
     "description": "Retail areas",
-    "priority": 4
+    "priority": 80
   },
   "landuse=industrial": {
     "zoom": 12,
     "color": "#D3D3D3",
     "description": "Industrial areas",
-    "priority": 4
+    "priority": 80
   },
   "landuse=construction": {
     "zoom": 14,
     "color": "#FFDAB9",
     "description": "Construction areas",
-    "priority": 4
+    "priority": 80
   },
   "amenity=parking": {
     "zoom": 15,
     "color": "#B0B0B0",
     "description": "Parking areas",
-    "priority": 5
+    "priority": 75
   },
   "waterway=river": {
     "zoom": 8,
     "color": "#3399FF",
     "description": "Rivers",
-    "priority": 6
+    "priority": 70
   },
   "waterway=stream": {
     "zoom": 8,
     "color": "#3399FF",
     "description": "Streams",
-    "priority": 6
+    "priority": 70
   },
   "waterway=canal": {
     "zoom": 12,
     "color": "#3399FF",
     "description": "Canals",
-    "priority": 6
+    "priority": 70
   },
   "railway=rail": {
     "zoom": 8,
     "color": "#A9A9A9",
     "description": "Railways",
-    "priority": 7
+    "priority": 65
   },
   "railway=subway": {
     "zoom": 12,
     "color": "#A9A9A9",
     "description": "Subway lines",
-    "priority": 7
+    "priority": 65
   },
   "railway=tram": {
     "zoom": 12,
     "color": "#B0C4DE",
     "description": "Tram lines",
-    "priority": 7
-  },
-  "amenity=hospital": {
-    "zoom": 15,
-    "color": "#FF0000",
-    "description": "Hospitals",
-    "priority": 8
-  },
-  "amenity=school": {
-    "zoom": 15,
-    "color": "#FFFACD",
-    "description": "Schools",
-    "priority": 8
-  },
-  "amenity=university": {
-    "zoom": 15,
-    "color": "#FFFACD",
-    "description": "University",
-    "priority": 8
-  },
-  "amenity=kindergarten": {
-    "zoom": 15,
-    "color": "#FFFACD",
-    "description": "Kindergarten",
-    "priority": 8
-  },
-  "amenity=place_of_worship": {
-    "zoom": 15,
-    "color": "#FFF8DC",
-    "description": "Place of worship",
-    "priority": 8
-  },
-  "amenity=police": {
-    "zoom": 15,
-    "color": "#000080",
-    "description": "Police",
-    "priority": 8
-  },
-  "amenity=fire_station": {
-    "zoom": 15,
-    "color": "#FF0000",
-    "description": "Fire station",
-    "priority": 8
-  },
-  "amenity=library": {
-    "zoom": 15,
-    "color": "#4682B4",
-    "description": "Library",
-    "priority": 8
-  },
-  "amenity=post_office": {
-    "zoom": 15,
-    "color": "#FFD700",
-    "description": "Post office",
-    "priority": 8
-  },
-  "amenity=bank": {
-    "zoom": 15,
-    "color": "#FFD700",
-    "description": "Bank",
-    "priority": 8
-  },
-  "amenity=pharmacy": {
-    "zoom": 15,
-    "color": "#FF0000",
-    "description": "Pharmacy",
-    "priority": 8
-  },
-  "amenity=bus_station": {
-    "zoom": 15,
-    "color": "#4682B4",
-    "description": "Bus station",
-    "priority": 8
-  },
-  "amenity=marketplace": {
-    "zoom": 15,
-    "color": "#FFF8DC",
-    "description": "Marketplace",
-    "priority": 8
+    "priority": 65
   },
   "building": {
     "zoom": 15,
     "color": "#BBBBBB",
     "description": "Buildings",
-    "priority": 9
+    "priority": 60
+  },
+  "amenity=hospital": {
+    "zoom": 15,
+    "color": "#FF0000",
+    "description": "Hospitals",
+    "priority": 55
+  },
+  "amenity=school": {
+    "zoom": 15,
+    "color": "#FFFACD",
+    "description": "Schools",
+    "priority": 55
+  },
+  "amenity=university": {
+    "zoom": 15,
+    "color": "#FFFACD",
+    "description": "University",
+    "priority": 55
+  },
+  "amenity=kindergarten": {
+    "zoom": 15,
+    "color": "#FFFACD",
+    "description": "Kindergarten",
+    "priority": 55
+  },
+  "amenity=place_of_worship": {
+    "zoom": 15,
+    "color": "#FFF8DC",
+    "description": "Place of worship",
+    "priority": 55
+  },
+  "amenity=police": {
+    "zoom": 15,
+    "color": "#000080",
+    "description": "Police",
+    "priority": 55
+  },
+  "amenity=fire_station": {
+    "zoom": 15,
+    "color": "#FF0000",
+    "description": "Fire station",
+    "priority": 55
+  },
+  "amenity=library": {
+    "zoom": 15,
+    "color": "#4682B4",
+    "description": "Library",
+    "priority": 55
+  },
+  "amenity=post_office": {
+    "zoom": 15,
+    "color": "#FFD700",
+    "description": "Post office",
+    "priority": 55
+  },
+  "amenity=bank": {
+    "zoom": 15,
+    "color": "#FFD700",
+    "description": "Bank",
+    "priority": 55
+  },
+  "amenity=pharmacy": {
+    "zoom": 15,
+    "color": "#FF0000",
+    "description": "Pharmacy",
+    "priority": 55
+  },
+  "amenity=bus_station": {
+    "zoom": 15,
+    "color": "#4682B4",
+    "description": "Bus station",
+    "priority": 55
+  },
+  "amenity=marketplace": {
+    "zoom": 15,
+    "color": "#FFF8DC",
+    "description": "Marketplace",
+    "priority": 55
   },
   "highway=motorway": {
     "zoom": 6,
     "color": "#FFFFFF",
     "description": "Motorways",
-    "priority": 10
+    "priority": 50
   },
   "highway=trunk": {
     "zoom": 6,
     "color": "#FFD700",
     "description": "Trunk roads",
-    "priority": 11
+    "priority": 49
   },
   "highway=primary": {
     "zoom": 6,
     "color": "#FFA500",
     "description": "Primary roads",
-    "priority": 12
+    "priority": 48
   },
   "highway=secondary": {
     "zoom": 12,
     "color": "#FFF200",
     "description": "Secondary roads",
-    "priority": 13
+    "priority": 47
   },
   "highway=tertiary": {
     "zoom": 12,
     "color": "#FFDAB9",
     "description": "Tertiary roads",
-    "priority": 14
+    "priority": 46
   },
   "highway=residential": {
     "zoom": 14,
     "color": "#EFEFEF",
     "description": "Residential roads",
-    "priority": 15
+    "priority": 45
   },
   "highway=living_street": {
     "zoom": 14,
     "color": "#EFEFEF",
     "description": "Living streets",
-    "priority": 16
+    "priority": 44
   },
   "highway=service": {
     "zoom": 14,
     "color": "#D3D3D3",
     "description": "Service roads",
-    "priority": 17
+    "priority": 43
   },
   "highway=pedestrian": {
     "zoom": 15,
     "color": "#F8E8E8",
     "description": "Pedestrian areas",
-    "priority": 18
+    "priority": 42
   },
   "highway=track": {
     "zoom": 15,
     "color": "#C8B080",
     "description": "Tracks",
-    "priority": 19
+    "priority": 41
   },
   "highway=path": {
     "zoom": 15,
     "color": "#C8B080",
     "description": "Paths",
-    "priority": 20
+    "priority": 40
   },
   "highway=footway": {
     "zoom": 15,
     "color": "#E8D8C8",
     "description": "Footways",
-    "priority": 21
+    "priority": 39
   },
   "highway=cycleway": {
     "zoom": 15,
     "color": "#4682B4",
     "description": "Cycleways",
-    "priority": 22
+    "priority": 38
   },
   "highway=steps": {
     "zoom": 16,
     "color": "#E8D8C8",
     "description": "Steps",
-    "priority": 23
+    "priority": 37
   },
   "highway=crossing": {
     "zoom": 16,
     "color": "#FFD700",
     "description": "Crossings",
-    "priority": 24
+    "priority": 36
   },
   "highway=bus_stop": {
     "zoom": 17,
     "color": "#4682B4",
     "description": "Bus stops",
-    "priority": 25
+    "priority": 35
   },
   "highway=unclassified": {
     "zoom": 12,
     "color": "#EFEFEF",
     "description": "Unclassified roads",
-    "priority": 26
+    "priority": 34
   },
   "natural=peak": {
     "zoom": 15,
     "color": "#964B00",
     "description": "Mountain peaks",
-    "priority": 27
+    "priority": 30
   },
   "natural=tree_row": {
     "zoom": 16,
     "color": "#228B22",
     "description": "Tree rows",
-    "priority": 28
+    "priority": 29
   },
   "natural=tree": {
     "zoom": 17,
     "color": "#228B22",
     "description": "Individual trees",
-    "priority": 29
+    "priority": 28
   },
   "highway=street_lamp": {
     "zoom": 17,
     "color": "#FFFACD",
     "description": "Street lamps",
-    "priority": 30
+    "priority": 27
   },
   "natural=spring": {
     "zoom": 17,
     "color": "#3399FF",
     "description": "Springs",
-    "priority": 31
+    "priority": 26
   },
   "place=state": {
     "zoom": 8,
     "color": "#2C3E50",
     "description": "State labels",
-    "priority": 32
+    "priority": 25
   },
   "place=town": {
     "zoom": 12,
     "color": "#34495E",
     "description": "Towns",
-    "priority": 33
+    "priority": 24
   },
   "place=village": {
     "zoom": 12,
     "color": "#546E7A",
     "description": "Villages",
-    "priority": 34
+    "priority": 23
   },
   "place=hamlet": {
     "zoom": 15,
     "color": "#90A4AE",
     "description": "Hamlets",
-    "priority": 35
+    "priority": 22
   }
 }
