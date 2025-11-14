@@ -623,7 +623,6 @@ Examples:
     else:
         zoom_levels = [int(args.zoom)]
     max_file_size_bytes = args.max_file_size * 1024
-    logger.info("Step 2/2: Generating tiles...")
     logger.info("Input: " + args.gol_file)
     logger.info("Output: " + args.output_dir)
     logger.info("Config: " + args.config_file)

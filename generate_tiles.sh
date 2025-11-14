@@ -2,7 +2,7 @@
 
 # Script to generate tiles from PBF using Docker
 # Converts PBF -> GOL -> Tiles automatically
-# Optimized version with minimal dependencies (NO SHAPELY)
+# Optimized version with minimal dependencies 
 
 set -e
 
@@ -119,7 +119,7 @@ fi
 
 echo -e "${YELLOW}Preparing Docker environment...${NC}"
 
-# Create lightweight Dockerfile (NO SHAPELY, NO OSMIUM)
+# Create Dockerfile
 cat > /tmp/Dockerfile.tiles.light << 'EOF'
 FROM python:3.11-slim
 
@@ -127,20 +127,21 @@ FROM python:3.11-slim
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
     wget ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* >/dev/null 2>&1
 
-# Install minimal Python dependencies (NO SHAPELY)
-# Total size: ~20MB vs ~200MB with shapely
+RUN pip install --no-cache-dir --upgrade pip >/dev/null 2>&1
+
+# Install minimal Python dependencies
 RUN pip install --no-cache-dir \
     ijson==3.2.3 \
     tqdm==4.66.1 \
-    psutil==5.9.8
+    psutil==5.9.8 >/dev/null 2>&1
 
 WORKDIR /work
 
 # Display installed packages for verification
 RUN pip list && \
-    echo "Docker image ready - lightweight version (no shapely)"
+    echo "Docker image ready for tile generation"
 EOF
 
 # Handle --clean-docker option
@@ -158,13 +159,20 @@ fi
 # Check if Docker image exists
 IMAGE_EXISTS=$($DOCKER_CMD images tile-generator:light -q 2>/dev/null || true)
 if [ -z "$IMAGE_EXISTS" ]; then
-    echo -e "${YELLOW}Building lightweight Docker image${NC}"
+    echo -e "${YELLOW}Building Docker image${NC}"
     echo ""
     
-    $DOCKER_CMD build --progress=plain -t tile-generator:light -f /tmp/Dockerfile.tiles.light .
+    #$DOCKER_CMD build --progress=plain -t tile-generator:light -f /tmp/Dockerfile.tiles.light . >/dev/null 2>&1
+    #$DOCKER_CMD build --progress=tty -t tile-generator:light -f /tmp/Dockerfile.tiles.light .
+    #DOCKER_BUILDKIT=1 \
+    #$DOCKER_CMD build --progress=plain -t tile-generator:light -f /tmp/Dockerfile.tiles.light .
+    DOCKER_BUILDKIT=1 \
+    $DOCKER_CMD build -t tile-generator:light -f /tmp/Dockerfile.tiles.light .
+
+
     
     echo ""
-    echo -e "${GREEN}✓ Lightweight Docker image created${NC}"
+    echo -e "${GREEN}✓ Docker image created${NC}"
     
     # Show image size
     IMAGE_SIZE=$($DOCKER_CMD images tile-generator:light --format "{{.Size}}" 2>/dev/null || echo "unknown")
@@ -191,7 +199,7 @@ else
 fi
 
 echo ""
-echo "🚀 Starting tile generation (lightweight mode)..."
+echo "🚀 Starting tile generation ..."
 echo ""
 
 # Run in Docker
@@ -204,7 +212,7 @@ $DOCKER_CMD run --rm \
     tile-generator:light bash -c "
         set -e
         
-        echo '✓ Lightweight Python environment ready'
+        echo '✓ Python environment ready'
         echo ''
         
         # Step 1: Convert PBF to GOL
@@ -239,7 +247,7 @@ $DOCKER_CMD run --rm \
         echo \"  Size: \$GOL_SIZE\"
         echo ''
         
-        # Step 2: Generate tiles (NO SHAPELY - pure Python)
+        # Step 2: Generate tiles 
         echo '🗺️  Step 2/2: Generating tiles ...'
         echo ''
         
@@ -255,7 +263,7 @@ $DOCKER_CMD run --rm \
         if [ -d \"/output\" ]; then
             echo '✓ Tiles generation completed'
         fi
-    "
+        "
 
 # Docker cleanup logic
 if [ "$FORCE_CLEAN" = true ]; then
@@ -280,7 +288,7 @@ else
     echo -e "${GREEN}✓ Docker image kept for reuse${NC}"
     echo "  Use --clean-docker to rebuild"
     IMAGE_SIZE=$($DOCKER_CMD images tile-generator:light --format "{{.Size}}" 2>/dev/null || echo "unknown")
-    echo "  Image size: $IMAGE_SIZE (lightweight)"
+    echo "  Image size: $IMAGE_SIZE "
 fi
 
 echo ""
