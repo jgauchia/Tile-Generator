@@ -16,8 +16,7 @@ NC='\033[0m' # No Color
 # Banner
 echo -e "${BLUE}"
 echo "╔════════════════════════════════════════╗"
-echo "║   PBF → GOL → Tiles (Lightweight)      ║"
-echo "║   No Shapely - Pure Python             ║"
+echo "║   PBF → GOL → Tiles Generator          ║"
 echo "╚════════════════════════════════════════╝"
 echo -e "${NC}"
 
@@ -241,10 +240,7 @@ $DOCKER_CMD run --rm \
         echo ''
         
         # Step 2: Generate tiles (NO SHAPELY - pure Python)
-        echo '🗺️  Step 2/2: Generating tiles (pure Python, no shapely)...'
-        echo ''
-        echo '  Processing mode: Direct coordinate processing'
-        echo '  Memory usage: ~80% less than shapely version'
+        echo '🗺️  Step 2/2: Generating tiles ...'
         echo ''
         
         python3 /work/tile_generator.py \
@@ -257,11 +253,7 @@ $DOCKER_CMD run --rm \
         
         # Show results
         if [ -d \"/output\" ]; then
-            TILE_COUNT=\$(find \"/output\" -name '*.bin' 2>/dev/null | wc -l)
-            TOTAL_SIZE=\$(du -sh \"/output\" 2>/dev/null | cut -f1)
-            echo '✓ Generation completed'
-            echo \"  Tiles: \$TILE_COUNT\"
-            echo \"  Size: \$TOTAL_SIZE\"
+            echo '✓ Tiles generation completed'
         fi
     "
 
