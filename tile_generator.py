@@ -11,6 +11,7 @@ import os
 import gc
 import subprocess
 import ijson
+import time
 from decimal import Decimal
 from tqdm import tqdm
 import argparse
@@ -562,6 +563,20 @@ def write_single_tile(job):
     with open(filepath, 'wb') as f:
         f.write(data)
 
+def format_time(seconds: float) -> str:
+    """Formatea segundos en un formato legible"""
+    if seconds < 60:
+        return f"{seconds:.2f}s"
+    elif seconds < 3600:
+        minutes = int(seconds // 60)
+        secs = seconds % 60
+        return f"{minutes}m {secs:.2f}s"
+    else:
+        hours = int(seconds // 3600)
+        minutes = int((seconds % 3600) // 60)
+        secs = seconds % 60
+        return f"{hours}h {minutes}m {secs:.2f}s"
+
 def generate_tiles(gol_file: str, output_dir: str, config_file: str, zoom_levels: List[int], max_file_size: int = 65536):
     with open(config_file) as f:
         config = json.load(f)
@@ -580,16 +595,25 @@ def generate_tiles(gol_file: str, output_dir: str, config_file: str, zoom_levels
             for feature in ijson.items(process.stdout, "features.item"):
                 feature_count += 1
                 process_feature(feature, config, zoom, tiles_data)
-                if feature_count % 1000 == 0:
+                if feature_count % 5000 == 0:
                     print("\rZoom " + str(zoom) + ": " + str(feature_count) + " features...", end='', flush=True)
             print("\rZoom " + str(zoom) + ": " + str(feature_count) + " features processed", end='')
             sys.stdout.flush()
         except ijson.common.IncompleteJSONError:
             pass
+        finally:
+            # Cerrar explícitamente los pipes del proceso
+            if process.stdout:
+                process.stdout.close()
+            if process.stderr:
+                stderr_content = process.stderr.read() if process.stderr else ""
+                if process.stderr:
+                    process.stderr.close()
+        
         process.wait()
         if process.returncode != 0:
-            stderr = process.stderr.read()
-            raise RuntimeError("gol query failed: " + stderr)
+            raise RuntimeError("gol query failed: " + stderr_content)
+        
         if tiles_data:
             print(" - Writing " + str(len(tiles_data)) + " tiles")
             tile_jobs = [(tx, ty, entries, zoom, output_dir, max_file_size) for (tx, ty), entries in tiles_data.items()]
@@ -602,10 +626,16 @@ def generate_tiles(gol_file: str, output_dir: str, config_file: str, zoom_levels
                         pbar.update(1)
         else:
             print()
+        
+        # Liberar memoria explícitamente al final de cada nivel de zoom
         del tiles_data
+        del process
         gc.collect()
 
 def main():
+    # Iniciar contador de tiempo
+    start_time = time.time()
+    
     parser = argparse.ArgumentParser(description='Generate map tiles from GoL file using features configuration', formatter_class=argparse.RawDescriptionHelpFormatter, epilog="""
 Examples:
   ./tile_generator.py map.gol output_dir features.json --zoom 6-17
@@ -656,10 +686,16 @@ Examples:
     else:
         size_str = str(round(total_size / (1024 * 1024 * 1024), 2)) + "GB"
     
+    # Calcular tiempo total
+    end_time = time.time()
+    elapsed_time = end_time - start_time
+    
     logger.info("Total tiles written: " + str(total_count))
     logger.info("Total size: " + size_str)
     logger.info("Average tile size: " + str(round(total_size / total_count)) + " bytes" if total_count > 0 else "N/A")
     logger.info("Palette file: " + os.path.join(args.output_dir, 'palette.bin'))
+    logger.info("=" * 50)
+    logger.info("Total processing time: " + format_time(elapsed_time))
 
 if __name__ == "__main__":
     main()
