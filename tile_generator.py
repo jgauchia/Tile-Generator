@@ -90,6 +90,114 @@ def hex_to_rgb332(hex_color: str) -> int:
     except:
         return 0xFF
 
+def douglas_peucker_simplify(points: List, tolerance: float) -> List:
+    """
+    Simplificación de geometría usando algoritmo Douglas-Peucker.
+    Elimina vértices que no aportan información visual significativa.
+    """
+    if len(points) < 3:
+        return points
+    
+    def perpendicular_distance(point, line_start, line_end):
+        """Calcula distancia perpendicular de un punto a una línea"""
+        x0, y0 = point[0], point[1]
+        x1, y1 = line_start[0], line_start[1]
+        x2, y2 = line_end[0], line_end[1]
+        
+        dx = x2 - x1
+        dy = y2 - y1
+        
+        if dx == 0 and dy == 0:
+            return math.sqrt((x0 - x1)**2 + (y0 - y1)**2)
+        
+        return abs(dy * x0 - dx * y0 + x2 * y1 - y2 * x1) / math.sqrt(dx**2 + dy**2)
+    
+    def simplify_recursive(points_list, start_idx, end_idx, tolerance):
+        """Recursivamente simplifica el segmento de puntos"""
+        max_dist = 0
+        max_idx = start_idx
+        
+        for i in range(start_idx + 1, end_idx):
+            dist = perpendicular_distance(points_list[i], points_list[start_idx], points_list[end_idx])
+            if dist > max_dist:
+                max_dist = dist
+                max_idx = i
+        
+        if max_dist > tolerance:
+            # Dividir y conquistar
+            left = simplify_recursive(points_list, start_idx, max_idx, tolerance)
+            right = simplify_recursive(points_list, max_idx, end_idx, tolerance)
+            return left[:-1] + right
+        else:
+            return [points_list[start_idx], points_list[end_idx]]
+    
+    if len(points) < 3:
+        return points
+    
+    simplified = simplify_recursive(points, 0, len(points) - 1, tolerance)
+    return simplified
+
+def get_simplification_tolerance(zoom: int) -> float:
+    """
+    Retorna tolerancia de simplificación en grados según zoom.
+    Optimizado para pantalla 480x320.
+    """
+    if zoom < 13:
+        return 0.0001  # ~11 metros
+    elif zoom == 13:
+        return 0.00005  # ~5.5 metros
+    elif zoom == 14:
+        return 0.00003  # ~3.3 metros
+    elif zoom == 15:
+        return 0.00002  # ~2.2 metros
+    elif zoom == 16:
+        return 0.00001  # ~1.1 metros (agresivo pero imperceptible en 480x320)
+    else:  # zoom 17+
+        return 0.000007  # ~0.8 metros (muy agresivo para pantalla pequeña)
+
+def simplify_coordinates(coordinates, geom_type: str, zoom: int):
+    """
+    Simplifica coordenadas según tipo de geometría y zoom.
+    Retorna coordenadas simplificadas.
+    """
+    if zoom < 16:
+        return coordinates
+    
+    tolerance = get_simplification_tolerance(zoom)
+    
+    def simplify_ring(ring):
+        if not ring or len(ring) < 3:
+            return ring
+        simplified = douglas_peucker_simplify(ring, tolerance)
+        # Asegurar que el anillo se cierra
+        if simplified and simplified[0] != simplified[-1]:
+            simplified.append(simplified[0])
+        return simplified
+    
+    if geom_type == "LineString":
+        if len(coordinates) < 3:
+            return coordinates
+        return douglas_peucker_simplify(coordinates, tolerance)
+    
+    elif geom_type == "Polygon":
+        if not coordinates or not coordinates[0]:
+            return coordinates
+        simplified_exterior = simplify_ring(coordinates[0])
+        return [simplified_exterior]
+    
+    elif geom_type == "MultiLineString":
+        return [douglas_peucker_simplify(line, tolerance) if len(line) >= 3 else line for line in coordinates]
+    
+    elif geom_type == "MultiPolygon":
+        result = []
+        for poly in coordinates:
+            if poly and poly[0]:
+                simplified_exterior = simplify_ring(poly[0])
+                result.append([simplified_exterior])
+        return result
+    
+    return coordinates
+
 def geojson_bounds(coordinates, geom_type: str) -> Tuple[float, float, float, float]:
     def flatten_coords(coords):
         if not coords:
@@ -346,18 +454,14 @@ def get_layer_from_tags(tags: Dict) -> int:
         return 5
     return 1
 
-def geometry_to_commands(geom_type: str, coordinates, color: int, zoom: int, tile_x: int, tile_y: int, tags: Dict, hex_color: str = None) -> List[Dict]:
+def geometry_to_commands(geom_type: str, coordinates, color: int, zoom: int, tile_x: int, tile_y: int, layer: int, color_index: Optional[int] = None) -> List[Dict]:
     commands = []
-    layer = get_layer_from_tags(tags)
     commands.append({'type': DRAW_COMMANDS['SET_LAYER'], 'layer': layer})
-    if hex_color:
-        color_index = hex_to_color_index(hex_color)
-        if color_index is not None:
-            commands.append({'type': DRAW_COMMANDS['SET_COLOR_INDEX'], 'color_index': color_index})
-        else:
-            commands.append({'type': DRAW_COMMANDS['SET_COLOR'], 'color': color})
+    if color_index is not None:
+        commands.append({'type': DRAW_COMMANDS['SET_COLOR_INDEX'], 'color_index': color_index})
     else:
         commands.append({'type': DRAW_COMMANDS['SET_COLOR'], 'color': color})
+    
     def process_linestring(coords):
         if len(coords) < 2:
             return []
@@ -374,6 +478,7 @@ def geometry_to_commands(geom_type: str, coordinates, color: int, zoom: int, til
             return [{'type': DRAW_COMMANDS['LINE'], 'x1': x1, 'y1': y1, 'x2': x2, 'y2': y2}]
         else:
             return [{'type': DRAW_COMMANDS['POLYLINE'], 'points': unique_pixels}]
+    
     def process_polygon(coords):
         if not coords or not coords[0] or len(coords[0]) < 3:
             return []
@@ -388,6 +493,7 @@ def geometry_to_commands(geom_type: str, coordinates, color: int, zoom: int, til
         if len(set(unique_pixels)) < 3:
             return []
         return [{'type': DRAW_COMMANDS['STROKE_POLYGON'], 'points': unique_pixels}]
+    
     if geom_type == "LineString":
         commands.extend(process_linestring(coordinates))
     elif geom_type == "Polygon":
@@ -491,7 +597,8 @@ def compress_goql_queries(config: Dict) -> str:
             parts.append("nwa[" + tag + "~'^(" + pat + ")$']")
     for tag in sorted(area_single):
         parts.append("nwa[" + tag + "]")
-    return ", ".join(parts) if parts else "*"
+    query = ", ".join(parts) if parts else "*"
+    return query
 
 def process_feature(feature: Dict, config: Dict, zoom: int, tiles_data: Dict):
     geom = feature.get('geometry')
@@ -500,19 +607,35 @@ def process_feature(feature: Dict, config: Dict, zoom: int, tiles_data: Dict):
         return
     geom_type = geom['type']
     coordinates = geom['coordinates']
-    coordinates = normalize_coordinates(coordinates)
+    
+    # Obtener estilo primero - si no hay estilo, salir temprano
     style = get_style_for_tags(props, config)
     if not style:
         return
-    hex_color = style.get('color', '#FFFFFF')
-    color = hex_to_rgb332(hex_color)
+    
+    # Filtro de zoom temprano - antes de normalizar coordenadas
     zoom_filter = style.get('zoom', 6)
-    priority = style.get('priority', 50)
     if zoom < zoom_filter:
         return
+    
+    # Normalizar coordenadas
+    coordinates = normalize_coordinates(coordinates)
+    
+    # PROPUESTA F: Simplificar geometría en zoom 16-17
+    if zoom >= 16:
+        coordinates = simplify_coordinates(coordinates, geom_type, zoom)
+    
+    # CACHE: Calcular una vez los valores que se reutilizarán para todos los tiles
+    hex_color = style.get('color', '#FFFFFF')
+    color = hex_to_rgb332(hex_color)
+    color_index = hex_to_color_index(hex_color)
+    priority = style.get('priority', 50)
+    layer = get_layer_from_tags(props)
+    
     minx, miny, maxx, maxy = geojson_bounds(coordinates, geom_type)
     tile_x_min, tile_y_min = deg2num(miny, minx, zoom)
     tile_x_max, tile_y_max = deg2num(maxy, maxx, zoom)
+    
     for tx in range(min(tile_x_min, tile_x_max), max(tile_x_min, tile_x_max) + 1):
         for ty in range(min(tile_y_min, tile_y_max), max(tile_y_min, tile_y_max) + 1):
             tile_bounds = tile_bbox(tx, ty, zoom)
@@ -521,12 +644,13 @@ def process_feature(feature: Dict, config: Dict, zoom: int, tiles_data: Dict):
             clipped = clip_coordinates_to_tile(coordinates, geom_type, tile_bounds)
             if not clipped:
                 continue
-            commands = geometry_to_commands(geom_type, clipped, color, zoom, tx, ty, props, hex_color)
+            # Usar valores cacheados en lugar de recalcularlos
+            commands = geometry_to_commands(geom_type, clipped, color, zoom, tx, ty, layer, color_index)
             if commands:
                 tile_key = (tx, ty)
                 if tile_key not in tiles_data:
                     tiles_data[tile_key] = []
-                tiles_data[tile_key].append({'commands': commands, 'priority': priority, 'layer': get_layer_from_tags(props)})
+                tiles_data[tile_key].append({'commands': commands, 'priority': priority, 'layer': layer})
 
 def get_style_for_tags(tags: Dict, config: Dict) -> Optional[Dict]:
     for k, v in tags.items():
@@ -577,27 +701,101 @@ def format_time(seconds: float) -> str:
         secs = seconds % 60
         return f"{hours}h {minutes}m {secs:.2f}s"
 
-def generate_tiles(gol_file: str, output_dir: str, config_file: str, zoom_levels: List[int], max_file_size: int = 65536):
+def merge_tiles_data(target: Dict, source: Dict):
+    """Fusiona source en target, acumulando comandos para tiles duplicados"""
+    for tile_key, entries in source.items():
+        if tile_key in target:
+            target[tile_key].extend(entries)
+        else:
+            target[tile_key] = entries
+
+def write_tiles_batch(tiles_data: Dict, zoom: int, output_dir: str, max_file_size: int, max_workers: int, persistent_tiles: Dict):
+    """Fusiona tiles_data en persistent_tiles sin escribir aún"""
+    merge_tiles_data(persistent_tiles, tiles_data)
+    return len(tiles_data)
+
+def write_final_tiles(persistent_tiles: Dict, zoom: int, output_dir: str, max_file_size: int, max_workers: int):
+    """Escribe todos los tiles acumulados al final del zoom"""
+    if not persistent_tiles:
+        return 0
+    
+    tile_jobs = [(tx, ty, entries, zoom, output_dir, max_file_size) for (tx, ty), entries in persistent_tiles.items()]
+    tiles_written = len(tile_jobs)
+    
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(write_single_tile, job) for job in tile_jobs]
+        for future in as_completed(futures):
+            future.result()
+    
+    return tiles_written
+
+def get_adaptive_batch_size(zoom: int, base_batch_size: int) -> int:
+    """Calcula batch size adaptativo según el nivel de zoom"""
+    if zoom < 10:
+        return base_batch_size
+    elif zoom < 13:
+        return max(base_batch_size // 2, 10000)
+    elif zoom < 15:
+        return max(base_batch_size // 4, 5000)
+    else:
+        return max(base_batch_size // 8, 2500)
+
+def generate_tiles(gol_file: str, output_dir: str, config_file: str, zoom_levels: List[int], max_file_size: int = 65536, batch_size: int = 50000):
     with open(config_file) as f:
         config = json.load(f)
+    
+    # Pre-computar datos que no cambian entre zooms
     precompute_global_color_palette(config)
     write_palette_bin(output_dir)
     query = compress_goql_queries(config)
+    
     cpu_count = os.cpu_count() or 4
     max_workers = min(cpu_count, 8)
+    
+    # Cachear la ruta del ejecutable gol
+    gol_cmd = "/gol" if os.path.exists("/gol") else "gol"
+    
     for zoom in zoom_levels:
-        logger.info("Processing zoom " + str(zoom) + "...")
-        gol_cmd = "/gol" if os.path.exists("/gol") else "gol"
-        process = subprocess.Popen([gol_cmd, "query", gol_file, query, "-f", "geojson"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=8192)
+        zoom_start = time.time()
+        
+        # Batch size adaptativo según zoom
+        adaptive_batch = get_adaptive_batch_size(zoom, batch_size)
+        simplify_msg = " [geometry simplification enabled]" if zoom >= 16 else ""
+        logger.info("Processing zoom " + str(zoom) + " (batch size: " + str(adaptive_batch) + ")" + simplify_msg + "...")
+        
+        process = subprocess.Popen([gol_cmd, "query", gol_file, query, "-f", "geojson"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=65536)
         tiles_data = {}
+        persistent_tiles = {}  # Acumulador persistente para todo el zoom
         feature_count = 0
+        batch_count = 0
+        
         try:
             for feature in ijson.items(process.stdout, "features.item"):
                 feature_count += 1
                 process_feature(feature, config, zoom, tiles_data)
-                if feature_count % 5000 == 0:
-                    print("\rZoom " + str(zoom) + ": " + str(feature_count) + " features...", end='', flush=True)
-            print("\rZoom " + str(zoom) + ": " + str(feature_count) + " features processed", end='')
+                
+                # Fusionar en persistente cada adaptive_batch features
+                if feature_count % adaptive_batch == 0:
+                    batch_count += 1
+                    write_tiles_batch(tiles_data, zoom, output_dir, max_file_size, max_workers, persistent_tiles)
+                    print("\rZoom " + str(zoom) + ": " + str(feature_count) + " features, " + str(len(persistent_tiles)) + " unique tiles (batch " + str(batch_count) + ")...", end='', flush=True)
+                    # Liberar memoria del lote temporal
+                    tiles_data.clear()
+                    gc.collect()
+                elif feature_count % 5000 == 0:
+                    print("\rZoom " + str(zoom) + ": " + str(feature_count) + " features, " + str(len(tiles_data)) + " tiles in buffer, " + str(len(persistent_tiles)) + " persistent...", end='', flush=True)
+            
+            # Fusionar tiles restantes
+            if tiles_data:
+                write_tiles_batch(tiles_data, zoom, output_dir, max_file_size, max_workers, persistent_tiles)
+            
+            # Ahora escribir TODOS los tiles acumulados
+            print("\rZoom " + str(zoom) + ": " + str(feature_count) + " features processed, writing " + str(len(persistent_tiles)) + " tiles..." + " " * 20)
+            sys.stdout.flush()
+            
+            total_tiles_written = write_final_tiles(persistent_tiles, zoom, output_dir, max_file_size, max_workers)
+            
+            print("\rZoom " + str(zoom) + ": " + str(feature_count) + " features processed, " + str(total_tiles_written) + " tiles written" + " " * 20)
             sys.stdout.flush()
         except ijson.common.IncompleteJSONError:
             pass
@@ -614,21 +812,12 @@ def generate_tiles(gol_file: str, output_dir: str, config_file: str, zoom_levels
         if process.returncode != 0:
             raise RuntimeError("gol query failed: " + stderr_content)
         
-        if tiles_data:
-            print(" - Writing " + str(len(tiles_data)) + " tiles")
-            tile_jobs = [(tx, ty, entries, zoom, output_dir, max_file_size) for (tx, ty), entries in tiles_data.items()]
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                desc_text = "Zoom " + str(zoom)
-                with tqdm(total=len(tile_jobs), desc=desc_text, unit="tiles", leave=False) as pbar:
-                    futures = [executor.submit(write_single_tile, job) for job in tile_jobs]
-                    for future in as_completed(futures):
-                        future.result()
-                        pbar.update(1)
-        else:
-            print()
+        zoom_elapsed = time.time() - zoom_start
+        logger.info("Zoom " + str(zoom) + " completed in " + format_time(zoom_elapsed))
         
         # Liberar memoria explícitamente al final de cada nivel de zoom
         del tiles_data
+        del persistent_tiles
         del process
         gc.collect()
 
@@ -640,26 +829,33 @@ def main():
 Examples:
   ./tile_generator.py map.gol output_dir features.json --zoom 6-17
   ./tile_generator.py map.gol output_dir features.json --zoom 12 --max-file-size 256
+  ./tile_generator.py map.gol output_dir features.json --zoom 6-17 --batch-size 50000
     """)
     parser.add_argument("gol_file", help="Input GoL file path")
     parser.add_argument("output_dir", help="Output directory for tiles")
     parser.add_argument("config_file", help="JSON config file with feature definitions")
     parser.add_argument("--zoom", default="6-17", help="Zoom level(s) to generate")
     parser.add_argument("--max-file-size", type=int, default=128, help="Maximum tile file size in KB")
+    parser.add_argument("--batch-size", type=int, default=50000, help="Base batch size (auto-adjusted per zoom level)")
     args = parser.parse_args()
+    
     if '-' in args.zoom:
         start, end = map(int, args.zoom.split('-'))
         zoom_levels = list(range(start, end + 1))
     else:
         zoom_levels = [int(args.zoom)]
+    
     max_file_size_bytes = args.max_file_size * 1024
+    
     logger.info("Input: " + args.gol_file)
     logger.info("Output: " + args.output_dir)
     logger.info("Config: " + args.config_file)
     logger.info("Zoom levels: " + str(zoom_levels))
     logger.info("Max tile size: " + str(args.max_file_size) + "KB")
+    logger.info("Base batch size: " + str(args.batch_size) + " features (adaptive per zoom)")
+    logger.info("Geometry simplification: Enabled for zoom 16-17 (optimized for 480x320 display)")
     
-    generate_tiles(args.gol_file, args.output_dir, args.config_file, zoom_levels, max_file_size_bytes)
+    generate_tiles(args.gol_file, args.output_dir, args.config_file, zoom_levels, max_file_size_bytes, args.batch_size)
     
     # Count actual tiles and calculate total size
     total_count = 0
