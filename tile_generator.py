@@ -3,6 +3,7 @@
 Optimized tile generator - NO SHAPELY VERSION
 Processes GeoJSON coordinates directly without heavy geometry libraries.
 Optimized for 8GB RAM systems with conservative resource usage.
+Item 1.2: Coordinate processing optimization - ROBUST NORMALIZATION
 """
 
 import math
@@ -41,13 +42,11 @@ def get_available_memory_mb() -> int:
     """Get available memory in MB, with fallback for different platforms"""
     try:
         if os.name == 'posix':
-            # Linux/Mac
             with open('/proc/meminfo', 'r') as f:
                 for line in f:
                     if 'MemAvailable' in line:
                         return int(line.split()[1]) // 1024
         elif os.name == 'nt':
-            # Windows
             import ctypes
             kernel32 = ctypes.windll.kernel32
             ctypes.windll.kernel32.GetPhysicallyInstalledSystemMemory.argtypes = [ctypes.POINTER(ctypes.c_ulonglong)]
@@ -56,21 +55,13 @@ def get_available_memory_mb() -> int:
                 return memory.value // (1024 * 1024)
     except:
         pass
-    return 4096  # Fallback: 4GB assumption
+    return 4096
 
 def get_optimal_workers(cpu_count: int, available_memory_mb: int) -> int:
-    """
-    Calculate optimal worker count considering both CPU and memory constraints.
-    Conservative for 8GB RAM systems, scales for better systems.
-    """
-    # Memory-based constraint: ~1GB per worker baseline
     memory_workers = max(1, min(available_memory_mb // 1024, 6))
-    
-    # CPU-based constraint: leave one core free
     cpu_workers = max(1, cpu_count - 1)
     
-    # Conservative cap for 8GB systems, higher for more RAM
-    if available_memory_mb <= 8192:  # 8GB or less
+    if available_memory_mb <= 8192:
         max_workers = min(3, memory_workers, cpu_workers)
     else:
         max_workers = min(6, memory_workers, cpu_workers)
@@ -79,14 +70,8 @@ def get_optimal_workers(cpu_count: int, available_memory_mb: int) -> int:
     return max_workers
 
 def get_adaptive_batch_size(zoom: int, base_batch_size: int, available_memory_mb: int) -> int:
-    """
-    Calculate adaptive batch size based on zoom level and available memory.
-    Conservative for limited RAM systems, scales for better hardware.
-    """
-    # Memory factor: normalize to 4GB baseline, cap at 2.0 for systems with more RAM
     memory_factor = min(2.0, available_memory_mb / 4096)
     
-    # Base adjustments for zoom levels with memory consideration
     if zoom < 10:
         adjusted_size = max(2000, int(base_batch_size * 0.6 * memory_factor))
     elif zoom < 13:
@@ -96,7 +81,6 @@ def get_adaptive_batch_size(zoom: int, base_batch_size: int, available_memory_mb
     else:
         adjusted_size = max(250, int(base_batch_size * 0.2 * memory_factor))
     
-    logger.debug(f"Zoom {zoom}: base={base_batch_size}, memory_factor={memory_factor:.2f} -> batch={adjusted_size}")
     return adjusted_size
 
 def precompute_global_color_palette(config: Dict[str, Any]) -> int:
@@ -115,7 +99,7 @@ def precompute_global_color_palette(config: Dict[str, Any]) -> int:
         rgb332_value = hex_to_rgb332(hex_color)
         GLOBAL_COLOR_PALETTE[hex_color] = index
         GLOBAL_INDEX_TO_RGB332[index] = rgb332_value
-    logger.info("Palette: " + str(len(unique_colors)) + " colors")
+    logger.info(f"Palette: {len(unique_colors)} colors")
     return len(unique_colors)
 
 def write_palette_bin(output_dir: str):
@@ -251,8 +235,8 @@ def geojson_bounds(coordinates, geom_type: str) -> Tuple[float, float, float, fl
             return [float(coords)]
         if len(coords) == 2:
             try:
-                lon = float(coords[0]) if isinstance(coords[0], Decimal) else coords[0]
-                lat = float(coords[1]) if isinstance(coords[1], Decimal) else coords[1]
+                lon = float(coords[0]) if not isinstance(coords[0], (int, float)) else coords[0]
+                lat = float(coords[1]) if not isinstance(coords[1], (int, float)) else coords[1]
                 if isinstance(lon, (int, float)) and isinstance(lat, (int, float)):
                     return [[lon, lat]]
             except (TypeError, ValueError, IndexError):
@@ -275,35 +259,39 @@ def coords_intersect_tile(coordinates, geom_type: str, tile_bbox: Tuple[float, f
         return False
     return True
 
-def normalize_coordinates(coordinates):
-    if isinstance(coordinates, (int, float)):
+def normalize_coordinates_robust(coordinates):
+    """
+    OPTIMIZATION 1.2: Robust coordinate normalization - handles nested structures
+    """
+    if isinstance(coordinates, (int, float, Decimal)):
         return float(coordinates)
-    if isinstance(coordinates, Decimal):
-        return float(coordinates)
+    
     if isinstance(coordinates, (list, tuple)):
         if len(coordinates) == 2:
-            try:
-                lon = float(coordinates[0]) if isinstance(coordinates[0], Decimal) else coordinates[0]
-                lat = float(coordinates[1]) if isinstance(coordinates[1], Decimal) else coordinates[1]
-                if isinstance(lon, (int, float)) and isinstance(lat, (int, float)):
-                    return [lon, lat]
-            except (TypeError, ValueError, IndexError):
-                pass
-        return [normalize_coordinates(item) for item in coordinates]
+            first, second = coordinates[0], coordinates[1]
+            if (isinstance(first, (int, float, Decimal)) and 
+                isinstance(second, (int, float, Decimal))):
+                return [float(first), float(second)]
+        
+        return [normalize_coordinates_robust(item) for item in coordinates]
+    
     return coordinates
 
 def clip_polygon_sutherland_hodgman(vertices, minx, miny, maxx, maxy):
     if not vertices or len(vertices) < 3:
         return []
+    
     def inside(p, edge):
         if edge == 'left': return p[0] >= minx
         elif edge == 'right': return p[0] <= maxx
         elif edge == 'bottom': return p[1] >= miny
         elif edge == 'top': return p[1] <= maxy
         return False
+    
     def compute_intersection(p1, p2, edge):
-        x1, y1 = p1
-        x2, y2 = p2
+        x1, y1 = float(p1[0]), float(p1[1])
+        x2, y2 = float(p2[0]), float(p2[1])
+        
         if edge == 'left':
             x = minx
             y = y1 + (y2 - y1) * (minx - x1) / (x2 - x1) if x2 != x1 else y1
@@ -317,6 +305,7 @@ def clip_polygon_sutherland_hodgman(vertices, minx, miny, maxx, maxy):
             y = maxy
             x = x1 + (x2 - x1) * (maxy - y1) / (y2 - y1) if y2 != y1 else x1
         return [x, y]
+    
     output = list(vertices)
     for edge in ['left', 'right', 'bottom', 'top']:
         if not output:
@@ -345,8 +334,9 @@ def clip_polygon_sutherland_hodgman(vertices, minx, miny, maxx, maxy):
 
 def clip_line_to_bbox(p1, p2, bbox):
     minx, miny, maxx, maxy = bbox
-    x1, y1 = p1
-    x2, y2 = p2
+    x1, y1 = float(p1[0]), float(p1[1])
+    x2, y2 = float(p2[0]), float(p2[1])
+    
     def compute_outcode(x, y):
         code = 0
         if x < minx: code |= 1
@@ -354,14 +344,18 @@ def clip_line_to_bbox(p1, p2, bbox):
         if y < miny: code |= 4
         if y > maxy: code |= 8
         return code
+    
     outcode1 = compute_outcode(x1, y1)
     outcode2 = compute_outcode(x2, y2)
+    
     while True:
         if outcode1 == 0 and outcode2 == 0:
             return ([x1, y1], [x2, y2])
         if (outcode1 & outcode2) != 0:
             return None
+        
         outcode = outcode1 if outcode1 != 0 else outcode2
+        
         if outcode & 8:
             x = x1 + (x2 - x1) * (maxy - y1) / (y2 - y1)
             y = maxy
@@ -374,6 +368,7 @@ def clip_line_to_bbox(p1, p2, bbox):
         elif outcode & 1:
             y = y1 + (y2 - y1) * (minx - x1) / (x2 - x1)
             x = minx
+            
         if outcode == outcode1:
             x1, y1 = x, y
             outcode1 = compute_outcode(x1, y1)
@@ -383,6 +378,7 @@ def clip_line_to_bbox(p1, p2, bbox):
 
 def clip_coordinates_to_tile(coordinates, geom_type: str, tile_bbox: Tuple[float, float, float, float]):
     minx, miny, maxx, maxy = tile_bbox
+    
     def clip_linestring(coords):
         if not coords or len(coords) < 2:
             return []
@@ -395,6 +391,7 @@ def clip_coordinates_to_tile(coordinates, geom_type: str, tile_bbox: Tuple[float
                     clipped.append(p1)
                 clipped.append(p2)
         return clipped if len(clipped) >= 2 else []
+    
     if geom_type == "Point":
         lon, lat = float(coordinates[0]), float(coordinates[1])
         if minx <= lon <= maxx and miny <= lat <= maxy:
@@ -447,8 +444,9 @@ def coords_to_pixels(coordinates, zoom: int, tile_x: int, tile_y: int) -> List[T
     n = 2.0 ** zoom
     pixels = []
     for coord in coordinates:
-        lon = float(coord[0]) if isinstance(coord[0], Decimal) else coord[0]
-        lat = float(coord[1]) if isinstance(coord[1], Decimal) else coord[1]
+        lon = float(coord[0]) if not isinstance(coord[0], (int, float)) else coord[0]
+        lat = float(coord[1]) if not isinstance(coord[1], (int, float)) else coord[1]
+            
         x = ((lon + 180.0) / 360.0 * n - tile_x) * TILE_SIZE
         lat_rad = math.radians(lat)
         y = ((1.0 - math.log(math.tan(lat_rad) + 1 / math.cos(lat_rad)) / math.pi) / 2.0 * n - tile_y) * TILE_SIZE
@@ -699,7 +697,7 @@ def process_feature(feature: Dict, config: Dict, zoom: int, tiles_data: Dict):
     if zoom < zoom_filter:
         return
     
-    coordinates = normalize_coordinates(coordinates)
+    coordinates = normalize_coordinates_robust(coordinates)
     
     if zoom >= 16:
         coordinates = simplify_coordinates(coordinates, geom_type, zoom)
@@ -802,13 +800,13 @@ def generate_tiles(gol_file: str, output_dir: str, config_file: str, zoom_levels
     with open(config_file) as f:
         config = json.load(f)
     
-    # Detect system resources
     available_memory_mb = get_available_memory_mb()
     cpu_count = os.cpu_count() or 4
     max_workers = get_optimal_workers(cpu_count, available_memory_mb)
     
     logger.info(f"System detected: {cpu_count} CPU cores, {available_memory_mb}MB RAM")
     logger.info(f"Resource settings: {max_workers} workers, base batch size: {base_batch_size}")
+    logger.info("OPTIMIZATION 1.2: ROBUST coordinate normalization - handles nested structures")
     
     precompute_global_color_palette(config)
     write_palette_bin(output_dir)
@@ -819,7 +817,6 @@ def generate_tiles(gol_file: str, output_dir: str, config_file: str, zoom_levels
     for zoom in zoom_levels:
         zoom_start = time.time()
         
-        # Calculate adaptive batch size for this zoom level
         adaptive_batch = get_adaptive_batch_size(zoom, base_batch_size, available_memory_mb)
         logger.info(f"Processing zoom {zoom} (batch size: {adaptive_batch}, workers: {max_workers})...")
         
@@ -901,6 +898,7 @@ def main():
     logger.info(f"Zoom levels: {zoom_levels}")
     logger.info(f"Max tile size: {args.max_file_size}KB")
     logger.info(f"Base batch size: {args.batch_size} features (adaptive per zoom and system RAM)")
+    logger.info("OPTIMIZATION 1.2: ROBUST coordinate normalization - handles nested structures")
     
     generate_tiles(args.gol_file, args.output_dir, args.config_file, zoom_levels, max_file_size_bytes, args.batch_size)
     
