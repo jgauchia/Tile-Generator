@@ -3,7 +3,7 @@
 Optimized tile generator - NO SHAPELY VERSION
 Processes GeoJSON coordinates directly without heavy geometry libraries.
 Optimized for 8GB RAM systems with conservative resource usage.
-Item 1.2: Coordinate processing optimization - ROBUST NORMALIZATION
+Item 2.1: Douglas-Peucker simplification optimization - CORREGIDO
 """
 
 import math
@@ -37,6 +37,22 @@ DRAW_COMMANDS = {
 
 GLOBAL_COLOR_PALETTE = {}
 GLOBAL_INDEX_TO_RGB332 = {}
+
+def perpendicular_distance(point, line_start, line_end):
+    """
+    OPTIMIZATION 2.1: Moved to global scope for accessibility
+    """
+    x0, y0 = point[0], point[1]
+    x1, y1 = line_start[0], line_start[1]
+    x2, y2 = line_end[0], line_end[1]
+    
+    dx = x2 - x1
+    dy = y2 - y1
+    
+    if dx == 0 and dy == 0:
+        return math.sqrt((x0 - x1)**2 + (y0 - y1)**2)
+    
+    return abs(dy * x0 - dx * y0 + x2 * y1 - y2 * x1) / math.sqrt(dx**2 + dy**2)
 
 def get_available_memory_mb() -> int:
     """Get available memory in MB, with fallback for different platforms"""
@@ -136,21 +152,11 @@ def hex_to_rgb332(hex_color: str) -> int:
         return 0xFF
 
 def douglas_peucker_simplify(points: List, tolerance: float) -> List:
+    """
+    Original Douglas-Peucker implementation
+    """
     if len(points) < 3:
         return points
-    
-    def perpendicular_distance(point, line_start, line_end):
-        x0, y0 = point[0], point[1]
-        x1, y1 = line_start[0], line_start[1]
-        x2, y2 = line_end[0], line_end[1]
-        
-        dx = x2 - x1
-        dy = y2 - y1
-        
-        if dx == 0 and dy == 0:
-            return math.sqrt((x0 - x1)**2 + (y0 - y1)**2)
-        
-        return abs(dy * x0 - dx * y0 + x2 * y1 - y2 * x1) / math.sqrt(dx**2 + dy**2)
     
     def simplify_recursive(points_list, start_idx, end_idx, tolerance):
         max_dist = 0
@@ -175,30 +181,90 @@ def douglas_peucker_simplify(points: List, tolerance: float) -> List:
     simplified = simplify_recursive(points, 0, len(points) - 1, tolerance)
     return simplified
 
-def get_simplification_tolerance(zoom: int) -> float:
-    if zoom < 13:
-        return 0.0001
-    elif zoom == 13:
-        return 0.00005
-    elif zoom == 14:
-        return 0.00003
-    elif zoom == 15:
-        return 0.00002
-    elif zoom == 16:
-        return 0.00001
-    else:
-        return 0.000007
+def all_points_near(points: List, threshold: float) -> bool:
+    """
+    OPTIMIZATION 2.1: Check if all points are within threshold distance
+    """
+    if len(points) < 2:
+        return True
+    
+    # Use first and last points as reference
+    start = points[0]
+    end = points[-1]
+    
+    for point in points[1:-1]:
+        dist = perpendicular_distance(point, start, end)
+        if dist > threshold:
+            return False
+    return True
 
-def simplify_coordinates(coordinates, geom_type: str, zoom: int):
-    if zoom < 16:
+def douglas_peucker_optimized(points: List, tolerance: float) -> List:
+    """
+    OPTIMIZATION 2.1: Optimized Douglas-Peucker with early termination
+    """
+    if len(points) <= 2:
+        return points
+    
+    # Early termination for nearly straight lines
+    if all_points_near(points, tolerance * 5):
+        return [points[0], points[-1]]
+    
+    return douglas_peucker_simplify(points, tolerance)
+
+def should_skip_simplification(coordinates, geom_type: str) -> bool:
+    """
+    OPTIMIZATION 2.1: Skip simplification for already simple geometries
+    """
+    def count_vertices(geom):
+        if isinstance(geom, (list, tuple)) and len(geom) == 2:
+            return 1
+        if isinstance(geom, list):
+            return sum(count_vertices(item) for item in geom)
+        return 0
+    
+    total_vertices = count_vertices(coordinates)
+    
+    # Skip simplification for simple geometries
+    if total_vertices < 50:
+        return True
+    
+    if geom_type == "LineString" and len(coordinates) < 10:
+        return True
+        
+    return False
+
+def get_optimized_simplification_tolerance(zoom: int) -> float:
+    """
+    OPTIMIZATION 2.1: Adjusted tolerances for GOL data
+    """
+    if zoom == 16:
+        return 0.000015
+    elif zoom == 17:
+        return 0.000012
+    elif zoom == 18:
+        return 0.00001
+    elif zoom == 19:
+        return 0.000008
+    else:
+        return 0.000005
+
+def simplify_coordinates(coordinates, geom_type: str, zoom: int, enable_simplification: bool = True):
+    """
+    OPTIMIZATION 2.1: Conditional simplification with optimized parameters
+    """
+    if not enable_simplification or zoom < 16:
         return coordinates
     
-    tolerance = get_simplification_tolerance(zoom)
+    # Skip simplification for already simple geometries
+    if should_skip_simplification(coordinates, geom_type):
+        return coordinates
+    
+    tolerance = get_optimized_simplification_tolerance(zoom)
     
     def simplify_ring(ring):
         if not ring or len(ring) < 3:
             return ring
-        simplified = douglas_peucker_simplify(ring, tolerance)
+        simplified = douglas_peucker_optimized(ring, tolerance)
         if simplified and simplified[0] != simplified[-1]:
             simplified.append(simplified[0])
         return simplified
@@ -206,7 +272,7 @@ def simplify_coordinates(coordinates, geom_type: str, zoom: int):
     if geom_type == "LineString":
         if len(coordinates) < 3:
             return coordinates
-        return douglas_peucker_simplify(coordinates, tolerance)
+        return douglas_peucker_optimized(coordinates, tolerance)
     
     elif geom_type == "Polygon":
         if not coordinates or not coordinates[0]:
@@ -215,7 +281,7 @@ def simplify_coordinates(coordinates, geom_type: str, zoom: int):
         return [simplified_exterior]
     
     elif geom_type == "MultiLineString":
-        return [douglas_peucker_simplify(line, tolerance) if len(line) >= 3 else line for line in coordinates]
+        return [douglas_peucker_optimized(line, tolerance) if len(line) >= 3 else line for line in coordinates]
     
     elif geom_type == "MultiPolygon":
         result = []
@@ -681,7 +747,7 @@ def compress_goql_queries(config: Dict) -> str:
     query = ", ".join(parts) if parts else "*"
     return query
 
-def process_feature(feature: Dict, config: Dict, zoom: int, tiles_data: Dict):
+def process_feature(feature: Dict, config: Dict, zoom: int, tiles_data: Dict, enable_simplification: bool = True):
     geom = feature.get('geometry')
     props = feature.get('properties', {})
     if not geom or geom['type'] not in ['LineString', 'Polygon', 'MultiLineString', 'MultiPolygon']:
@@ -699,8 +765,9 @@ def process_feature(feature: Dict, config: Dict, zoom: int, tiles_data: Dict):
     
     coordinates = normalize_coordinates_robust(coordinates)
     
+    # OPTIMIZATION 2.1: Conditional simplification
     if zoom >= 16:
-        coordinates = simplify_coordinates(coordinates, geom_type, zoom)
+        coordinates = simplify_coordinates(coordinates, geom_type, zoom, enable_simplification)
     
     hex_color = style.get('color', '#FFFFFF')
     color = hex_to_rgb332(hex_color)
@@ -796,7 +863,7 @@ def write_final_tiles(persistent_tiles: Dict, zoom: int, output_dir: str, max_fi
     
     return tiles_written
 
-def generate_tiles(gol_file: str, output_dir: str, config_file: str, zoom_levels: List[int], max_file_size: int = 65536, base_batch_size: int = 10000):
+def generate_tiles(gol_file: str, output_dir: str, config_file: str, zoom_levels: List[int], max_file_size: int = 65536, base_batch_size: int = 10000, enable_simplification: bool = True):
     with open(config_file) as f:
         config = json.load(f)
     
@@ -806,7 +873,7 @@ def generate_tiles(gol_file: str, output_dir: str, config_file: str, zoom_levels
     
     logger.info(f"System detected: {cpu_count} CPU cores, {available_memory_mb}MB RAM")
     logger.info(f"Resource settings: {max_workers} workers, base batch size: {base_batch_size}")
-    logger.info("OPTIMIZATION 1.2: ROBUST coordinate normalization - handles nested structures")
+    logger.info(f"OPTIMIZATION 2.1: Simplification {'ENABLED' if enable_simplification else 'DISABLED'} - optimized for GOL data")
     
     precompute_global_color_palette(config)
     write_palette_bin(output_dir)
@@ -829,7 +896,7 @@ def generate_tiles(gol_file: str, output_dir: str, config_file: str, zoom_levels
         try:
             for feature in ijson.items(process.stdout, "features.item"):
                 feature_count += 1
-                process_feature(feature, config, zoom, tiles_data)
+                process_feature(feature, config, zoom, tiles_data, enable_simplification)
                 
                 if feature_count % adaptive_batch == 0:
                     batch_count += 1
@@ -882,6 +949,7 @@ def main():
     parser.add_argument("--zoom", default="6-17", help="Zoom level(s) to generate")
     parser.add_argument("--max-file-size", type=int, default=128, help="Maximum tile file size in KB")
     parser.add_argument("--batch-size", type=int, default=10000, help="Base batch size (auto-adjusted per zoom level and system RAM)")
+    parser.add_argument("--no-simplify", action="store_true", help="Disable Douglas-Peucker simplification")
     args = parser.parse_args()
     
     if '-' in args.zoom:
@@ -898,9 +966,9 @@ def main():
     logger.info(f"Zoom levels: {zoom_levels}")
     logger.info(f"Max tile size: {args.max_file_size}KB")
     logger.info(f"Base batch size: {args.batch_size} features (adaptive per zoom and system RAM)")
-    logger.info("OPTIMIZATION 1.2: ROBUST coordinate normalization - handles nested structures")
+    logger.info(f"Simplification: {'DISABLED' if args.no_simplify else 'ENABLED (optimized)'}")
     
-    generate_tiles(args.gol_file, args.output_dir, args.config_file, zoom_levels, max_file_size_bytes, args.batch_size)
+    generate_tiles(args.gol_file, args.output_dir, args.config_file, zoom_levels, max_file_size_bytes, args.batch_size, not args.no_simplify)
     
     total_count = 0
     total_size = 0
