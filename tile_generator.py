@@ -2,6 +2,7 @@
 """
 Optimized tile generator - NO SHAPELY VERSION
 Processes GeoJSON coordinates directly without heavy geometry libraries.
+Fixed layer ordering without SET_LAYER command.
 """
 
 import math
@@ -32,7 +33,7 @@ DRAW_COMMANDS = {
     'STROKE_POLYGON': 3,
     'SET_COLOR': 0x80,
     'SET_COLOR_INDEX': 0x81,
-    'SET_LAYER': 0x88,
+    # REMOVED: 'SET_LAYER': 0x88,  # This was causing parsing errors
 }
 
 GLOBAL_COLOR_PALETTE = {}
@@ -91,15 +92,10 @@ def hex_to_rgb332(hex_color: str) -> int:
         return 0xFF
 
 def douglas_peucker_simplify(points: List, tolerance: float) -> List:
-    """
-    Simplificación de geometría usando algoritmo Douglas-Peucker.
-    Elimina vértices que no aportan información visual significativa.
-    """
     if len(points) < 3:
         return points
     
     def perpendicular_distance(point, line_start, line_end):
-        """Calcula distancia perpendicular de un punto a una línea"""
         x0, y0 = point[0], point[1]
         x1, y1 = line_start[0], line_start[1]
         x2, y2 = line_end[0], line_end[1]
@@ -113,7 +109,6 @@ def douglas_peucker_simplify(points: List, tolerance: float) -> List:
         return abs(dy * x0 - dx * y0 + x2 * y1 - y2 * x1) / math.sqrt(dx**2 + dy**2)
     
     def simplify_recursive(points_list, start_idx, end_idx, tolerance):
-        """Recursivamente simplifica el segmento de puntos"""
         max_dist = 0
         max_idx = start_idx
         
@@ -124,7 +119,6 @@ def douglas_peucker_simplify(points: List, tolerance: float) -> List:
                 max_idx = i
         
         if max_dist > tolerance:
-            # Dividir y conquistar
             left = simplify_recursive(points_list, start_idx, max_idx, tolerance)
             right = simplify_recursive(points_list, max_idx, end_idx, tolerance)
             return left[:-1] + right
@@ -138,28 +132,20 @@ def douglas_peucker_simplify(points: List, tolerance: float) -> List:
     return simplified
 
 def get_simplification_tolerance(zoom: int) -> float:
-    """
-    Retorna tolerancia de simplificación en grados según zoom.
-    Optimizado para pantalla 480x320.
-    """
     if zoom < 13:
-        return 0.0001  # ~11 metros
+        return 0.0001
     elif zoom == 13:
-        return 0.00005  # ~5.5 metros
+        return 0.00005
     elif zoom == 14:
-        return 0.00003  # ~3.3 metros
+        return 0.00003
     elif zoom == 15:
-        return 0.00002  # ~2.2 metros
+        return 0.00002
     elif zoom == 16:
-        return 0.00001  # ~1.1 metros (agresivo pero imperceptible en 480x320)
-    else:  # zoom 17+
-        return 0.000007  # ~0.8 metros (muy agresivo para pantalla pequeña)
+        return 0.00001
+    else:
+        return 0.000007
 
 def simplify_coordinates(coordinates, geom_type: str, zoom: int):
-    """
-    Simplifica coordenadas según tipo de geometría y zoom.
-    Retorna coordenadas simplificadas.
-    """
     if zoom < 16:
         return coordinates
     
@@ -169,7 +155,6 @@ def simplify_coordinates(coordinates, geom_type: str, zoom: int):
         if not ring or len(ring) < 3:
             return ring
         simplified = douglas_peucker_simplify(ring, tolerance)
-        # Asegurar que el anillo se cierra
         if simplified and simplified[0] != simplified[-1]:
             simplified.append(simplified[0])
         return simplified
@@ -431,32 +416,84 @@ def pack_varint(n):
 def pack_zigzag(n):
     return pack_varint((n << 1) ^ (n >> 31))
 
-def get_layer_from_tags(tags: Dict) -> int:
-    if 'natural' in tags and tags['natural'] in ['water', 'coastline', 'bay']:
-        return 0
-    if 'waterway' in tags and tags.get('waterway') in ['riverbank', 'dock', 'boatyard']:
-        return 0
-    if 'landuse' in tags and tags['landuse'] in ['forest', 'farmland', 'meadow', 'grass', 'orchard', 'vineyard', 'residential', 'commercial', 'retail', 'industrial']:
-        return 1
-    if 'natural' in tags and tags['natural'] in ['wood', 'forest', 'scrub', 'heath', 'grassland', 'beach', 'sand', 'wetland']:
-        return 1
-    if 'leisure' in tags and tags['leisure'] in ['park', 'pitch', 'golf_course', 'stadium', 'sports_centre', 'playground']:
-        return 1
-    if 'waterway' in tags and tags['waterway'] not in ['riverbank', 'dock', 'boatyard']:
-        return 2
-    if 'building' in tags:
-        return 3
-    if 'highway' in tags:
-        return 4
-    if 'railway' in tags:
-        return 4
-    if 'amenity' in tags:
-        return 5
-    return 1
+def get_layer_priority(tags: Dict) -> int:
+    """
+    Calculate layer priority for correct rendering order.
+    Lower numbers render first (background), higher numbers render last (foreground).
+    """
+    # Handle explicit OSM layer tag if present
+    if 'layer' in tags:
+        try:
+            layer_val = int(tags['layer'])
+            return layer_val * 1000  # Scale to avoid conflicts with our priorities
+        except (ValueError, TypeError):
+            pass
 
-def geometry_to_commands(geom_type: str, coordinates, color: int, zoom: int, tile_x: int, tile_y: int, layer: int, color_index: Optional[int] = None) -> List[Dict]:
+    # Base priorities for different feature types
+    if 'natural' in tags and tags['natural'] in ['water', 'coastline', 'bay']:
+        return 100
+    if 'waterway' in tags and tags.get('waterway') in ['riverbank', 'dock', 'boatyard']:
+        return 100
+
+    if 'landuse' in tags:
+        return 200
+    if 'natural' in tags and tags['natural'] in ['wood', 'forest', 'scrub', 'heath', 'grassland', 'beach', 'sand', 'wetland']:
+        return 200
+    if 'leisure' in tags and tags['leisure'] in ['park', 'nature_reserve', 'garden']:
+        return 200
+
+    if 'waterway' in tags and tags['waterway'] in ['river', 'stream', 'canal']:
+        return 300
+
+    if 'natural' in tags and tags['natural'] in ['peak', 'ridge', 'volcano', 'cliff']:
+        return 400
+
+    if 'tunnel' in tags and tags['tunnel'] == 'yes':
+        return 500
+
+    if 'railway' in tags:
+        return 600
+
+    if 'highway' in tags and tags['highway'] in ['path', 'footway', 'cycleway', 'steps', 'pedestrian', 'track']:
+        return 700
+
+    if 'highway' in tags and tags['highway'] in ['tertiary', 'tertiary_link']:
+        return 800
+
+    if 'highway' in tags and tags['highway'] in ['secondary', 'secondary_link']:
+        return 900
+
+    if 'highway' in tags and tags['highway'] in ['primary', 'primary_link']:
+        return 1000
+
+    if 'highway' in tags and tags['highway'] in ['trunk', 'trunk_link']:
+        return 1100
+
+    if 'highway' in tags and tags['highway'] in ['motorway', 'motorway_link']:
+        return 1200
+
+    if 'bridge' in tags and tags['bridge'] == 'yes':
+        return 1300
+    if 'aeroway' in tags:
+        return 1300
+
+    if 'building' in tags:
+        return 1400
+
+    if 'amenity' in tags:
+        return 1500
+
+    if 'boundary' in tags:
+        return 1600
+
+    # Default priority
+    return 200
+
+def geometry_to_commands(geom_type: str, coordinates, color: int, zoom: int, tile_x: int, tile_y: int, color_index: Optional[int] = None) -> List[Dict]:
     commands = []
-    commands.append({'type': DRAW_COMMANDS['SET_LAYER'], 'layer': layer})
+    
+    # REMOVED: SET_LAYER command - visualizer doesn't support it
+    
     if color_index is not None:
         commands.append({'type': DRAW_COMMANDS['SET_COLOR_INDEX'], 'color_index': color_index})
     else:
@@ -520,8 +557,7 @@ def pack_draw_commands(commands: List[Dict]) -> bytes:
             out += struct.pack("B", cmd.get('color', 0xFF))
         elif cmd_type == DRAW_COMMANDS['SET_COLOR_INDEX']:
             out += pack_varint(cmd.get('color_index', 0))
-        elif cmd_type == DRAW_COMMANDS['SET_LAYER']:
-            out += pack_varint(cmd.get('layer', 0))
+        # REMOVED: SET_LAYER handling
         elif cmd_type == DRAW_COMMANDS['LINE']:
             x1, y1, x2, y2 = cmd['x1'], cmd['y1'], cmd['x2'], cmd['y2']
             out += pack_zigzag(x1)
@@ -608,29 +644,30 @@ def process_feature(feature: Dict, config: Dict, zoom: int, tiles_data: Dict):
     geom_type = geom['type']
     coordinates = geom['coordinates']
     
-    # Obtener estilo primero - si no hay estilo, salir temprano
+    # Get style first - if no style, exit early
     style = get_style_for_tags(props, config)
     if not style:
         return
     
-    # Filtro de zoom temprano - antes de normalizar coordenadas
+    # Early zoom filter - before normalizing coordinates
     zoom_filter = style.get('zoom', 6)
     if zoom < zoom_filter:
         return
     
-    # Normalizar coordenadas
+    # Normalize coordinates
     coordinates = normalize_coordinates(coordinates)
     
-    # PROPUESTA F: Simplificar geometría en zoom 16-17
+    # Simplify geometry at zoom 16-17
     if zoom >= 16:
         coordinates = simplify_coordinates(coordinates, geom_type, zoom)
     
-    # CACHE: Calcular una vez los valores que se reutilizarán para todos los tiles
+    # Calculate values
     hex_color = style.get('color', '#FFFFFF')
     color = hex_to_rgb332(hex_color)
     color_index = hex_to_color_index(hex_color)
     priority = style.get('priority', 50)
-    layer = get_layer_from_tags(props)
+    # Use layer priority for correct rendering order
+    layer_priority = get_layer_priority(props)
     
     minx, miny, maxx, maxy = geojson_bounds(coordinates, geom_type)
     tile_x_min, tile_y_min = deg2num(miny, minx, zoom)
@@ -644,13 +681,15 @@ def process_feature(feature: Dict, config: Dict, zoom: int, tiles_data: Dict):
             clipped = clip_coordinates_to_tile(coordinates, geom_type, tile_bounds)
             if not clipped:
                 continue
-            # Usar valores cacheados en lugar de recalcularlos
-            commands = geometry_to_commands(geom_type, clipped, color, zoom, tx, ty, layer, color_index)
+            
+            commands = geometry_to_commands(geom_type, clipped, color, zoom, tx, ty, color_index)
             if commands:
                 tile_key = (tx, ty)
                 if tile_key not in tiles_data:
                     tiles_data[tile_key] = []
-                tiles_data[tile_key].append({'commands': commands, 'priority': priority, 'layer': layer})
+                # Store with combined priority (layer + feature priority)
+                combined_priority = layer_priority + priority
+                tiles_data[tile_key].append({'commands': commands, 'priority': combined_priority})
 
 def get_style_for_tags(tags: Dict, config: Dict) -> Optional[Dict]:
     for k, v in tags.items():
@@ -663,7 +702,8 @@ def get_style_for_tags(tags: Dict, config: Dict) -> Optional[Dict]:
     return None
 
 def sort_and_flatten_commands(tile_entries: List[Dict]) -> List[Dict]:
-    sorted_entries = sorted(tile_entries, key=lambda x: (x['layer'], -x['priority']))
+    # Sort by priority (ascending) - lower priority drawn first
+    sorted_entries = sorted(tile_entries, key=lambda x: x['priority'])
     all_commands = []
     for entry in sorted_entries:
         all_commands.extend(entry['commands'])
@@ -677,18 +717,12 @@ def write_single_tile(job):
     filepath = os.path.join(tile_dir, str(ty) + ".bin")
     data = pack_draw_commands(commands)
     if len(data) > max_file_size:
-        truncated_data = bytearray()
-        for i in range(len(commands)):
-            test_data = pack_draw_commands(commands[:i+1])
-            if len(test_data) > max_file_size:
-                break
-            truncated_data = test_data
-        data = truncated_data if truncated_data else pack_draw_commands([])
+        # Simple truncation - just take what fits
+        data = data[:max_file_size]
     with open(filepath, 'wb') as f:
         f.write(data)
 
 def format_time(seconds: float) -> str:
-    """Formatea segundos en un formato legible"""
     if seconds < 60:
         return f"{seconds:.2f}s"
     elif seconds < 3600:
@@ -702,7 +736,6 @@ def format_time(seconds: float) -> str:
         return f"{hours}h {minutes}m {secs:.2f}s"
 
 def merge_tiles_data(target: Dict, source: Dict):
-    """Fusiona source en target, acumulando comandos para tiles duplicados"""
     for tile_key, entries in source.items():
         if tile_key in target:
             target[tile_key].extend(entries)
@@ -710,12 +743,10 @@ def merge_tiles_data(target: Dict, source: Dict):
             target[tile_key] = entries
 
 def write_tiles_batch(tiles_data: Dict, zoom: int, output_dir: str, max_file_size: int, max_workers: int, persistent_tiles: Dict):
-    """Fusiona tiles_data en persistent_tiles sin escribir aún"""
     merge_tiles_data(persistent_tiles, tiles_data)
     return len(tiles_data)
 
 def write_final_tiles(persistent_tiles: Dict, zoom: int, output_dir: str, max_file_size: int, max_workers: int):
-    """Escribe todos los tiles acumulados al final del zoom"""
     if not persistent_tiles:
         return 0
     
@@ -730,7 +761,6 @@ def write_final_tiles(persistent_tiles: Dict, zoom: int, output_dir: str, max_fi
     return tiles_written
 
 def get_adaptive_batch_size(zoom: int, base_batch_size: int) -> int:
-    """Calcula batch size adaptativo según el nivel de zoom"""
     if zoom < 10:
         return base_batch_size
     elif zoom < 13:
@@ -744,7 +774,6 @@ def generate_tiles(gol_file: str, output_dir: str, config_file: str, zoom_levels
     with open(config_file) as f:
         config = json.load(f)
     
-    # Pre-computar datos que no cambian entre zooms
     precompute_global_color_palette(config)
     write_palette_bin(output_dir)
     query = compress_goql_queries(config)
@@ -752,20 +781,18 @@ def generate_tiles(gol_file: str, output_dir: str, config_file: str, zoom_levels
     cpu_count = os.cpu_count() or 4
     max_workers = min(cpu_count, 8)
     
-    # Cachear la ruta del ejecutable gol
     gol_cmd = "/gol" if os.path.exists("/gol") else "gol"
     
     for zoom in zoom_levels:
         zoom_start = time.time()
         
-        # Batch size adaptativo según zoom
         adaptive_batch = get_adaptive_batch_size(zoom, batch_size)
         simplify_msg = " [geometry simplification enabled]" if zoom >= 16 else ""
         logger.info("Processing zoom " + str(zoom) + " (batch size: " + str(adaptive_batch) + ")" + simplify_msg + "...")
         
         process = subprocess.Popen([gol_cmd, "query", gol_file, query, "-f", "geojson"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=65536)
         tiles_data = {}
-        persistent_tiles = {}  # Acumulador persistente para todo el zoom
+        persistent_tiles = {}
         feature_count = 0
         batch_count = 0
         
@@ -774,22 +801,18 @@ def generate_tiles(gol_file: str, output_dir: str, config_file: str, zoom_levels
                 feature_count += 1
                 process_feature(feature, config, zoom, tiles_data)
                 
-                # Fusionar en persistente cada adaptive_batch features
                 if feature_count % adaptive_batch == 0:
                     batch_count += 1
                     write_tiles_batch(tiles_data, zoom, output_dir, max_file_size, max_workers, persistent_tiles)
                     print("\rZoom " + str(zoom) + ": " + str(feature_count) + " features, " + str(len(persistent_tiles)) + " unique tiles (batch " + str(batch_count) + ")...", end='', flush=True)
-                    # Liberar memoria del lote temporal
                     tiles_data.clear()
                     gc.collect()
                 elif feature_count % 5000 == 0:
                     print("\rZoom " + str(zoom) + ": " + str(feature_count) + " features, " + str(len(tiles_data)) + " tiles in buffer, " + str(len(persistent_tiles)) + " persistent...", end='', flush=True)
             
-            # Fusionar tiles restantes
             if tiles_data:
                 write_tiles_batch(tiles_data, zoom, output_dir, max_file_size, max_workers, persistent_tiles)
             
-            # Ahora escribir TODOS los tiles acumulados
             print("\rZoom " + str(zoom) + ": " + str(feature_count) + " features processed, writing " + str(len(persistent_tiles)) + " tiles..." + " " * 20)
             sys.stdout.flush()
             
@@ -800,7 +823,6 @@ def generate_tiles(gol_file: str, output_dir: str, config_file: str, zoom_levels
         except ijson.common.IncompleteJSONError:
             pass
         finally:
-            # Cerrar explícitamente los pipes del proceso
             if process.stdout:
                 process.stdout.close()
             if process.stderr:
@@ -815,14 +837,12 @@ def generate_tiles(gol_file: str, output_dir: str, config_file: str, zoom_levels
         zoom_elapsed = time.time() - zoom_start
         logger.info("Zoom " + str(zoom) + " completed in " + format_time(zoom_elapsed))
         
-        # Liberar memoria explícitamente al final de cada nivel de zoom
         del tiles_data
         del persistent_tiles
         del process
         gc.collect()
 
 def main():
-    # Iniciar contador de tiempo
     start_time = time.time()
     
     parser = argparse.ArgumentParser(description='Generate map tiles from GoL file using features configuration', formatter_class=argparse.RawDescriptionHelpFormatter, epilog="""
@@ -853,11 +873,11 @@ Examples:
     logger.info("Zoom levels: " + str(zoom_levels))
     logger.info("Max tile size: " + str(args.max_file_size) + "KB")
     logger.info("Base batch size: " + str(args.batch_size) + " features (adaptive per zoom)")
-    logger.info("Geometry simplification: Enabled for zoom 16-17 (optimized for 480x320 display)")
+    logger.info("Geometry simplification: Enabled for zoom 16-17")
+    logger.info("IMPORTANT: Using priority-based layer ordering (no SET_LAYER commands)")
     
     generate_tiles(args.gol_file, args.output_dir, args.config_file, zoom_levels, max_file_size_bytes, args.batch_size)
     
-    # Count actual tiles and calculate total size
     total_count = 0
     total_size = 0
     for zoom in zoom_levels:
@@ -872,7 +892,6 @@ Examples:
                             tile_path = os.path.join(x_path, tile_file)
                             total_size += os.path.getsize(tile_path)
     
-    # Format size nicely
     if total_size < 1024:
         size_str = str(total_size) + "B"
     elif total_size < 1024 * 1024:
@@ -882,7 +901,6 @@ Examples:
     else:
         size_str = str(round(total_size / (1024 * 1024 * 1024), 2)) + "GB"
     
-    # Calcular tiempo total
     end_time = time.time()
     elapsed_time = end_time - start_time
     

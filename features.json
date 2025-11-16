@@ -21,6 +21,7 @@
   "config_file": "features.json",
   "fps_limit": 30,
   "fill_polygons": true,
+  "//": "Additional features with automatic layer assignment",
   "natural=coastline": {
     "zoom": 6,
     "color": "#0077FF",
@@ -165,6 +166,18 @@
     "description": "Park",
     "priority": 85
   },
+  "leisure=nature_reserve": {
+    "zoom": 12,
+    "color": "#66CC66",
+    "description": "Nature reserve",
+    "priority": 85
+  },
+  "leisure=garden": {
+    "zoom": 14,
+    "color": "#66CC66",
+    "description": "Garden",
+    "priority": 85
+  },
   "leisure=pitch": {
     "zoom": 12,
     "color": "#98FB98",
@@ -231,12 +244,6 @@
     "description": "Construction areas",
     "priority": 80
   },
-  "amenity=parking": {
-    "zoom": 15,
-    "color": "#B0B0B0",
-    "description": "Parking areas",
-    "priority": 75
-  },
   "waterway=river": {
     "zoom": 8,
     "color": "#3399FF",
@@ -255,6 +262,36 @@
     "description": "Canals",
     "priority": 70
   },
+  "natural=peak": {
+    "zoom": 15,
+    "color": "#964B00",
+    "description": "Mountain peaks",
+    "priority": 30
+  },
+  "natural=ridge": {
+    "zoom": 15,
+    "color": "#964B00",
+    "description": "Mountain ridges",
+    "priority": 30
+  },
+  "natural=volcano": {
+    "zoom": 15,
+    "color": "#FF4500",
+    "description": "Volcanoes",
+    "priority": 30
+  },
+  "natural=cliff": {
+    "zoom": 15,
+    "color": "#8B4513",
+    "description": "Cliffs",
+    "priority": 30
+  },
+  "tunnel=yes": {
+    "zoom": 12,
+    "color": "#A0A0A0",
+    "description": "Tunnels",
+    "priority": 40
+  },
   "railway=rail": {
     "zoom": 8,
     "color": "#A9A9A9",
@@ -272,150 +309,6 @@
     "color": "#B0C4DE",
     "description": "Tram lines",
     "priority": 65
-  },
-  "building": {
-    "zoom": 15,
-    "color": "#BBBBBB",
-    "description": "Buildings",
-    "priority": 60
-  },
-  "amenity=hospital": {
-    "zoom": 15,
-    "color": "#FF0000",
-    "description": "Hospitals",
-    "priority": 55
-  },
-  "amenity=school": {
-    "zoom": 15,
-    "color": "#FFFACD",
-    "description": "Schools",
-    "priority": 55
-  },
-  "amenity=university": {
-    "zoom": 15,
-    "color": "#FFFACD",
-    "description": "University",
-    "priority": 55
-  },
-  "amenity=kindergarten": {
-    "zoom": 15,
-    "color": "#FFFACD",
-    "description": "Kindergarten",
-    "priority": 55
-  },
-  "amenity=place_of_worship": {
-    "zoom": 15,
-    "color": "#FFF8DC",
-    "description": "Place of worship",
-    "priority": 55
-  },
-  "amenity=police": {
-    "zoom": 15,
-    "color": "#000080",
-    "description": "Police",
-    "priority": 55
-  },
-  "amenity=fire_station": {
-    "zoom": 15,
-    "color": "#FF0000",
-    "description": "Fire station",
-    "priority": 55
-  },
-  "amenity=library": {
-    "zoom": 15,
-    "color": "#4682B4",
-    "description": "Library",
-    "priority": 55
-  },
-  "amenity=post_office": {
-    "zoom": 15,
-    "color": "#FFD700",
-    "description": "Post office",
-    "priority": 55
-  },
-  "amenity=bank": {
-    "zoom": 15,
-    "color": "#FFD700",
-    "description": "Bank",
-    "priority": 55
-  },
-  "amenity=pharmacy": {
-    "zoom": 15,
-    "color": "#FF0000",
-    "description": "Pharmacy",
-    "priority": 55
-  },
-  "amenity=bus_station": {
-    "zoom": 15,
-    "color": "#4682B4",
-    "description": "Bus station",
-    "priority": 55
-  },
-  "amenity=marketplace": {
-    "zoom": 15,
-    "color": "#FFF8DC",
-    "description": "Marketplace",
-    "priority": 55
-  },
-  "highway=motorway": {
-    "zoom": 6,
-    "color": "#FFFFFF",
-    "description": "Motorways",
-    "priority": 50
-  },
-  "highway=trunk": {
-    "zoom": 6,
-    "color": "#FFD700",
-    "description": "Trunk roads",
-    "priority": 49
-  },
-  "highway=primary": {
-    "zoom": 6,
-    "color": "#FFA500",
-    "description": "Primary roads",
-    "priority": 48
-  },
-  "highway=secondary": {
-    "zoom": 12,
-    "color": "#FFF200",
-    "description": "Secondary roads",
-    "priority": 47
-  },
-  "highway=tertiary": {
-    "zoom": 12,
-    "color": "#FFDAB9",
-    "description": "Tertiary roads",
-    "priority": 46
-  },
-  "highway=residential": {
-    "zoom": 14,
-    "color": "#EFEFEF",
-    "description": "Residential roads",
-    "priority": 45
-  },
-  "highway=living_street": {
-    "zoom": 14,
-    "color": "#EFEFEF",
-    "description": "Living streets",
-    "priority": 44
-  },
-  "highway=service": {
-    "zoom": 14,
-    "color": "#D3D3D3",
-    "description": "Service roads",
-    "priority": 43
-  },
-  "highway=pedestrian": {
-    "zoom": 15,
-    "color": "#F8E8E8",
-    "description": "Pedestrian areas",
-    "priority": 42
-  },
-  "highway=track": {
-    "zoom": 15,
-    "color": "#C8B080",
-    "description": "Tracks",
-    "priority": 41
   },
   "highway=path": {
     "zoom": 15,
@@ -441,6 +334,168 @@
     "description": "Steps",
     "priority": 37
   },
+  "highway=pedestrian": {
+    "zoom": 15,
+    "color": "#F8E8E8",
+    "description": "Pedestrian areas",
+    "priority": 42
+  },
+  "highway=track": {
+    "zoom": 15,
+    "color": "#C8B080",
+    "description": "Tracks",
+    "priority": 41
+  },
+  "highway=tertiary": {
+    "zoom": 12,
+    "color": "#FFDAB9",
+    "description": "Tertiary roads",
+    "priority": 46
+  },
+  "highway=tertiary_link": {
+    "zoom": 12,
+    "color": "#FFDAB9",
+    "description": "Tertiary links",
+    "priority": 46
+  },
+  "highway=secondary": {
+    "zoom": 12,
+    "color": "#FFF200",
+    "description": "Secondary roads",
+    "priority": 47
+  },
+  "highway=secondary_link": {
+    "zoom": 12,
+    "color": "#FFF200",
+    "description": "Secondary links",
+    "priority": 47
+  },
+  "highway=primary": {
+    "zoom": 6,
+    "color": "#FFA500",
+    "description": "Primary roads",
+    "priority": 48
+  },
+  "highway=primary_link": {
+    "zoom": 6,
+    "color": "#FFA500",
+    "description": "Primary links",
+    "priority": 48
+  },
+  "highway=trunk": {
+    "zoom": 6,
+    "color": "#FFD700",
+    "description": "Trunk roads",
+    "priority": 49
+  },
+  "highway=trunk_link": {
+    "zoom": 6,
+    "color": "#FFD700",
+    "description": "Trunk links",
+    "priority": 49
+  },
+  "highway=motorway": {
+    "zoom": 6,
+    "color": "#FFFFFF",
+    "description": "Motorways",
+    "priority": 50
+  },
+  "highway=motorway_link": {
+    "zoom": 6,
+    "color": "#FFFFFF",
+    "description": "Motorway links",
+    "priority": 50
+  },
+  "bridge=yes": {
+    "zoom": 12,
+    "color": "#C0C0C0",
+    "description": "Bridges",
+    "priority": 60
+  },
+  "aeroway=runway": {
+    "zoom": 12,
+    "color": "#E0E0E0",
+    "description": "Runways",
+    "priority": 55
+  },
+  "aeroway=taxiway": {
+    "zoom": 14,
+    "color": "#D0D0D0",
+    "description": "Taxiways",
+    "priority": 55
+  },
+  "aeroway=apron": {
+    "zoom": 14,
+    "color": "#C8C8C8",
+    "description": "Aprons",
+    "priority": 55
+  },
+  "building": {
+    "zoom": 15,
+    "color": "#BBBBBB",
+    "description": "Buildings",
+    "priority": 60
+  },
+  "man_made=bridge": {
+    "zoom": 12,
+    "color": "#C0C0C0",
+    "description": "Bridges (man_made)",
+    "priority": 60
+  },
+  "man_made=tower": {
+    "zoom": 15,
+    "color": "#AAAAAA",
+    "description": "Towers",
+    "priority": 55
+  },
+  "amenity=parking": {
+    "zoom": 15,
+    "color": "#B0B0B0",
+    "description": "Parking areas",
+    "priority": 75
+  },
+  "amenity=hospital": {
+    "zoom": 15,
+    "color": "#FF0000",
+    "description": "Hospitals",
+    "priority": 55
+  },
+  "amenity=school": {
+    "zoom": 15,
+    "color": "#FFFACD",
+    "description": "Schools",
+    "priority": 55
+  },
+  "amenity=university": {
+    "zoom": 15,
+    "color": "#FFFACD",
+    "description": "University",
+    "priority": 55
+  },
+  "amenity=place_of_worship": {
+    "zoom": 15,
+    "color": "#FFF8DC",
+    "description": "Place of worship",
+    "priority": 55
+  },
+  "highway=residential": {
+    "zoom": 14,
+    "color": "#EFEFEF",
+    "description": "Residential roads",
+    "priority": 45
+  },
+  "highway=living_street": {
+    "zoom": 14,
+    "color": "#EFEFEF",
+    "description": "Living streets",
+    "priority": 44
+  },
+  "highway=service": {
+    "zoom": 14,
+    "color": "#D3D3D3",
+    "description": "Service roads",
+    "priority": 43
+  },
   "highway=crossing": {
     "zoom": 16,
     "color": "#FFD700",
@@ -458,12 +513,6 @@
     "color": "#EFEFEF",
     "description": "Unclassified roads",
     "priority": 34
-  },
-  "natural=peak": {
-    "zoom": 15,
-    "color": "#964B00",
-    "description": "Mountain peaks",
-    "priority": 30
   },
   "natural=tree_row": {
     "zoom": 16,
