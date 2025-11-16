@@ -2,7 +2,7 @@
 """
 Optimized tile generator - NO SHAPELY VERSION
 Processes GeoJSON coordinates directly without heavy geometry libraries.
-Clean version with only essential functionality.
+Optimized for 8GB RAM systems with conservative resource usage.
 """
 
 import math
@@ -36,6 +36,68 @@ DRAW_COMMANDS = {
 
 GLOBAL_COLOR_PALETTE = {}
 GLOBAL_INDEX_TO_RGB332 = {}
+
+def get_available_memory_mb() -> int:
+    """Get available memory in MB, with fallback for different platforms"""
+    try:
+        if os.name == 'posix':
+            # Linux/Mac
+            with open('/proc/meminfo', 'r') as f:
+                for line in f:
+                    if 'MemAvailable' in line:
+                        return int(line.split()[1]) // 1024
+        elif os.name == 'nt':
+            # Windows
+            import ctypes
+            kernel32 = ctypes.windll.kernel32
+            ctypes.windll.kernel32.GetPhysicallyInstalledSystemMemory.argtypes = [ctypes.POINTER(ctypes.c_ulonglong)]
+            memory = ctypes.c_ulonglong()
+            if kernel32.GetPhysicallyInstalledSystemMemory(ctypes.byref(memory)):
+                return memory.value // (1024 * 1024)
+    except:
+        pass
+    return 4096  # Fallback: 4GB assumption
+
+def get_optimal_workers(cpu_count: int, available_memory_mb: int) -> int:
+    """
+    Calculate optimal worker count considering both CPU and memory constraints.
+    Conservative for 8GB RAM systems, scales for better systems.
+    """
+    # Memory-based constraint: ~1GB per worker baseline
+    memory_workers = max(1, min(available_memory_mb // 1024, 6))
+    
+    # CPU-based constraint: leave one core free
+    cpu_workers = max(1, cpu_count - 1)
+    
+    # Conservative cap for 8GB systems, higher for more RAM
+    if available_memory_mb <= 8192:  # 8GB or less
+        max_workers = min(3, memory_workers, cpu_workers)
+    else:
+        max_workers = min(6, memory_workers, cpu_workers)
+    
+    logger.info(f"System: {cpu_count} CPU cores, {available_memory_mb}MB RAM -> Using {max_workers} workers")
+    return max_workers
+
+def get_adaptive_batch_size(zoom: int, base_batch_size: int, available_memory_mb: int) -> int:
+    """
+    Calculate adaptive batch size based on zoom level and available memory.
+    Conservative for limited RAM systems, scales for better hardware.
+    """
+    # Memory factor: normalize to 4GB baseline, cap at 2.0 for systems with more RAM
+    memory_factor = min(2.0, available_memory_mb / 4096)
+    
+    # Base adjustments for zoom levels with memory consideration
+    if zoom < 10:
+        adjusted_size = max(2000, int(base_batch_size * 0.6 * memory_factor))
+    elif zoom < 13:
+        adjusted_size = max(1000, int(base_batch_size * 0.4 * memory_factor))
+    elif zoom < 15:
+        adjusted_size = max(500, int(base_batch_size * 0.3 * memory_factor))
+    else:
+        adjusted_size = max(250, int(base_batch_size * 0.2 * memory_factor))
+    
+    logger.debug(f"Zoom {zoom}: base={base_batch_size}, memory_factor={memory_factor:.2f} -> batch={adjusted_size}")
+    return adjusted_size
 
 def precompute_global_color_palette(config: Dict[str, Any]) -> int:
     global GLOBAL_COLOR_PALETTE, GLOBAL_INDEX_TO_RGB332
@@ -736,34 +798,30 @@ def write_final_tiles(persistent_tiles: Dict, zoom: int, output_dir: str, max_fi
     
     return tiles_written
 
-def get_adaptive_batch_size(zoom: int, base_batch_size: int) -> int:
-    if zoom < 10:
-        return base_batch_size
-    elif zoom < 13:
-        return max(base_batch_size // 2, 10000)
-    elif zoom < 15:
-        return max(base_batch_size // 4, 5000)
-    else:
-        return max(base_batch_size // 8, 2500)
-
-def generate_tiles(gol_file: str, output_dir: str, config_file: str, zoom_levels: List[int], max_file_size: int = 65536, batch_size: int = 50000):
+def generate_tiles(gol_file: str, output_dir: str, config_file: str, zoom_levels: List[int], max_file_size: int = 65536, base_batch_size: int = 10000):
     with open(config_file) as f:
         config = json.load(f)
+    
+    # Detect system resources
+    available_memory_mb = get_available_memory_mb()
+    cpu_count = os.cpu_count() or 4
+    max_workers = get_optimal_workers(cpu_count, available_memory_mb)
+    
+    logger.info(f"System detected: {cpu_count} CPU cores, {available_memory_mb}MB RAM")
+    logger.info(f"Resource settings: {max_workers} workers, base batch size: {base_batch_size}")
     
     precompute_global_color_palette(config)
     write_palette_bin(output_dir)
     query = compress_goql_queries(config)
-    
-    cpu_count = os.cpu_count() or 4
-    max_workers = min(cpu_count, 8)
     
     gol_cmd = "/gol" if os.path.exists("/gol") else "gol"
     
     for zoom in zoom_levels:
         zoom_start = time.time()
         
-        adaptive_batch = get_adaptive_batch_size(zoom, batch_size)
-        logger.info(f"Processing zoom {zoom} (batch size: {adaptive_batch})...")
+        # Calculate adaptive batch size for this zoom level
+        adaptive_batch = get_adaptive_batch_size(zoom, base_batch_size, available_memory_mb)
+        logger.info(f"Processing zoom {zoom} (batch size: {adaptive_batch}, workers: {max_workers})...")
         
         process = subprocess.Popen([gol_cmd, "query", gol_file, query, "-f", "geojson"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=65536)
         tiles_data = {}
@@ -826,7 +884,7 @@ def main():
     parser.add_argument("config_file", help="JSON config file with feature definitions")
     parser.add_argument("--zoom", default="6-17", help="Zoom level(s) to generate")
     parser.add_argument("--max-file-size", type=int, default=128, help="Maximum tile file size in KB")
-    parser.add_argument("--batch-size", type=int, default=50000, help="Base batch size (auto-adjusted per zoom level)")
+    parser.add_argument("--batch-size", type=int, default=10000, help="Base batch size (auto-adjusted per zoom level and system RAM)")
     args = parser.parse_args()
     
     if '-' in args.zoom:
@@ -842,7 +900,7 @@ def main():
     logger.info(f"Config: {args.config_file}")
     logger.info(f"Zoom levels: {zoom_levels}")
     logger.info(f"Max tile size: {args.max_file_size}KB")
-    logger.info(f"Base batch size: {args.batch_size} features")
+    logger.info(f"Base batch size: {args.batch_size} features (adaptive per zoom and system RAM)")
     
     generate_tiles(args.gol_file, args.output_dir, args.config_file, zoom_levels, max_file_size_bytes, args.batch_size)
     
