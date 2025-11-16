@@ -2,7 +2,7 @@
 """
 Optimized tile generator - NO SHAPELY VERSION
 Processes GeoJSON coordinates directly without heavy geometry libraries.
-Fixed layer ordering without SET_LAYER command.
+Clean version with only essential functionality.
 """
 
 import math
@@ -14,7 +14,6 @@ import subprocess
 import ijson
 import time
 from decimal import Decimal
-from tqdm import tqdm
 import argparse
 import sys
 import logging
@@ -33,7 +32,6 @@ DRAW_COMMANDS = {
     'STROKE_POLYGON': 3,
     'SET_COLOR': 0x80,
     'SET_COLOR_INDEX': 0x81,
-    # REMOVED: 'SET_LAYER': 0x88,  # This was causing parsing errors
 }
 
 GLOBAL_COLOR_PALETTE = {}
@@ -417,19 +415,13 @@ def pack_zigzag(n):
     return pack_varint((n << 1) ^ (n >> 31))
 
 def get_layer_priority(tags: Dict) -> int:
-    """
-    Calculate layer priority for correct rendering order.
-    Lower numbers render first (background), higher numbers render last (foreground).
-    """
-    # Handle explicit OSM layer tag if present
     if 'layer' in tags:
         try:
             layer_val = int(tags['layer'])
-            return layer_val * 1000  # Scale to avoid conflicts with our priorities
+            return layer_val * 1000
         except (ValueError, TypeError):
             pass
 
-    # Base priorities for different feature types
     if 'natural' in tags and tags['natural'] in ['water', 'coastline', 'bay']:
         return 100
     if 'waterway' in tags and tags.get('waterway') in ['riverbank', 'dock', 'boatyard']:
@@ -483,16 +475,10 @@ def get_layer_priority(tags: Dict) -> int:
     if 'amenity' in tags:
         return 1500
 
-    if 'boundary' in tags:
-        return 1600
-
-    # Default priority
     return 200
 
 def geometry_to_commands(geom_type: str, coordinates, color: int, zoom: int, tile_x: int, tile_y: int, color_index: Optional[int] = None) -> List[Dict]:
     commands = []
-    
-    # REMOVED: SET_LAYER command - visualizer doesn't support it
     
     if color_index is not None:
         commands.append({'type': DRAW_COMMANDS['SET_COLOR_INDEX'], 'color_index': color_index})
@@ -557,7 +543,6 @@ def pack_draw_commands(commands: List[Dict]) -> bytes:
             out += struct.pack("B", cmd.get('color', 0xFF))
         elif cmd_type == DRAW_COMMANDS['SET_COLOR_INDEX']:
             out += pack_varint(cmd.get('color_index', 0))
-        # REMOVED: SET_LAYER handling
         elif cmd_type == DRAW_COMMANDS['LINE']:
             x1, y1, x2, y2 = cmd['x1'], cmd['y1'], cmd['x2'], cmd['y2']
             out += pack_zigzag(x1)
@@ -644,29 +629,23 @@ def process_feature(feature: Dict, config: Dict, zoom: int, tiles_data: Dict):
     geom_type = geom['type']
     coordinates = geom['coordinates']
     
-    # Get style first - if no style, exit early
     style = get_style_for_tags(props, config)
     if not style:
         return
     
-    # Early zoom filter - before normalizing coordinates
     zoom_filter = style.get('zoom', 6)
     if zoom < zoom_filter:
         return
     
-    # Normalize coordinates
     coordinates = normalize_coordinates(coordinates)
     
-    # Simplify geometry at zoom 16-17
     if zoom >= 16:
         coordinates = simplify_coordinates(coordinates, geom_type, zoom)
     
-    # Calculate values
     hex_color = style.get('color', '#FFFFFF')
     color = hex_to_rgb332(hex_color)
     color_index = hex_to_color_index(hex_color)
     priority = style.get('priority', 50)
-    # Use layer priority for correct rendering order
     layer_priority = get_layer_priority(props)
     
     minx, miny, maxx, maxy = geojson_bounds(coordinates, geom_type)
@@ -687,7 +666,6 @@ def process_feature(feature: Dict, config: Dict, zoom: int, tiles_data: Dict):
                 tile_key = (tx, ty)
                 if tile_key not in tiles_data:
                     tiles_data[tile_key] = []
-                # Store with combined priority (layer + feature priority)
                 combined_priority = layer_priority + priority
                 tiles_data[tile_key].append({'commands': commands, 'priority': combined_priority})
 
@@ -702,7 +680,6 @@ def get_style_for_tags(tags: Dict, config: Dict) -> Optional[Dict]:
     return None
 
 def sort_and_flatten_commands(tile_entries: List[Dict]) -> List[Dict]:
-    # Sort by priority (ascending) - lower priority drawn first
     sorted_entries = sorted(tile_entries, key=lambda x: x['priority'])
     all_commands = []
     for entry in sorted_entries:
@@ -717,7 +694,6 @@ def write_single_tile(job):
     filepath = os.path.join(tile_dir, str(ty) + ".bin")
     data = pack_draw_commands(commands)
     if len(data) > max_file_size:
-        # Simple truncation - just take what fits
         data = data[:max_file_size]
     with open(filepath, 'wb') as f:
         f.write(data)
@@ -787,8 +763,7 @@ def generate_tiles(gol_file: str, output_dir: str, config_file: str, zoom_levels
         zoom_start = time.time()
         
         adaptive_batch = get_adaptive_batch_size(zoom, batch_size)
-        simplify_msg = " [geometry simplification enabled]" if zoom >= 16 else ""
-        logger.info("Processing zoom " + str(zoom) + " (batch size: " + str(adaptive_batch) + ")" + simplify_msg + "...")
+        logger.info(f"Processing zoom {zoom} (batch size: {adaptive_batch})...")
         
         process = subprocess.Popen([gol_cmd, "query", gol_file, query, "-f", "geojson"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=65536)
         tiles_data = {}
@@ -804,21 +779,21 @@ def generate_tiles(gol_file: str, output_dir: str, config_file: str, zoom_levels
                 if feature_count % adaptive_batch == 0:
                     batch_count += 1
                     write_tiles_batch(tiles_data, zoom, output_dir, max_file_size, max_workers, persistent_tiles)
-                    print("\rZoom " + str(zoom) + ": " + str(feature_count) + " features, " + str(len(persistent_tiles)) + " unique tiles (batch " + str(batch_count) + ")...", end='', flush=True)
+                    print(f"\rZoom {zoom}: {feature_count} features, {len(persistent_tiles)} unique tiles (batch {batch_count})...", end='', flush=True)
                     tiles_data.clear()
                     gc.collect()
                 elif feature_count % 5000 == 0:
-                    print("\rZoom " + str(zoom) + ": " + str(feature_count) + " features, " + str(len(tiles_data)) + " tiles in buffer, " + str(len(persistent_tiles)) + " persistent...", end='', flush=True)
+                    print(f"\rZoom {zoom}: {feature_count} features, {len(tiles_data)} tiles in buffer, {len(persistent_tiles)} persistent...", end='', flush=True)
             
             if tiles_data:
                 write_tiles_batch(tiles_data, zoom, output_dir, max_file_size, max_workers, persistent_tiles)
             
-            print("\rZoom " + str(zoom) + ": " + str(feature_count) + " features processed, writing " + str(len(persistent_tiles)) + " tiles..." + " " * 20)
+            print(f"\rZoom {zoom}: {feature_count} features processed, writing {len(persistent_tiles)} tiles...{' ' * 20}")
             sys.stdout.flush()
             
             total_tiles_written = write_final_tiles(persistent_tiles, zoom, output_dir, max_file_size, max_workers)
             
-            print("\rZoom " + str(zoom) + ": " + str(feature_count) + " features processed, " + str(total_tiles_written) + " tiles written" + " " * 20)
+            print(f"\rZoom {zoom}: {feature_count} features processed, {total_tiles_written} tiles written{' ' * 20}")
             sys.stdout.flush()
         except ijson.common.IncompleteJSONError:
             pass
@@ -835,7 +810,7 @@ def generate_tiles(gol_file: str, output_dir: str, config_file: str, zoom_levels
             raise RuntimeError("gol query failed: " + stderr_content)
         
         zoom_elapsed = time.time() - zoom_start
-        logger.info("Zoom " + str(zoom) + " completed in " + format_time(zoom_elapsed))
+        logger.info(f"Zoom {zoom} completed in {format_time(zoom_elapsed)}")
         
         del tiles_data
         del persistent_tiles
@@ -845,12 +820,7 @@ def generate_tiles(gol_file: str, output_dir: str, config_file: str, zoom_levels
 def main():
     start_time = time.time()
     
-    parser = argparse.ArgumentParser(description='Generate map tiles from GoL file using features configuration', formatter_class=argparse.RawDescriptionHelpFormatter, epilog="""
-Examples:
-  ./tile_generator.py map.gol output_dir features.json --zoom 6-17
-  ./tile_generator.py map.gol output_dir features.json --zoom 12 --max-file-size 256
-  ./tile_generator.py map.gol output_dir features.json --zoom 6-17 --batch-size 50000
-    """)
+    parser = argparse.ArgumentParser(description='Generate map tiles from GoL file using features configuration')
     parser.add_argument("gol_file", help="Input GoL file path")
     parser.add_argument("output_dir", help="Output directory for tiles")
     parser.add_argument("config_file", help="JSON config file with feature definitions")
@@ -867,14 +837,12 @@ Examples:
     
     max_file_size_bytes = args.max_file_size * 1024
     
-    logger.info("Input: " + args.gol_file)
-    logger.info("Output: " + args.output_dir)
-    logger.info("Config: " + args.config_file)
-    logger.info("Zoom levels: " + str(zoom_levels))
-    logger.info("Max tile size: " + str(args.max_file_size) + "KB")
-    logger.info("Base batch size: " + str(args.batch_size) + " features (adaptive per zoom)")
-    logger.info("Geometry simplification: Enabled for zoom 16-17")
-    logger.info("IMPORTANT: Using priority-based layer ordering (no SET_LAYER commands)")
+    logger.info(f"Input: {args.gol_file}")
+    logger.info(f"Output: {args.output_dir}")
+    logger.info(f"Config: {args.config_file}")
+    logger.info(f"Zoom levels: {zoom_levels}")
+    logger.info(f"Max tile size: {args.max_file_size}KB")
+    logger.info(f"Base batch size: {args.batch_size} features")
     
     generate_tiles(args.gol_file, args.output_dir, args.config_file, zoom_levels, max_file_size_bytes, args.batch_size)
     
@@ -893,23 +861,23 @@ Examples:
                             total_size += os.path.getsize(tile_path)
     
     if total_size < 1024:
-        size_str = str(total_size) + "B"
+        size_str = f"{total_size}B"
     elif total_size < 1024 * 1024:
-        size_str = str(round(total_size / 1024, 1)) + "KB"
+        size_str = f"{round(total_size / 1024, 1)}KB"
     elif total_size < 1024 * 1024 * 1024:
-        size_str = str(round(total_size / (1024 * 1024), 1)) + "MB"
+        size_str = f"{round(total_size / (1024 * 1024), 1)}MB"
     else:
-        size_str = str(round(total_size / (1024 * 1024 * 1024), 2)) + "GB"
+        size_str = f"{round(total_size / (1024 * 1024 * 1024), 2)}GB"
     
     end_time = time.time()
     elapsed_time = end_time - start_time
     
-    logger.info("Total tiles written: " + str(total_count))
-    logger.info("Total size: " + size_str)
-    logger.info("Average tile size: " + str(round(total_size / total_count)) + " bytes" if total_count > 0 else "N/A")
-    logger.info("Palette file: " + os.path.join(args.output_dir, 'palette.bin'))
+    logger.info(f"Total tiles written: {total_count}")
+    logger.info(f"Total size: {size_str}")
+    logger.info(f"Average tile size: {round(total_size / total_count) if total_count > 0 else 0} bytes")
+    logger.info(f"Palette file: {os.path.join(args.output_dir, 'palette.bin')}")
     logger.info("=" * 50)
-    logger.info("Total processing time: " + format_time(elapsed_time))
+    logger.info(f"Total processing time: {format_time(elapsed_time)}")
 
 if __name__ == "__main__":
     main()
