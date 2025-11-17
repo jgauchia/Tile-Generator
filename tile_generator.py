@@ -1,10 +1,4 @@
 #!/usr/bin/env python3
-"""
-Optimized tile generator - NO SHAPELY VERSION
-Processes GeoJSON coordinates directly without heavy geometry libraries.
-Optimized for 8GB RAM systems with conservative resource usage.
-Item 2.1: Douglas-Peucker simplification optimization - CORREGIDO
-"""
 
 import math
 import struct
@@ -39,9 +33,6 @@ GLOBAL_COLOR_PALETTE = {}
 GLOBAL_INDEX_TO_RGB332 = {}
 
 def perpendicular_distance(point, line_start, line_end):
-    """
-    OPTIMIZATION 2.1: Moved to global scope for accessibility
-    """
     x0, y0 = point[0], point[1]
     x1, y1 = line_start[0], line_start[1]
     x2, y2 = line_end[0], line_end[1]
@@ -55,7 +46,6 @@ def perpendicular_distance(point, line_start, line_end):
     return abs(dy * x0 - dx * y0 + x2 * y1 - y2 * x1) / math.sqrt(dx**2 + dy**2)
 
 def get_available_memory_mb() -> int:
-    """Get available memory in MB, with fallback for different platforms"""
     try:
         if os.name == 'posix':
             with open('/proc/meminfo', 'r') as f:
@@ -152,9 +142,6 @@ def hex_to_rgb332(hex_color: str) -> int:
         return 0xFF
 
 def douglas_peucker_simplify(points: List, tolerance: float) -> List:
-    """
-    Original Douglas-Peucker implementation
-    """
     if len(points) < 3:
         return points
     
@@ -182,13 +169,9 @@ def douglas_peucker_simplify(points: List, tolerance: float) -> List:
     return simplified
 
 def all_points_near(points: List, threshold: float) -> bool:
-    """
-    OPTIMIZATION 2.1: Check if all points are within threshold distance
-    """
     if len(points) < 2:
         return True
     
-    # Use first and last points as reference
     start = points[0]
     end = points[-1]
     
@@ -199,22 +182,15 @@ def all_points_near(points: List, threshold: float) -> bool:
     return True
 
 def douglas_peucker_optimized(points: List, tolerance: float) -> List:
-    """
-    OPTIMIZATION 2.1: Optimized Douglas-Peucker with early termination
-    """
     if len(points) <= 2:
         return points
     
-    # Early termination for nearly straight lines
     if all_points_near(points, tolerance * 5):
         return [points[0], points[-1]]
     
     return douglas_peucker_simplify(points, tolerance)
 
 def should_skip_simplification(coordinates, geom_type: str) -> bool:
-    """
-    OPTIMIZATION 2.1: Skip simplification for already simple geometries
-    """
     def count_vertices(geom):
         if isinstance(geom, (list, tuple)) and len(geom) == 2:
             return 1
@@ -224,7 +200,6 @@ def should_skip_simplification(coordinates, geom_type: str) -> bool:
     
     total_vertices = count_vertices(coordinates)
     
-    # Skip simplification for simple geometries
     if total_vertices < 50:
         return True
     
@@ -234,9 +209,6 @@ def should_skip_simplification(coordinates, geom_type: str) -> bool:
     return False
 
 def get_optimized_simplification_tolerance(zoom: int) -> float:
-    """
-    OPTIMIZATION 2.1: Adjusted tolerances for GOL data
-    """
     if zoom == 16:
         return 0.000015
     elif zoom == 17:
@@ -249,13 +221,9 @@ def get_optimized_simplification_tolerance(zoom: int) -> float:
         return 0.000005
 
 def simplify_coordinates(coordinates, geom_type: str, zoom: int, enable_simplification: bool = True):
-    """
-    OPTIMIZATION 2.1: Conditional simplification with optimized parameters
-    """
     if not enable_simplification or zoom < 16:
         return coordinates
     
-    # Skip simplification for already simple geometries
     if should_skip_simplification(coordinates, geom_type):
         return coordinates
     
@@ -326,9 +294,6 @@ def coords_intersect_tile(coordinates, geom_type: str, tile_bbox: Tuple[float, f
     return True
 
 def normalize_coordinates_robust(coordinates):
-    """
-    OPTIMIZATION 1.2: Robust coordinate normalization - handles nested structures
-    """
     if isinstance(coordinates, (int, float, Decimal)):
         return float(coordinates)
     
@@ -765,7 +730,6 @@ def process_feature(feature: Dict, config: Dict, zoom: int, tiles_data: Dict, en
     
     coordinates = normalize_coordinates_robust(coordinates)
     
-    # OPTIMIZATION 2.1: Conditional simplification
     if zoom >= 16:
         coordinates = simplify_coordinates(coordinates, geom_type, zoom, enable_simplification)
     
@@ -873,8 +837,7 @@ def generate_tiles(gol_file: str, output_dir: str, config_file: str, zoom_levels
     
     logger.info(f"System detected: {cpu_count} CPU cores, {available_memory_mb}MB RAM")
     logger.info(f"Resource settings: {max_workers} workers, base batch size: {base_batch_size}")
-    logger.info(f"OPTIMIZATION 2.1: Simplification {'ENABLED' if enable_simplification else 'DISABLED'} - optimized for GOL data")
-    
+        
     precompute_global_color_palette(config)
     write_palette_bin(output_dir)
     query = compress_goql_queries(config)
