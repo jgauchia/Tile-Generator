@@ -293,13 +293,15 @@ def darken_color(rgb, amount=0.3):
     return tuple(max(0, int(v * (1 - amount))) for v in rgb)
 
 def skip_command(cmd_type, data, offset):
-    """Skip command data without processing it"""
+    """Skip command data without processing it (incluyendo ancho)"""
     if cmd_type == 1:  # LINE
+        _, offset = read_varint(data, offset)  # Saltar ancho
         _, offset = read_zigzag(data, offset)
         _, offset = read_zigzag(data, offset)
         _, offset = read_zigzag(data, offset)
         _, offset = read_zigzag(data, offset)
     elif cmd_type == 2:  # POLYLINE
+        _, offset = read_varint(data, offset)  # Saltar ancho
         n_pts, offset = read_varint(data, offset)
         for _ in range(n_pts):
             if _ == 0:
@@ -309,12 +311,13 @@ def skip_command(cmd_type, data, offset):
                 _, offset = read_zigzag(data, offset)
                 _, offset = read_zigzag(data, offset)
     elif cmd_type == 3:  # STROKE_POLYGON
+        _, offset = read_varint(data, offset)  # Saltar ancho
         n_pts, offset = read_varint(data, offset)
         for _ in range(n_pts):
             _, offset = read_zigzag(data, offset)
             _, offset = read_zigzag(data, offset)
     else:
-        # For unknown commands, skip 4 bytes
+        # Para comandos desconocidos, saltar 4 bytes
         if offset < len(data) - 4:
             offset += 4
     
@@ -586,8 +589,51 @@ def handle_color_command(cmd_type, data, offset, current_color):
     
     return current_color, offset, False
 
-def render_polygon_command(data, offset, surface, rgb, fill_polygons):
-    """Render STROKE_POLYGON command"""
+def draw_thick_line_rounded(surface, color, start_pos, end_pos, width):
+    """Draw a line with rounded ends"""
+    # Calculate direction vector
+    dx = end_pos[0] - start_pos[0]
+    dy = end_pos[1] - start_pos[1]
+    length = max(1, math.sqrt(dx*dx + dy*dy))  # Avoid division by zero
+    
+    # Normalize direction vector
+    dx /= length
+    dy /= length
+    
+    # Calculate perpendicular vector
+    px = -dy * width / 2
+    py = dx * width / 2
+    
+    # Create the rectangle points for the thick line
+    points = [
+        (start_pos[0] + px, start_pos[1] + py),
+        (start_pos[0] - px, start_pos[1] - py),
+        (end_pos[0] - px, end_pos[1] - py),
+        (end_pos[0] + px, end_pos[1] + py)
+    ]
+    
+    # Draw the rectangle (main line body)
+    pygame.draw.polygon(surface, color, points)
+    
+    # Draw rounded ends (circles at start and end)
+    pygame.draw.circle(surface, color, (int(start_pos[0]), int(start_pos[1])), width // 2)
+    pygame.draw.circle(surface, color, (int(end_pos[0]), int(end_pos[1])), width // 2)
+
+def draw_thick_polyline_rounded(surface, color, points, width):
+    """Draw a polyline with rounded joins and ends"""
+    if len(points) < 2:
+        return
+    
+    # Draw the line segments with rounded joins
+    for i in range(len(points) - 1):
+        draw_thick_line_rounded(surface, color, points[i], points[i + 1], width)
+    
+    # Draw rounded joints at intermediate points
+    for i in range(1, len(points) - 1):
+        pygame.draw.circle(surface, color, (int(points[i][0]), int(points[i][1])), width // 2)
+
+def render_polygon_command(data, offset, surface, rgb, fill_polygons, line_width):
+    """Render STROKE_POLYGON command con ancho de línea"""
     n_pts, offset = read_varint(data, offset)
     pts = []
     x, y = 0, 0
@@ -604,44 +650,48 @@ def render_polygon_command(data, offset, surface, rgb, fill_polygons):
     
     if fill_polygons and len(pts) >= 3:
         pygame.draw.polygon(surface, rgb, pts, 0)
-        # Draw outline: darker on interior segments, original color on tile border segments
+        # Dibujar contorno con el ancho especificado
         border_segments, interior_segments = get_polygon_border_segments(pts)
         
-        # Draw border segments with original color
+        # Dibujar segmentos de borde con color original
         for pt1, pt2 in border_segments:
-            pygame.draw.line(surface, rgb, pt1, pt2, 1)
+            pygame.draw.line(surface, rgb, pt1, pt2, line_width)
         
-        # Draw interior segments with darkened color
+        # Dibujar segmentos interiores con color oscurecido
         for pt1, pt2 in interior_segments:
-            pygame.draw.line(surface, darken_color(rgb, 0.4), pt1, pt2, 1)
+            pygame.draw.line(surface, darken_color(rgb, 0.4), pt1, pt2, line_width)
     elif not fill_polygons and len(pts) >= 2:
-        # No fill: draw outline with original color on interior, background color on tile borders
+        # Sin relleno: dibujar contorno con color original en interior, color de fondo en bordes
         border_segments, interior_segments = get_polygon_border_segments(pts)
         bg_color = get_background_color(surface)
         
-        # Draw border segments with background color
+        # Dibujar segmentos de borde con color de fondo
         for pt1, pt2 in border_segments:
-            pygame.draw.line(surface, bg_color, pt1, pt2, 1)
+            pygame.draw.line(surface, bg_color, pt1, pt2, line_width)
         
-        # Draw interior segments with original color
+        # Dibujar segmentos interiores con color original
         for pt1, pt2 in interior_segments:
-            pygame.draw.line(surface, rgb, pt1, pt2, 1)
+            pygame.draw.line(surface, rgb, pt1, pt2, line_width)
     return offset
 
 def render_geometry_command(cmd_type, data, offset, surface, current_color, fill_mode, current_position, movement_vector, fill_polygons=False, show_tile_labels=False):
-    """Render geometry commands"""
+    """Render geometry commands with rounded line caps and joins"""
     rgb = rgb332_to_rgb888(current_color) if current_color is not None else (255, 255, 255)
     
-    # If surface is None, just skip the rendering and return updated offset/position
+    # Leer ancho de línea (por defecto 1)
+    line_width = 1
+    
+    # Si surface es None, solo saltar el renderizado pero procesar para obtener offset correcto
     if surface is None:
-        # Skip rendering but still process the command to get correct offset
         if cmd_type == 1:  # LINE
+            line_width, offset = read_varint(data, offset)  # Leer ancho
             _, offset = read_zigzag(data, offset)
             _, offset = read_zigzag(data, offset)
             _, offset = read_zigzag(data, offset)
             _, offset = read_zigzag(data, offset)
             return offset, current_position, movement_vector
         elif cmd_type == 2:  # POLYLINE
+            line_width, offset = read_varint(data, offset)  # Leer ancho
             n_pts, offset = read_varint(data, offset)
             for _ in range(n_pts):
                 if _ == 0:
@@ -652,6 +702,7 @@ def render_geometry_command(cmd_type, data, offset, surface, current_color, fill
                     _, offset = read_zigzag(data, offset)
             return offset, current_position, movement_vector
         elif cmd_type == 3:  # STROKE_POLYGON
+            line_width, offset = read_varint(data, offset)  # Leer ancho
             n_pts, offset = read_varint(data, offset)
             for _ in range(n_pts):
                 _, offset = read_zigzag(data, offset)
@@ -660,17 +711,24 @@ def render_geometry_command(cmd_type, data, offset, surface, current_color, fill
         return offset, current_position, movement_vector
     
     if cmd_type == 1:  # LINE
+        line_width, offset = read_varint(data, offset)  # Leer ancho
         x1, offset = read_zigzag(data, offset)
         y1, offset = read_zigzag(data, offset)
         dx, offset = read_zigzag(data, offset)
         dy, offset = read_zigzag(data, offset)
         x2 = x1 + dx
         y2 = y1 + dy
-        pygame.draw.line(surface, rgb, (uint16_to_tile_pixel(x1), uint16_to_tile_pixel(y1)),
-                         (uint16_to_tile_pixel(x2), uint16_to_tile_pixel(y2)), 1)
+        p1 = (uint16_to_tile_pixel(x1), uint16_to_tile_pixel(y1))
+        p2 = (uint16_to_tile_pixel(x2), uint16_to_tile_pixel(y2))
+        
+        if line_width == 1:
+            pygame.draw.line(surface, rgb, p1, p2, line_width)
+        else:
+            draw_thick_line_rounded(surface, rgb, p1, p2, line_width)
         current_position = (x2, y2)
         movement_vector = (dx, dy)
     elif cmd_type == 2:  # POLYLINE
+        line_width, offset = read_varint(data, offset)  # Leer ancho
         n_pts, offset = read_varint(data, offset)
         pts = []
         x, y = 0, 0
@@ -685,10 +743,15 @@ def render_geometry_command(cmd_type, data, offset, surface, current_color, fill
                 y += dy
             pts.append((uint16_to_tile_pixel(x), uint16_to_tile_pixel(y)))
         if len(pts) >= 2:
-            pygame.draw.lines(surface, rgb, False, pts, 1)
+            if line_width == 1:
+                pygame.draw.lines(surface, rgb, False, pts, line_width)
+            else:
+                # Usar el método de líneas gruesas con joins redondos
+                draw_thick_polyline_rounded(surface, rgb, pts, line_width)
             current_position = (x, y)
     elif cmd_type == 3:  # STROKE_POLYGON
-        offset = render_polygon_command(data, offset, surface, rgb, fill_polygons)
+        line_width, offset = read_varint(data, offset)  # Leer ancho
+        offset = render_polygon_command(data, offset, surface, rgb, fill_polygons, line_width)
     else:
         logger.warning(f"Unknown command type: {cmd_type} (0x{cmd_type:02x})")
     
