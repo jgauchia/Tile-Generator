@@ -1,231 +1,142 @@
 # OSM Vector Tile Generator
 
-This repository contains a highly optimized Python script for generating vector map tiles from OpenStreetMap (OSM) data using a custom binary format.
+Highly optimized Python script for generating vector map tiles from OpenStreetMap (OSM) data using a custom binary format.
 
-The generated tiles are extremely compact and optimized for fast rendering in custom map applications, featuring advanced compression techniques, dynamic color palette optimization, memory pooling, streaming database operations, and intelligent resource allocation.
+The generated tiles are extremely compact and optimized for fast rendering in custom map applications, featuring advanced compression techniques, dynamic color palette optimization, and intelligent line width handling.
 
 ---
 
 ## What Does the Script Do?
 
 - **GOL format support** using gol CLI for efficient OSM data processing
-- **Docker-based workflow** for seamless PBF → GOL → Tiles conversion
 - **Streaming GeoJSON processing** with incremental JSON parsing via ijson
-- **Dynamic resource allocation** based on 70% of total system memory
-- **Memory pooling** for object reuse and reduced garbage collection
-- **Streaming database operations** with LZ4 compression for optimal I/O
-- **Batch geometry processing** for improved performance
-- **Real-time progress tracking** with features per second metrics
-- **Intelligent worker allocation** based on system capabilities and memory pressure
-- **Generates compact binary tiles** with efficient coordinate encoding and palette optimization
+- **Dynamic resource allocation** based on available system memory
+- **Generates compact binary tiles** with efficient coordinate encoding
+- **Global color palette optimization** with compact indices
+- **Hybrid line width handling**: OSM tags + CartoDB-style zoom-based defaults
+- **Geometry smoothing** at high zoom levels (≥16) for smooth curves
+- **Geometry clipping** to tile boundaries using Cohen-Sutherland and Sutherland-Hodgman algorithms
+- **Layer-based priority system** for correct rendering order
+- **Adaptive batch sizing** based on zoom level and available memory
+- **Real-time progress tracking** with performance metrics
 
 ---
 
 ## Drawing Command Set
 
-The script implements a comprehensive set of drawing commands for efficient tile generation:
+The script implements these drawing commands for tile generation:
 
-### Basic Geometry Commands
+### Geometry Commands
 | Command | Code | Purpose | Data Format |
 |---------|------|---------|-------------|
-| `LINE` | 0x01 | Single line segment | x1, y1, x2, y2 (delta-encoded) |
-| `POLYLINE` | 0x02 | Multi-point line | point_count + coordinate_deltas |
-| `STROKE_POLYGON` | 0x03 | Polygon outline | point_count + coordinate_deltas |
-| `HORIZONTAL_LINE` | 0x05 | Horizontal line optimization | x1, width, y |
-| `VERTICAL_LINE` | 0x06 | Vertical line optimization | x, y1, height |
+| `POLYLINE` | 2 (0x02) | Multi-point line with width | varint(width) + varint(num_points) + coordinates |
+| `STROKE_POLYGON` | 3 (0x03) | Polygon outline with width | varint(width) + varint(num_points) + coordinates |
 
 ### State Management Commands
 | Command | Code | Purpose | Data Format |
 |---------|------|---------|-------------|
-| `SET_COLOR` | 0x80 | Set RGB color | r, g, b (8-bit values) |
-| `SET_COLOR_INDEX` | 0x81 | Set color from palette | palette_index |
-| `SET_LAYER` | 0x88 | Set rendering layer | layer_number |
+| `SET_COLOR` | 128 (0x80) | Set RGB332 color directly | uint8(rgb332) |
+| `SET_COLOR_INDEX` | 129 (0x81) | Set color from palette | varint(palette_index) |
 
-### Advanced Pattern Commands
-| Command | Code | Purpose | Data Format |
-|---------|------|---------|-------------|
-| `GRID_PATTERN` | 0x85 | Grid lines for tile borders | pattern_data |
-| `COMPRESSED_POLYLINE` | 0x8B | Compressed polyline | compressed_data |
-
-### Optimized Geometry Commands
-| Command | Code | Purpose | Data Format |
-|---------|------|---------|-------------|
-| `OPTIMIZED_POLYGON` | 0x8C | Optimized polygon | optimized_data |
-| `HOLLOW_POLYGON` | 0x8D | Hollow polygon | polygon_data |
-| `OPTIMIZED_TRIANGLE` | 0x8E | Optimized triangle | triangle_data |
-| `OPTIMIZED_RECTANGLE` | 0x8F | Optimized rectangle | rectangle_data |
-| `OPTIMIZED_CIRCLE` | 0x90 | Optimized circle | circle_data |
-
-### Simple Shape Commands
-| Command | Code | Purpose | Data Format |
-|---------|------|---------|-------------|
-| `SIMPLE_RECTANGLE` | 0x96 | Simple rectangle | x, y, width, height |
-| `SIMPLE_CIRCLE` | 0x97 | Simple circle | x, y, radius |
-| `SIMPLE_TRIANGLE` | 0x98 | Simple triangle | x1, y1, x2, y2, x3, y3 |
-| `DASHED_LINE` | 0x99 | Dashed line | x1, y1, x2, y2, dash_length |
-| `DOTTED_LINE` | 0x9A | Dotted line | x1, y1, x2, y2, dot_spacing |
+**Note**: All commands are defined in the `DRAW_COMMANDS` dictionary in the script. Only these 4 commands are actively used in tile generation.
 
 ---
 
-## Processing Performance
+## Line Width System
 
-- **GOL streaming**: Direct processing via gol CLI with GeoJSON streaming
-- **Incremental JSON parsing**: Uses ijson for memory-efficient feature processing
-- **Dynamic resource allocation**: Automatically adjusts workers and batch sizes based on system memory
-- **Memory pooling**: Reuses objects to minimize garbage collection overhead
-- **LZ4 compression**: Reduces database storage and I/O operations
-- **Streaming operations**: Processes data in chunks to maintain constant memory usage
-- **Real-time monitoring**: Tracks memory pressure and adjusts processing parameters dynamically
+The script uses a sophisticated hybrid approach for determining line widths:
+
+### 1. Physical Width from OSM Tags
+When available, the script uses physical width tags from OSM data:
+- `width`: Explicit width measurement
+- `maxwidth`: Maximum width
+- `est_width`: Estimated width
+- `diameter`: For circular features
+- `gauge`: For railway tracks
+
+Physical widths are converted from various units (meters, feet, inches) to pixels based on zoom level and latitude, then clamped to reasonable min/max constraints.
+
+### 2. CartoDB-Style Zoom Defaults
+When no physical tags exist, the script applies zoom-based styling optimized for small screens:
+
+**Major Roads** (visible but not overwhelming at low zoom):
+- Motorway: 1px@z6 → 16px@z18
+- Trunk: 1px@z6 → 14px@z18  
+- Primary: 1px@z8 → 14px@z18
+
+**Connecting Roads** (thin until zoomed in):
+- Secondary: 1px@z11 → 12px@z18
+- Tertiary: 1px@z12 → 10px@z18
+
+**Minor Roads** (hairline until very close):
+- Residential: 0.5px@z13 → 8px@z18
+- Service: 1px@z15 → 6px@z18
+
+**Waterways** (drastically reduced):
+- River: 1px@z8 → 10px@z18
+- Stream: 1px@z14 → 3px@z18
+
+**Transport**:
+- Railway: 1px@z10 → 5px@z18
+- Runway: 1px@z10 → 24px@z18
+
+### 3. Width Constraints
+All calculated widths are clamped with strict min/max values:
+- Low zoom (≤10): Maximum 3px for any feature
+- Medium zoom (≤12): Maximum 4px for any feature
+- High zoom: Feature-specific maximums (e.g., motorway max 18px)
+
+This ensures clean rendering on small screens without features blocking each other.
 
 ---
 
-## Script Features
+## Geometry Processing Pipeline
 
-### Advanced Optimization Suite
-- **Database optimization**: Composite indexes, WAL mode, LZ4 compression, streaming operations
-- **Memory pooling**: Object reuse for points, commands, coordinates, and features
-- **Dynamic resource allocation**: Automatic adjustment based on 70% of total system memory
-- **Batch processing**: Intelligent grouping of geometries by type for efficient processing
-- **Memory pressure monitoring**: Real-time adjustment of workers and batch sizes
-- **Streaming I/O**: Processes data in chunks to maintain constant memory usage
+### 1. Smoothing (Zoom ≥ 16)
+At high zoom levels, geometries are smoothed by interpolating additional points:
+- Roundabouts get extra smoothing
+- Maximum segment distance decreases with zoom
+- Preserves closed rings for polygons
 
-### Dynamic Color Palette
-```
-Analyzing colors from features.json to build dynamic palette
-Dynamic color palette created:
-  - Total unique colors: 39
-  - Palette indices: 0-38
-  - Memory saving potential: 39 colors -> compact indices
-Dynamic palette ready with 39 colors from your features.json
-Writing palette to TEST/palette.bin (39 colors)
-Palette written successfully
-```
+### 2. Clipping
+Geometries are clipped to tile boundaries using industry-standard algorithms:
+- **Lines**: Cohen-Sutherland line clipping
+- **Polygons**: Sutherland-Hodgman polygon clipping
+- Tolerance increased to 1e-5 for better continuity across tile edges
 
-### Comprehensive Statistics
-The script provides detailed processing reports with real-time progress tracking:
-```
-Validating input parameters...
-All input parameters validated successfully
-System information:
-  CPU cores: 8
-  Max workers: 8
-  DB batch size: 210,000
-  Tile batch size: 70,000
-  Total memory: 16384.0MB
-  Allocated memory: 11468.8MB (70% of total)
-  Worker memory limit: 1433.6MB per worker
-  Memory pressure: low
+### 3. Coordinate Conversion
+Geographic coordinates (lat/lon) are converted to tile pixel coordinates:
+- Float pixels (0-256) scaled to uint16 (0-65536) for precision
+- Delta encoding for compact storage
+- Zigzag encoding for signed deltas
 
-Analyzing colors from features.json to build dynamic palette
-Dynamic color palette created:
-  - Total unique colors: 39
-  - Palette indices: 0-38
-  - Memory saving potential: 39 colors -> compact indices
-Dynamic palette ready with 39 colors from your features.json
-Writing palette to tiles/palette.bin (39 colors)
-Palette written successfully
+---
 
-Processing GOL file with gol CLI directly
-Querying GOL features using gol CLI with features.json filtering...
-Starting gol query with streaming output...
-Streaming features from gol query output...
-Extracted 54,482 features (542 f/s)...
-Total extracted: 54,482 unique features from GOL
+## Performance Optimizations
 
-┌──────┬─────────┬─────────────┐
-│ Zoom │ Features│ Description │
-├──────┼─────────┼─────────────┤
-│    6 │     870 │ Level 6     │
-│    7 │     870 │ Level 7     │
-│    8 │   1,627 │ Level 8     │
-│    9 │   1,648 │ Level 9     │
-│   10 │   1,649 │ Level 10    │
-│   11 │   1,661 │ Level 11    │
-│   12 │   5,483 │ Level 12    │
-│   13 │   5,774 │ Level 13    │
-│   14 │   9,482 │ Level 14    │
-│   15 │  25,418 │ Level 15    │
-│TOTAL │  52,872 │ All levels  │
-└──────┴─────────┴─────────────┘
+### Memory Management
+- **Adaptive batch sizes**: Automatically adjusted based on zoom level and available memory
+- **Dynamic worker allocation**: Based on CPU cores and available RAM
+- **Garbage collection**: Triggered after processing batches
+- **Memory monitoring**: System memory detected and utilized efficiently
 
-Processing zoom level 6 from database
-Found 1 tiles for zoom 6
-Writing tiles (zoom 6): 100%|█████████████████████| 1/1 [00:00<00:00,  1.61s/it]
+### Processing Speed
+- **Streaming JSON parsing**: Uses ijson to avoid loading entire dataset
+- **Batch processing**: Features processed in configurable batch sizes
+- **Thread pool execution**: Parallel tile writing with optimal worker count
+- **Progress tracking**: Real-time feedback with features/second metrics
 
-┌──────┬───────┬─────────────────┐
-│ Zoom │ Tiles │ Avg Size (bytes)│
-├──────┼───────┼─────────────────┤
-│    6 │     1 │         3,778.00│
-│    7 │     1 │         3,778.00│
-│    8 │     4 │         4,125.50│
-│    9 │     4 │         4,125.50│
-│   10 │     4 │         4,125.50│
-│   11 │     4 │         4,125.50│
-│   12 │    16 │         4,250.00│
-│   13 │    16 │         4,250.00│
-│   14 │    25 │         4,300.00│
-│   15 │    64 │         4,500.00│
-│TOTAL │   139 │               - │
-└──────┴───────┴─────────────────┘
-
-Process completed successfully
-Cleaning up temporary files and database...
-Cleaned up database file: features.db
-
-⏱️  Total execution time: 00d 00:02:45
-```
-
-### Performance Monitoring
-- **Real-time progress tracking**: Shows scanned/filtered features with processing speed
-- **Memory pressure monitoring**: Automatically adjusts workers and batch sizes
-- **System resource display**: Shows CPU cores, memory allocation, and worker limits
-- **Tabulated statistics**: Clean tables for features per zoom and tile generation stats
-- **Execution time tracking**: Total time displayed in dd hh:mm:ss format
+### Storage Efficiency
+- **Variable-length encoding**: Varint and zigzag encoding for compact coordinates
+- **Global color palette**: Colors indexed once, referenced by index
+- **Delta encoding**: Coordinate differences stored instead of absolutes
+- **RGB332 format**: 8-bit color (3R, 3G, 2B) reduces palette storage
 
 ---
 
 ## Usage
 
-### Quick Start with Docker Script
-
-The `generate_tiles.sh` script automates the entire PBF → GOL → Tiles pipeline in Docker:
-
-```bash
-# Basic usage
-./generate_tiles.sh input.osm.pbf output_dir features.json
-
-# With zoom range
-./generate_tiles.sh input.osm.pbf output_dir features.json --zoom 6-17
-
-# With custom max file size (KB)
-./generate_tiles.sh input.osm.pbf output_dir features.json --zoom 6-17 --max-file-size 512
-
-# Force rebuild Docker image
-./generate_tiles.sh input.osm.pbf output_dir features.json --clean-docker
-```
-
-### Script Options
-
-| Option | Description | Default |
-|--------|-------------|---------|
-| `input.pbf` | Input OSM PBF file | Required |
-| `output_dir` | Output directory for tiles | Required |
-| `features.json` | Features configuration file | Required |
-| `--zoom N-M` | Zoom level or range (e.g. `6-17`) | `6-17` |
-| `--max-file-size KB` | Maximum tile file size in KB | 128 |
-| `--clean-docker` | Force rebuild Docker image | Keep existing |
-
-### Requirements
-
-- **Docker** installed and running
-- **gol CLI** installed locally ([download](https://www.geodesk.com/download/))
-- Input PBF file
-- Features JSON configuration file
-
-### Advanced: Direct GOL Processing
-
-For direct GOL file processing (without PBF):
-
+### Basic Usage
 ```bash
 python tile_generator.py input.gol output_dir features.json --zoom 6-17
 ```
@@ -233,145 +144,132 @@ python tile_generator.py input.gol output_dir features.json --zoom 6-17
 ### Arguments
 | Argument | Description | Default |
 |----------|-------------|---------|
-| `input_file` | Path to .gol file | Required |
+| `gol_file` | Path to .gol file | Required |
 | `output_dir` | Output directory for tiles | Required |
 | `config_file` | Features JSON configuration | Required |
-| `--zoom` | Zoom level or range (e.g. `12` or `6-17`) | `6-17` |
+| `--zoom` | Zoom level(s) (e.g. `12` or `6-17`) | `6-17` |
 | `--max-file-size` | Max tile size in KB | 128 |
-| `--db-path` | Path for temporary database | `features.db` |
+| `--batch-size` | Base batch size (auto-adjusted) | 10000 |
 
-### Advanced Memory Management
+### Examples
 
-The optimized version provides significant memory improvements:
+**Process specific zoom level:**
+```bash
+python tile_generator.py london.gol tiles/ features.json --zoom 12
+```
 
-- **Dynamic resource allocation**: Uses 70% of total system memory for optimal performance
-- **Memory pooling**: Reuses objects (points, commands, coordinates, features) to reduce GC overhead
-- **LZ4 compression**: Reduces database storage footprint and I/O operations
-- **Streaming operations**: Processes data in chunks to maintain constant memory usage
-- **Memory pressure monitoring**: Real-time adjustment of workers and batch sizes based on available memory
+**Process zoom range with custom batch size:**
+```bash
+python tile_generator.py region.gol tiles/ features.json --zoom 10-15 --batch-size 5000
+```
 
----
-
-## Binary Tile Format
-
-### Format Features
-- **Comprehensive command set**: Lines, polygons, polylines, shapes, patterns
-- **Variable-length encoding**: Efficient coordinate compression with varint/zigzag
-- **Delta encoding**: Coordinate differences for compact storage
-- **RGB332 color format**: 8-bit color encoding embedded in each command
-- **Layer-based rendering**: Commands ordered by rendering layer for optimal display
-
-### Command Types
-1. **Basic Geometry** (0x01-0x06): Lines, polygons, polylines
-2. **State Management** (0x80-0x81, 0x88): Color and layer control
-3. **Advanced Patterns** (0x85, 0x8B): Grid patterns, compressed data
-4. **Optimized Geometry** (0x8C-0x90): Optimized shapes and polygons
-5. **Simple Shapes** (0x96-0x9A): Basic geometric shapes
+**Large region with smaller tile size:**
+```bash
+python tile_generator.py planet.gol tiles/ features.json --zoom 6-17 --max-file-size 64
+```
 
 ---
 
 ## Configuration
 
-### Features JSON
-The script automatically detects feature types from your configuration:
+### Features JSON Format
+The script uses a JSON configuration file to define feature styling:
 
 ```json
 {
+  "highway=motorway": {
+    "color": "#E892A2",
+    "priority": 12,
+    "zoom": 6
+  },
   "highway=primary": {
-    "color": "#DC143C", 
-    "priority": 6,
+    "color": "#FCD6A4", 
+    "priority": 10,
     "zoom": 8
   },
   "building": {
-    "color": "#8B4513",
-    "priority": 5, 
-    "zoom": 12
+    "color": "#D9D0C9",
+    "priority": 14,
+    "zoom": 13
   },
   "waterway=river": {
-    "color": "#4169E1",
+    "color": "#A0C8F0",
     "priority": 3,
-    "zoom": 6
+    "zoom": 8
   }
 }
 ```
 
 **Configuration Features:**
-- **Feature definitions**: Colors, priorities, and zoom levels for OSM features
-- **Dynamic palette generation**: Colors automatically indexed into optimal palette
-- **Priority-based rendering**: Features rendered in order based on priority values
-- **Zoom-based filtering**: Features only appear at their minimum zoom level and above
-- **Tag pattern matching**: Supports both exact matches (`key=value`) and key-only matches
+- **Tag matching**: Supports both `key=value` and `key` only patterns
+- **Color**: Hex color code (converted to RGB332 internally)
+- **Priority**: Rendering order (higher = drawn later/on top)
+- **Zoom**: Minimum zoom level for feature visibility
+- **Automatic palette**: Colors automatically indexed into optimal palette
+
+### Priority System
+The script uses a sophisticated priority calculation:
+1. **Base priority** from configuration
+2. **Layer priority** from OSM `layer` tag (×1000 multiplier)
+3. **Feature type priorities**:
+   - Water features: 100-300
+   - Land use: 200
+   - Underground (tunnels): 500
+   - Railways: 600
+   - Roads: 700-1200 (by importance)
+   - Bridges: 1300
+   - Buildings: 1400
+   - Amenities: 1500
 
 ---
 
-## Dependencies
+## Binary Tile Format
 
-### With Docker (Recommended)
-
-The Docker approach handles all dependencies automatically:
-
-```bash
-# Install gol CLI (required)
-# Download from: https://www.geodesk.com/download/
-
-# That's it! Docker handles the rest
+### File Structure
+```
+[varint: num_commands]
+[command_1]
+[command_2]
+...
+[command_n]
 ```
 
-### Without Docker (Advanced)
+### Command Structure
 
-### Required Packages
+**SET_COLOR (0x80)**
 ```
-shapely
-tqdm
-geodesk
-tabulate
-lz4
-psutil
-ijson
+[0x80][rgb332_byte]
 ```
 
-### System Requirements
-- **Docker**: For containerized execution (recommended)
-- **gol CLI**: For GOL file processing ([download](https://www.geodesk.com/download/))
-- **Multi-core CPU**: Script utilizes all available cores for optimal performance
-- **RAM**: Streaming architecture works with modest RAM (4-8GB recommended for planet files)
-
-### Installation
-```bash
-# Python packages
-pip install shapely tqdm geodesk tabulate lz4 psutil ijson
-
-# gol CLI (from Docker, or install locally)
-# The Docker workflow handles gol CLI automatically
+**SET_COLOR_INDEX (0x81)**
+```
+[0x81][varint: palette_index]
 ```
 
----
-
-## Advanced Usage
-
-### Large-Scale Processing
-For planet-scale or large regional extracts:
-```bash
-# Process in smaller zoom ranges for memory efficiency
-./generate_tiles.sh region.osm.pbf tiles/ features.json --zoom 6-12
-./generate_tiles.sh region.osm.pbf tiles/ features.json --zoom 13-17
+**POLYLINE (0x02)**
+```
+[0x02][varint: width][varint: num_points]
+[zigzag: x1][zigzag: y1]
+[zigzag: dx2][zigzag: dy2]
+...
 ```
 
-### Custom Optimization Tuning
-- **Dynamic resource allocation**: Automatically adjusts based on 70% of total system memory
-- **Memory pooling**: Reuses objects to minimize garbage collection overhead
-- **LZ4 compression**: Reduces database storage and improves I/O performance
-- **Batch geometry processing**: Groups similar geometries for efficient processing
-- **Memory pressure monitoring**: Real-time adjustment of workers and batch sizes
-- **Streaming operations**: Processes data in chunks to maintain constant memory usage
+**STROKE_POLYGON (0x03)**
+```
+[0x03][varint: width][varint: num_points]
+[zigzag: x1][zigzag: y1]
+[zigzag: dx2][zigzag: dy2]
+...
+```
 
-### Performance Monitoring
-The script provides comprehensive monitoring:
-- **Real-time progress tracking**: Shows features per second during GOL processing
-- **Memory pressure monitoring**: Automatically adjusts workers and batch sizes
-- **System resource display**: Shows CPU cores, memory allocation, and worker limits
-- **Tabulated statistics**: Clean tables for features per zoom and tile generation stats
-- **Execution time tracking**: Total time displayed in dd hh:mm:ss format
+### Palette File Format
+```
+palette.bin:
+[uint32: num_colors]
+[r1][g1][b1]  // RGB888 for color 0
+[r2][g2][b2]  // RGB888 for color 1
+...
+```
 
 ---
 
@@ -379,82 +277,98 @@ The script provides comprehensive monitoring:
 
 ```
 output_dir/
-├── palette.bin          # Optimized color palette
+├── palette.bin          # Global color palette (RGB888)
+├── 6/                   # Zoom level 6
+│   └── 32/
+│       └── 21.bin       # Tile (x=32, y=21, z=6)
 ├── 12/                  # Zoom level 12
 │   ├── 2048/           
-│   │   ├── 1536.bin    # Tile (x=2048, y=1536)
+│   │   ├── 1536.bin    
 │   │   └── 1537.bin
 │   └── 2049/
-└── 13/                  # Zoom level 13
+└── 17/                  # Zoom level 17
     └── ...
 ```
 
-Each `.bin` file contains optimized drawing commands with variable-length encoding, embedded RGB332 colors, and layer-based rendering order.
+---
+
+## System Requirements
+
+### Required
+- **Python 3.7+**
+- **gol CLI** ([download](https://www.geodesk.com/download/))
+- **Python packages**: `ijson`
+
+### Recommended
+- **Multi-core CPU**: Script utilizes all available cores
+- **4-8GB RAM**: For processing large regions
+- **SSD storage**: For better I/O performance
+
+### Installation
+```bash
+# Install Python dependencies
+pip install ijson
+
+# Install gol CLI
+# Download from: https://www.geodesk.com/download/
+```
 
 ---
 
-## Documentation
+## Performance Statistics
 
-- [Binary Tile File Format](docs/bin_tile_format.md) - Complete specification of drawing commands
-- [Features JSON Format](docs/features_json_format.md) - Configuration format details
-- [Tile Viewer Documentation](docs/tile_viewer.md) - Tile viewer with command support
+The script provides comprehensive processing reports:
 
----
+```
+System: 8 CPU cores, 16384MB RAM -> Using 6 workers
+Resource settings: 6 workers, base batch size: 10000
+Building color palette...
+Palette: 39 colors
+Palette written
 
-## Technical Highlights
+Processing zoom 12 (batch size: 4000, workers: 6)...
+Zoom 12: 54482 features processed, 139 tiles written
+Zoom 12 completed in 2m 45.32s
 
-### GOL Processing
-- **GOL format**: 30% smaller than PBF with 5x faster processing
-- **Streaming architecture**: Process large files without memory overflow via gol CLI
-- **Real-time filtering**: GOQL queries with compressed selectors (na[...] and w[...])
-- **GeoJSON streaming**: Incremental JSON parsing with ijson for memory efficiency
-
-### Dynamic Color Palette System
-- **Automatic palette generation**: Analyzes `features.json` and creates optimal color palette
-- **Indexed colors**: Each unique color gets compact index (0-N) for maximum compression
-- **Smart state management**: SET_COLOR_INDEX and SET_COLOR commands minimize redundancy
-- **RGB888 palette format**: 3-byte colors with 4-byte header for tile viewer compatibility
-
-### Memory Pool Optimization
-- **Object reuse**: Reuses points, commands, coordinates, and features to reduce GC overhead
-- **Memory pooling**: Maintains pools of reusable objects with configurable size limits
-- **Periodic cleanup**: Clears pools every 100 tiles to prevent memory buildup
-- **Efficient allocation**: Reduces object creation and destruction overhead
-
-### Database Optimization
-- **LZ4 compression**: Compresses feature data to reduce storage and I/O operations
-- **Composite indexes**: Multi-column indexes for optimal query performance
-- **WAL mode**: Write-Ahead Logging for better concurrency and crash recovery
-- **Streaming operations**: Generator-based data retrieval for memory efficiency
-- **Batch operations**: Efficient bulk inserts and updates with executemany
-
-### Dynamic Resource Allocation
-- **Memory-based calculation**: Uses 70% of total system memory for optimal performance
-- **Adaptive workers**: Automatically adjusts worker count based on available memory
-- **Dynamic batch sizes**: Calculates optimal batch sizes based on system resources
-- **Memory pressure monitoring**: Real-time adjustment of processing parameters
-
-### Batch Geometry Processing
-- **Type-based grouping**: Groups polygons, linestrings, and other geometries separately
-- **Efficient processing**: Processes similar geometries in batches for better performance
-- **Memory optimization**: Reduces function call overhead and improves cache locality
-- **Layer ordering**: Maintains correct rendering order within each batch
+Total tiles written: 139
+Total size: 1.2MB
+Average tile size: 8847 bytes
+Palette file: tiles/palette.bin
+Total processing time: 2m 45.32s
+```
 
 ---
 
-## Performance Comparison
+## Advanced Usage
 
-### Before Optimization
-- **Memory usage**: High due to object allocation overhead
-- **Database I/O**: Uncompressed data storage and retrieval
-- **Processing**: Individual geometry processing without batching
-- **Resource allocation**: Fixed worker and batch sizes
+### Processing Large Regions
+For planet-scale or large extracts, process in smaller zoom ranges:
+```bash
+# Low zoom levels (broader features)
+python tile_generator.py planet.gol tiles/ features.json --zoom 6-10
 
-### After Optimization
-- **Memory usage**: Reduced through object pooling and reuse
-- **Database I/O**: LZ4 compression reduces storage and improves performance
-- **Processing**: Batch geometry processing for improved efficiency
-- **Resource allocation**: Dynamic adjustment based on 70% of system memory
+# Medium zoom levels
+python tile_generator.py planet.gol tiles/ features.json --zoom 11-14
+
+# High zoom levels (detailed features)
+python tile_generator.py planet.gol tiles/ features.json --zoom 15-17
+```
+
+### Memory-Constrained Systems
+Reduce batch size for systems with limited RAM:
+```bash
+python tile_generator.py input.gol tiles/ features.json --batch-size 2000
+```
+
+### Custom Tile Size Limits
+Adjust maximum tile file size:
+```bash
+# Smaller tiles (64KB) for bandwidth-constrained environments
+python tile_generator.py input.gol tiles/ features.json --max-file-size 64
+
+# Larger tiles (512KB) for high-detail regions
+python tile_generator.py input.gol tiles/ features.json --max-file-size 512
+```
 
 ---
 
@@ -462,45 +376,55 @@ Each `.bin` file contains optimized drawing commands with variable-length encodi
 
 ### Common Issues
 
-1. **gol CLI not found**:
-   ```bash
-   # Download gol from https://www.geodesk.com/download/
-   # Install it and make it available in your PATH
-   ```
+**gol CLI not found:**
+```bash
+# Download and install gol from https://www.geodesk.com/download/
+# Add to PATH or use absolute path
+```
 
-2. **Docker not available**:
-   - Install Docker from https://docs.docker.com/get-docker/
-   - Ensure Docker daemon is running
+**Memory issues:**
+- Script automatically adjusts based on available memory
+- Reduce `--batch-size` for very constrained systems
+- Process zoom ranges separately
 
-3. **Memory issues with large files**:
-   - The script automatically adjusts based on available memory
-   - Use smaller zoom ranges: `--zoom 6-12`
-   - Ensure sufficient RAM (4-8GB recommended)
+**Slow processing:**
+- Verify GOL file is not corrupted
+- Check system resources (CPU, RAM, disk I/O)
+- Use SSD for better performance
+- Script automatically optimizes worker count
 
-4. **Slow processing**:
-   - Check system resources (CPU, RAM)
-   - Verify PBF file is not corrupted
-   - The script automatically optimizes based on system capabilities
-   - GOL format provides better performance than direct PBF processing
-
-### Performance Tips
-
-- **Use SSD storage** for better I/O performance
-- **The script automatically optimizes** based on available system resources
-- **Process in zoom ranges** for very large files if needed
-- **Memory monitoring is automatic** - the script adjusts parameters dynamically
-- **System requirements**: 4-8GB RAM recommended for planet files
+**Missing features in tiles:**
+- Check `zoom` setting in features.json
+- Verify feature tags match configuration
+- Review gol query output for filtering issues
 
 ---
 
-## Contributing
+## Technical Details
 
-This project is actively maintained and optimized for performance. Contributions are welcome, especially:
+### Coordinate Precision
+- **Input**: Geographic coordinates (lat/lon, decimal degrees)
+- **Internal**: Float pixels (0-256 per tile)
+- **Storage**: Uint16 (0-65536) for sub-pixel precision
+- **Delta encoding**: Reduces storage by ~60-70%
 
-- **Memory optimizations**: Further improvements to memory pooling and resource allocation
-- **New drawing commands**: Additional geometric primitives for tile rendering
-- **Database optimizations**: Better compression, indexing, or query performance
-- **Documentation**: Examples, tutorials, best practices
+### Color System
+- **Input**: Hex colors (#RRGGBB)
+- **Conversion**: RGB888 → RGB332 (8-bit)
+- **Storage**: 3 bytes per palette color (RGB888)
+- **Usage**: 1 byte per palette index in commands
+
+### Width Calculation
+1. Check OSM tags for physical width
+2. Convert to pixels using zoom and latitude
+3. Apply feature-specific constraints (min/max)
+4. Fall back to CartoDB-style defaults if no tags
+5. Interpolate between zoom breakpoints
+
+### Clipping Algorithms
+- **Cohen-Sutherland**: Fast line segment clipping with outcodes
+- **Sutherland-Hodgman**: Polygon clipping against rectangular viewport
+- **Tolerance**: 1e-5 for continuity across tile edges
 
 ---
 
@@ -512,14 +436,6 @@ This project is open source and available under the MIT License.
 
 ## Acknowledgments
 
-- **OpenStreetMap**: For providing the open map data
-- **Geodesk**: For the GOL format and gol CLI tool
-- **Shapely**: For robust geometric operations
-- **SQLite**: For efficient data storage and retrieval
-- **LZ4**: For fast compression and decompression
+- **OpenStreetMap**: For providing open map data
+- **Geodesk**: For GOL format and gol CLI tool
 - **ijson**: For incremental JSON parsing
-- **Tabulate**: For beautiful table formatting in console output
-- **Docker**: For containerization support
-
----
-
