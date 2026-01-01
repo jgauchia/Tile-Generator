@@ -12,3 +12,7 @@ competitive_analysis_vector_tiles.md
 rsync_copy.sh
 MAP/
 VECTMAP/
+migracion.md
+venv/
+CHANGELOG_FGB_MIGRATION.md
+
