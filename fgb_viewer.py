@@ -2,7 +2,7 @@
 """
 FlatGeobuf Viewer - ESP32 Map Simulator
 
-Simulates the ESP32 map rendering behavior using FlatGeobuf files.
+Simulates the ESP32 map rendering behavior using unified FlatGeobuf files.
 Displays a 768x768 viewport (3x3 tiles of 256px) centered on given coordinates.
 
 Usage:
@@ -16,6 +16,7 @@ import argparse
 import logging
 from typing import Dict, List, Tuple, Optional
 import json
+import re
 
 try:
     import pygame
@@ -44,19 +45,6 @@ STATUSBAR_HEIGHT = 60
 WINDOW_WIDTH = VIEWPORT_SIZE + TOOLBAR_WIDTH
 WINDOW_HEIGHT = VIEWPORT_SIZE + STATUSBAR_HEIGHT
 
-# Layer rendering order (lower = rendered first = behind)
-LAYER_ORDER = [
-    'water',
-    'landuse',
-    'terrain',
-    'railways',
-    'roads',
-    'infrastructure',
-    'buildings',
-    'amenities',
-    'places'
-]
-
 
 def deg2num(lat_deg: float, lon_deg: float, zoom: int) -> Tuple[float, float]:
     """Convert lat/lon to tile numbers (floating point for sub-tile precision)."""
@@ -77,65 +65,26 @@ def num2deg(xtile: float, ytile: float, zoom: int) -> Tuple[float, float]:
 
 
 def get_bbox_for_viewport(center_lat: float, center_lon: float, zoom: int) -> Tuple[float, float, float, float]:
-    """
-    Calculate bounding box for 768x768 viewport centered on coordinates.
-    Returns (min_lon, min_lat, max_lon, max_lat)
-    """
-    # Get tile coordinates for center
+    """Calculate bounding box for 768x768 viewport centered on coordinates."""
     center_x, center_y = deg2num(center_lat, center_lon, zoom)
-
-    # Calculate extent in tiles (768px = 3 tiles of 256px)
-    tiles_extent = VIEWPORT_SIZE / TILE_SIZE / 2.0  # 1.5 tiles from center
-
-    # Get corner tile coordinates
+    tiles_extent = VIEWPORT_SIZE / TILE_SIZE / 2.0
     min_tile_x = center_x - tiles_extent
     max_tile_x = center_x + tiles_extent
     min_tile_y = center_y - tiles_extent
     max_tile_y = center_y + tiles_extent
-
-    # Convert back to lat/lon
     max_lat, min_lon = num2deg(min_tile_x, min_tile_y, zoom)
     min_lat, max_lon = num2deg(max_tile_x, max_tile_y, zoom)
-
     return (min_lon, min_lat, max_lon, max_lat)
 
 
 def latlon_to_pixel(lat: float, lon: float, bbox: Tuple[float, float, float, float]) -> Tuple[int, int]:
     """Convert lat/lon to pixel coordinates within viewport."""
     min_lon, min_lat, max_lon, max_lat = bbox
-
-    # Normalize to 0-1
     x_norm = (lon - min_lon) / (max_lon - min_lon)
-    y_norm = (max_lat - lat) / (max_lat - min_lat)  # Y is inverted
-
-    # Scale to viewport
+    y_norm = (max_lat - lat) / (max_lat - min_lat)
     px = int(x_norm * VIEWPORT_SIZE)
     py = int(y_norm * VIEWPORT_SIZE)
-
     return px, py
-
-
-def pixel_to_latlon(px: int, py: int, bbox: Tuple[float, float, float, float]) -> Tuple[float, float]:
-    """Convert pixel coordinates to lat/lon."""
-    min_lon, min_lat, max_lon, max_lat = bbox
-
-    x_norm = px / VIEWPORT_SIZE
-    y_norm = py / VIEWPORT_SIZE
-
-    lon = min_lon + x_norm * (max_lon - min_lon)
-    lat = max_lat - y_norm * (max_lat - min_lat)
-
-    return lat, lon
-
-
-def hex_to_rgb(hex_color: str) -> Tuple[int, int, int]:
-    """Convert hex color to RGB tuple."""
-    try:
-        if hex_color.startswith('#'):
-            hex_color = hex_color[1:]
-        return tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
-    except:
-        return (255, 255, 255)
 
 
 def rgb332_to_rgb888(c: int) -> Tuple[int, int, int]:
@@ -152,66 +101,63 @@ def darken_color(rgb: Tuple[int, int, int], amount: float = 0.3) -> Tuple[int, i
 
 
 class FGBViewer:
-    """FlatGeobuf map viewer simulating ESP32 behavior."""
+    """FlatGeobuf map viewer simulating ESP32 behavior with unified files."""
 
     def __init__(self, fgb_dir: str, config_file: str = None):
         self.fgb_dir = fgb_dir
         self.config = {}
-        self.layer_files: Dict[str, str] = {}  # layer_name -> filepath (flat structure fallback)
-        self.zoom_dirs: Dict[int, str] = {}  # zoom_level -> directory path (new structure)
+        self.zoom_files: Dict[Tuple[int, int], str] = {}  # (min_zoom, max_zoom) -> filepath
 
-        # Load config if provided
         if config_file and os.path.exists(config_file):
             with open(config_file, 'r') as f:
                 self.config = json.load(f)
             logger.info(f"Loaded config from {config_file}")
 
-        # Index FGB files (but don't load them)
-        self._index_layers()
+        self._index_files()
 
-        # Viewport state
         self.center_lat = 0.0
         self.center_lon = 0.0
         self.zoom = 14
         self.bbox = None
-
-        # Display options
-        self.background_color = (255, 255, 255)  # White default
+        self.background_color = (255, 255, 255)
         self.fill_polygons = True
         self.show_tile_grid = False
-
-        # Stats
         self.last_query_stats = {}
 
-    def _index_layers(self):
-        """Index available zoom levels with FlatGeobuf files."""
+    def _index_files(self):
+        """Index available unified FGB files."""
         if not os.path.isdir(self.fgb_dir):
             logger.error(f"Directory not found: {self.fgb_dir}")
             return
 
-        # Check for zoom-level directory structure (new format)
-        self.zoom_dirs = {}
-        for item in os.listdir(self.fgb_dir):
-            item_path = os.path.join(self.fgb_dir, item)
-            if os.path.isdir(item_path) and item.isdigit():
-                zoom_level = int(item)
-                self.zoom_dirs[zoom_level] = item_path
-                # Count FGB files in this zoom directory
-                fgb_count = len([f for f in os.listdir(item_path) if f.endswith('.fgb')])
-                logger.info(f"Indexed zoom {zoom_level}: {fgb_count} layers")
+        # Look for unified files like z6-9.fgb, z10-12.fgb, z13-17.fgb
+        pattern = re.compile(r'^z(\d+)-(\d+)\.fgb$')
 
-        if self.zoom_dirs:
-            logger.info(f"Zoom levels available: {sorted(self.zoom_dirs.keys())}")
+        for filename in os.listdir(self.fgb_dir):
+            match = pattern.match(filename)
+            if match:
+                min_z = int(match.group(1))
+                max_z = int(match.group(2))
+                filepath = os.path.join(self.fgb_dir, filename)
+                self.zoom_files[(min_z, max_z)] = filepath
+                file_size = os.path.getsize(filepath) / (1024 * 1024)
+                logger.info(f"Indexed: {filename} (z{min_z}-{max_z}, {file_size:.1f} MB)")
+
+        if self.zoom_files:
+            logger.info(f"Total unified files: {len(self.zoom_files)}")
         else:
-            # Fallback to flat structure (old format)
-            for filename in os.listdir(self.fgb_dir):
-                if filename.endswith('.fgb'):
-                    layer_name = filename[:-4]
-                    filepath = os.path.join(self.fgb_dir, filename)
-                    self.layer_files[layer_name] = filepath
-                    file_size = os.path.getsize(filepath) / (1024 * 1024)
-                    logger.info(f"Indexed layer: {layer_name} ({file_size:.1f} MB)")
-            logger.info(f"Total layers indexed: {len(self.layer_files)} (flat structure)")
+            logger.warning("No unified FGB files found (expected z*-*.fgb)")
+
+    def _get_file_for_zoom(self) -> Optional[str]:
+        """Get the FGB file for the current zoom level."""
+        for (min_z, max_z), filepath in self.zoom_files.items():
+            if min_z <= self.zoom <= max_z:
+                return filepath
+        # Fallback: return file with highest max_zoom
+        if self.zoom_files:
+            best_range = max(self.zoom_files.keys(), key=lambda x: x[1])
+            return self.zoom_files[best_range]
+        return None
 
     def set_center(self, lat: float, lon: float, zoom: int = None):
         """Set viewport center and optionally zoom."""
@@ -221,63 +167,31 @@ class FGBViewer:
             self.zoom = zoom
         self.bbox = get_bbox_for_viewport(self.center_lat, self.center_lon, self.zoom)
         logger.info(f"Viewport centered at ({lat:.6f}, {lon:.6f}) zoom {self.zoom}")
-        logger.info(f"Bounding box: {self.bbox}")
 
-    def _get_zoom_dir(self) -> Optional[str]:
-        """Get the directory for the current zoom level."""
-        if not self.zoom_dirs:
-            return None
-
-        # Find the best matching zoom directory
-        available_zooms = sorted(self.zoom_dirs.keys())
-        best_zoom = available_zooms[0]  # Default to lowest
-
-        for z in available_zooms:
-            if z <= self.zoom:
-                best_zoom = z
-            else:
-                break
-
-        return self.zoom_dirs.get(best_zoom)
-
-    def query_features(self, layer_name: str) -> Optional[gpd.GeoDataFrame]:
-        """Query features from layer within current bbox using R-Tree spatial index.
-
-        This simulates ESP32 behavior - reads only features within bbox directly
-        from the FGB file using its built-in R-Tree index.
-        """
+    def query_features(self) -> Optional[gpd.GeoDataFrame]:
+        """Query features from unified file within current bbox."""
         if self.bbox is None:
             return None
 
-        # Determine file path based on structure
-        if self.zoom_dirs:
-            # New zoom-based structure
-            zoom_dir = self._get_zoom_dir()
-            if zoom_dir is None:
-                return None
-            filepath = os.path.join(zoom_dir, f"{layer_name}.fgb")
-            if not os.path.exists(filepath):
-                return None
-        else:
-            # Flat structure fallback
-            if layer_name not in self.layer_files:
-                return None
-            filepath = self.layer_files[layer_name]
+        filepath = self._get_file_for_zoom()
+        if filepath is None:
+            return None
 
-        # Query directly from file using bbox (uses FGB R-Tree index)
         import time
         start = time.time()
 
         try:
-            # gpd.read_file with bbox parameter uses R-Tree index for FlatGeobuf
             result = gpd.read_file(filepath, bbox=self.bbox)
+            elapsed = (time.time() - start) * 1000
 
-            elapsed = (time.time() - start) * 1000  # ms
+            # Filter by min_zoom if available
+            if 'min_zoom' in result.columns:
+                result = result[result['min_zoom'] <= self.zoom]
 
-            # Calculate bytes read (memory usage of loaded data)
             bytes_read = result.memory_usage(deep=True).sum() if len(result) > 0 else 0
 
-            self.last_query_stats[layer_name] = {
+            self.last_query_stats = {
+                'file': os.path.basename(filepath),
                 'features': len(result),
                 'time_ms': elapsed,
                 'read_kb': bytes_read / 1024
@@ -285,7 +199,7 @@ class FGBViewer:
 
             return result
         except Exception as e:
-            logger.debug(f"Spatial query error for {layer_name}: {e}")
+            logger.error(f"Query error: {e}")
             return None
 
     def render_to_surface(self, surface: pygame.Surface):
@@ -293,26 +207,9 @@ class FGBViewer:
         if self.bbox is None:
             return
 
-        # Clear with background color
         surface.fill(self.background_color)
 
-        # Render layers in order
-        for layer_name in LAYER_ORDER:
-            # Check if layer exists (either in zoom dirs or flat structure)
-            if self.zoom_dirs:
-                zoom_dir = self._get_zoom_dir()
-                if zoom_dir and os.path.exists(os.path.join(zoom_dir, f"{layer_name}.fgb")):
-                    self._render_layer(surface, layer_name)
-            elif layer_name in self.layer_files:
-                self._render_layer(surface, layer_name)
-
-        # Draw tile grid if enabled
-        if self.show_tile_grid:
-            self._draw_tile_grid(surface)
-
-    def _render_layer(self, surface: pygame.Surface, layer_name: str):
-        """Render a single layer."""
-        features = self.query_features(layer_name)
+        features = self.query_features()
         if features is None or len(features) == 0:
             return
 
@@ -321,19 +218,21 @@ class FGBViewer:
             features = features.sort_values('priority')
 
         for idx, row in features.iterrows():
-            self._render_feature(surface, row, layer_name)
+            self._render_feature(surface, row)
 
-    def _render_feature(self, surface: pygame.Surface, feature, layer_name: str):
+        if self.show_tile_grid:
+            self._draw_tile_grid(surface)
+
+    def _render_feature(self, surface: pygame.Surface, feature):
         """Render a single feature."""
         geom = feature.geometry
         if geom is None or geom.is_empty:
             return
 
-        # Get color from properties or default
         if 'color_rgb332' in feature.index and feature['color_rgb332']:
             color = rgb332_to_rgb888(int(feature['color_rgb332']))
         else:
-            color = self._get_layer_default_color(layer_name)
+            color = (200, 200, 200)
 
         geom_type = geom.geom_type
 
@@ -364,7 +263,6 @@ class FGBViewer:
             points.append((px, py))
 
         if len(points) >= 2:
-            # Clip to viewport (simple)
             pygame.draw.lines(surface, color, False, points, width)
 
     def _render_polygon(self, surface: pygame.Surface, polygon, color: Tuple[int, int, int]):
@@ -372,7 +270,6 @@ class FGBViewer:
         if polygon.is_empty:
             return
 
-        # Get exterior ring
         exterior = polygon.exterior
         points = []
         for coord in exterior.coords:
@@ -382,37 +279,17 @@ class FGBViewer:
         if len(points) >= 3:
             if self.fill_polygons:
                 pygame.draw.polygon(surface, color, points)
-                # Draw border
                 border_color = darken_color(color, 0.4)
                 pygame.draw.polygon(surface, border_color, points, 1)
             else:
                 pygame.draw.polygon(surface, color, points, 1)
 
-    def _get_layer_default_color(self, layer_name: str) -> Tuple[int, int, int]:
-        """Get default color for layer."""
-        defaults = {
-            'water': (136, 201, 250),      # Light blue
-            'landuse': (200, 230, 200),    # Light green
-            'roads': (255, 255, 255),      # White
-            'railways': (128, 128, 128),   # Gray
-            'buildings': (221, 221, 221),  # Light gray
-            'amenities': (255, 200, 200),  # Light red
-            'infrastructure': (200, 200, 200),
-            'terrain': (139, 115, 85),     # Brown
-            'places': (100, 100, 100)
-        }
-        return defaults.get(layer_name, (200, 200, 200))
-
     def _draw_tile_grid(self, surface: pygame.Surface):
         """Draw tile grid overlay."""
         grid_color = (100, 100, 100)
-
-        # Draw vertical lines
         for i in range(4):
             x = i * TILE_SIZE
             pygame.draw.line(surface, grid_color, (x, 0), (x, VIEWPORT_SIZE), 1)
-
-        # Draw horizontal lines
         for i in range(4):
             y = i * TILE_SIZE
             pygame.draw.line(surface, grid_color, (0, y), (VIEWPORT_SIZE, y), 1)
@@ -423,9 +300,6 @@ def draw_button(surface, text, rect, bg_color, fg_color, border_color, font, pre
     radius = 8
     pygame.draw.rect(surface, bg_color, rect, border_radius=radius)
     pygame.draw.rect(surface, border_color, rect, 2, border_radius=radius)
-    if pressed:
-        pygame.draw.rect(surface, border_color, rect, 4, border_radius=radius)
-
     label = font.render(text, True, fg_color)
     text_rect = label.get_rect(center=rect.center)
     surface.blit(label, text_rect)
@@ -433,31 +307,21 @@ def draw_button(surface, text, rect, bg_color, fg_color, border_color, font, pre
 
 def format_coord(decimal: float, is_latitude: bool = True) -> str:
     """Format decimal coordinate as degrees/minutes/seconds."""
-    sign = ""
-    if is_latitude:
-        sign = "N" if decimal >= 0 else "S"
-    else:
-        sign = "E" if decimal >= 0 else "W"
-
+    sign = "N" if is_latitude else "E"
+    if decimal < 0:
+        sign = "S" if is_latitude else "W"
     decimal = abs(decimal)
     degrees = int(decimal)
     minutes_full = (decimal - degrees) * 60
     minutes = int(minutes_full)
     seconds = (minutes_full - minutes) * 60
-
     return f"{degrees}°{minutes}'{seconds:.1f}\"{sign}"
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description='FlatGeobuf Map Viewer - ESP32 Simulator',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description='FlatGeobuf Map Viewer - ESP32 Simulator (Unified Files)',
         epilog="""
-Examples:
-    python fgb_viewer.py ./output --lat 42.5063 --lon 1.5218
-    python fgb_viewer.py ./output --lat 42.5063 --lon 1.5218 --zoom 16
-    python fgb_viewer.py ./output --lat 41.3851 --lon 2.1734 --zoom 14 --config features.json
-
 Controls:
     Arrow keys / Mouse drag: Pan map
     Mouse wheel / [ ] keys: Zoom in/out
@@ -468,7 +332,7 @@ Controls:
         """
     )
 
-    parser.add_argument('fgb_dir', help='Directory containing FGB files')
+    parser.add_argument('fgb_dir', help='Directory containing unified FGB files')
     parser.add_argument('--lat', type=float, required=True, help='Center latitude')
     parser.add_argument('--lon', type=float, required=True, help='Center longitude')
     parser.add_argument('--zoom', type=int, default=14, help='Zoom level (default: 14)')
@@ -484,27 +348,19 @@ Controls:
         logger.error("geopandas is required. Install with: pip install geopandas pyogrio")
         sys.exit(1)
 
-    if not os.path.isdir(args.fgb_dir):
-        logger.error(f"Directory not found: {args.fgb_dir}")
-        sys.exit(1)
-
-    # Initialize viewer
     viewer = FGBViewer(args.fgb_dir, args.config)
     viewer.set_center(args.lat, args.lon, args.zoom)
 
-    # Initialize pygame
     pygame.init()
     screen = pygame.display.set_mode((WINDOW_WIDTH, WINDOW_HEIGHT))
-    pygame.display.set_caption(f"FGB Viewer - {os.path.basename(args.fgb_dir)}")
+    pygame.display.set_caption(f"FGB Viewer (Unified) - {os.path.basename(args.fgb_dir)}")
 
     font = pygame.font.SysFont(None, 18)
     font_small = pygame.font.SysFont(None, 14)
     clock = pygame.time.Clock()
 
-    # Create viewport surface
     viewport_surface = pygame.Surface((VIEWPORT_SIZE, VIEWPORT_SIZE))
 
-    # Button definitions
     button_margin = 10
     button_height = 35
     button_width = TOOLBAR_WIDTH - 20
@@ -513,14 +369,11 @@ Controls:
     fill_button_rect = pygame.Rect(VIEWPORT_SIZE + 10, button_margin * 2 + button_height, button_width, button_height)
     grid_button_rect = pygame.Rect(VIEWPORT_SIZE + 10, button_margin * 3 + button_height * 2, button_width, button_height)
 
-    # State
     dragging = False
     drag_start = None
     drag_center_start = None
     need_redraw = True
     running = True
-
-    # Pan speed (degrees per key press)
     pan_speed_base = 0.01
 
     while running:
@@ -529,7 +382,6 @@ Controls:
                 running = False
 
             elif event.type == pygame.KEYDOWN:
-                # Calculate pan speed based on zoom
                 pan_speed = pan_speed_base / (2 ** (viewer.zoom - 10))
 
                 if event.key == pygame.K_LEFT:
@@ -553,10 +405,7 @@ Controls:
                         viewer.set_center(viewer.center_lat, viewer.center_lon, viewer.zoom + 1)
                         need_redraw = True
                 elif event.key == pygame.K_b:
-                    if viewer.background_color == (255, 255, 255):
-                        viewer.background_color = (0, 0, 0)
-                    else:
-                        viewer.background_color = (255, 255, 255)
+                    viewer.background_color = (0, 0, 0) if viewer.background_color == (255, 255, 255) else (255, 255, 255)
                     need_redraw = True
                 elif event.key == pygame.K_f:
                     viewer.fill_polygons = not viewer.fill_polygons
@@ -570,12 +419,9 @@ Controls:
             elif event.type == pygame.MOUSEBUTTONDOWN:
                 mx, my = event.pos
 
-                if event.button == 1:  # Left click
+                if event.button == 1:
                     if bg_button_rect.collidepoint(mx, my):
-                        if viewer.background_color == (255, 255, 255):
-                            viewer.background_color = (0, 0, 0)
-                        else:
-                            viewer.background_color = (255, 255, 255)
+                        viewer.background_color = (0, 0, 0) if viewer.background_color == (255, 255, 255) else (255, 255, 255)
                         need_redraw = True
                     elif fill_button_rect.collidepoint(mx, my):
                         viewer.fill_polygons = not viewer.fill_polygons
@@ -588,11 +434,11 @@ Controls:
                         drag_start = (mx, my)
                         drag_center_start = (viewer.center_lat, viewer.center_lon)
 
-                elif event.button == 4:  # Scroll up - zoom in
+                elif event.button == 4:
                     if viewer.zoom < 19:
                         viewer.set_center(viewer.center_lat, viewer.center_lon, viewer.zoom + 1)
                         need_redraw = True
-                elif event.button == 5:  # Scroll down - zoom out
+                elif event.button == 5:
                     if viewer.zoom > 1:
                         viewer.set_center(viewer.center_lat, viewer.center_lon, viewer.zoom - 1)
                         need_redraw = True
@@ -606,7 +452,6 @@ Controls:
                     dx = event.pos[0] - drag_start[0]
                     dy = event.pos[1] - drag_start[1]
 
-                    # Convert pixel delta to lat/lon delta
                     if viewer.bbox:
                         min_lon, min_lat, max_lon, max_lat = viewer.bbox
                         lon_per_pixel = (max_lon - min_lon) / VIEWPORT_SIZE
@@ -618,22 +463,14 @@ Controls:
                         viewer.set_center(new_lat, new_lon)
                         need_redraw = True
 
-        # Render
         if need_redraw:
-            # Render map to viewport
             viewer.render_to_surface(viewport_surface)
-
-            # Clear screen
             screen.fill((50, 50, 50))
-
-            # Draw viewport
             screen.blit(viewport_surface, (0, 0))
 
-            # Draw toolbar background
+            # Toolbar
             pygame.draw.rect(screen, (30, 30, 30), (VIEWPORT_SIZE, 0, TOOLBAR_WIDTH, VIEWPORT_SIZE))
-            pygame.draw.line(screen, (100, 100, 100), (VIEWPORT_SIZE, 0), (VIEWPORT_SIZE, VIEWPORT_SIZE))
 
-            # Draw buttons
             button_bg = (50, 50, 50)
             button_fg = (255, 255, 255)
             button_border = (100, 100, 100)
@@ -647,60 +484,35 @@ Controls:
             grid_text = "Grid: ON" if viewer.show_tile_grid else "Grid: OFF"
             draw_button(screen, grid_text, grid_button_rect, button_bg, button_fg, button_border, font_small)
 
-            # Draw info in toolbar
             info_y = button_margin * 4 + button_height * 3 + 20
             info_color = (200, 200, 200)
 
-            # Coordinates
-            lat_text = f"Lat: {viewer.center_lat:.6f}"
-            lon_text = f"Lon: {viewer.center_lon:.6f}"
-            zoom_text = f"Zoom: {viewer.zoom}"
+            screen.blit(font_small.render(f"Lat: {viewer.center_lat:.6f}", True, info_color), (VIEWPORT_SIZE + 10, info_y))
+            screen.blit(font_small.render(f"Lon: {viewer.center_lon:.6f}", True, info_color), (VIEWPORT_SIZE + 10, info_y + 18))
+            screen.blit(font_small.render(f"Zoom: {viewer.zoom}", True, info_color), (VIEWPORT_SIZE + 10, info_y + 36))
 
-            screen.blit(font_small.render(lat_text, True, info_color), (VIEWPORT_SIZE + 10, info_y))
-            screen.blit(font_small.render(lon_text, True, info_color), (VIEWPORT_SIZE + 10, info_y + 18))
-            screen.blit(font_small.render(zoom_text, True, info_color), (VIEWPORT_SIZE + 10, info_y + 36))
+            screen.blit(font_small.render(format_coord(viewer.center_lat, True), True, info_color), (VIEWPORT_SIZE + 10, info_y + 60))
+            screen.blit(font_small.render(format_coord(viewer.center_lon, False), True, info_color), (VIEWPORT_SIZE + 10, info_y + 78))
 
-            # DMS format
-            lat_dms = format_coord(viewer.center_lat, True)
-            lon_dms = format_coord(viewer.center_lon, False)
-            screen.blit(font_small.render(lat_dms, True, info_color), (VIEWPORT_SIZE + 10, info_y + 60))
-            screen.blit(font_small.render(lon_dms, True, info_color), (VIEWPORT_SIZE + 10, info_y + 78))
+            # Query stats
+            stats_y = info_y + 110
+            screen.blit(font_small.render("Query Stats:", True, info_color), (VIEWPORT_SIZE + 10, stats_y))
+            if viewer.last_query_stats:
+                s = viewer.last_query_stats
+                screen.blit(font_small.render(f"  File: {s.get('file', 'N/A')}", True, (150, 150, 150)), (VIEWPORT_SIZE + 10, stats_y + 18))
+                screen.blit(font_small.render(f"  Features: {s.get('features', 0)}", True, (150, 150, 150)), (VIEWPORT_SIZE + 10, stats_y + 32))
+                screen.blit(font_small.render(f"  Time: {s.get('time_ms', 0):.0f}ms", True, (150, 150, 150)), (VIEWPORT_SIZE + 10, stats_y + 46))
+                screen.blit(font_small.render(f"  Data: {s.get('read_kb', 0):.0f}KB", True, (150, 150, 150)), (VIEWPORT_SIZE + 10, stats_y + 60))
 
-            # Layer query stats (R-Tree queries)
-            layer_y = info_y + 110
-            screen.blit(font_small.render("R-Tree Queries:", True, info_color), (VIEWPORT_SIZE + 10, layer_y))
-            total_features = 0
-            total_time = 0
-            total_size_kb = 0
-            for i, layer_name in enumerate(LAYER_ORDER):
-                if layer_name in viewer.last_query_stats:
-                    stats = viewer.last_query_stats[layer_name]
-                    read_kb = stats.get('read_kb', 0)
-                    text = f"  {layer_name}: {stats['features']} ({stats['time_ms']:.0f}ms) [{read_kb:.0f}KB]"
-                    total_features += stats['features']
-                    total_time += stats['time_ms']
-                    total_size_kb += read_kb
-                    screen.blit(font_small.render(text, True, (150, 150, 150)), (VIEWPORT_SIZE + 10, layer_y + 18 + i * 14))
-
-            # Total stats
-            summary_y = layer_y + 18 + len(LAYER_ORDER) * 14 + 10
-            screen.blit(font_small.render(f"Total: {total_features} features", True, (100, 200, 100)), (VIEWPORT_SIZE + 10, summary_y))
-            screen.blit(font_small.render(f"Query time: {total_time:.0f}ms", True, (100, 200, 100)), (VIEWPORT_SIZE + 10, summary_y + 16))
-            screen.blit(font_small.render(f"Data read: {total_size_kb:.0f}KB", True, (100, 200, 100)), (VIEWPORT_SIZE + 10, summary_y + 32))
-
-            # Draw status bar
+            # Status bar
             pygame.draw.rect(screen, (30, 30, 30), (0, VIEWPORT_SIZE, WINDOW_WIDTH, STATUSBAR_HEIGHT))
-            pygame.draw.line(screen, (100, 100, 100), (0, VIEWPORT_SIZE), (WINDOW_WIDTH, VIEWPORT_SIZE))
-
-            # Status text
             if viewer.bbox:
                 min_lon, min_lat, max_lon, max_lat = viewer.bbox
                 bbox_text = f"BBox: ({min_lat:.4f}, {min_lon:.4f}) to ({max_lat:.4f}, {max_lon:.4f})"
                 screen.blit(font_small.render(bbox_text, True, (200, 200, 200)), (10, VIEWPORT_SIZE + 10))
 
-                # Resolution info
                 meters_per_pixel = 156543.03392 * math.cos(math.radians(viewer.center_lat)) / (2 ** viewer.zoom)
-                res_text = f"Resolution: {meters_per_pixel:.2f} m/px | Viewport: {VIEWPORT_SIZE}x{VIEWPORT_SIZE}px"
+                res_text = f"Resolution: {meters_per_pixel:.2f} m/px"
                 screen.blit(font_small.render(res_text, True, (200, 200, 200)), (10, VIEWPORT_SIZE + 30))
 
             pygame.display.flip()

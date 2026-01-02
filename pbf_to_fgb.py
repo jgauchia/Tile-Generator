@@ -3,10 +3,16 @@
 PBF to FlatGeobuf Converter
 
 Converts OpenStreetMap .pbf files to FlatGeobuf (.fgb) format with spatial indexing.
-Filters features based on features.json configuration and organizes output by layer.
+Generates ONE unified file per zoom range with all layers combined.
 
 Usage:
     python pbf_to_fgb.py input.pbf output_dir features.json [--zoom 6-17]
+
+Output structure:
+    output_dir/
+    ├── z6-9.fgb     # All layers combined for zooms 6-9
+    ├── z10-12.fgb   # All layers combined for zooms 10-12
+    └── z13-17.fgb   # All layers combined for zooms 13-17
 """
 
 import os
@@ -44,16 +50,21 @@ except ImportError:
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+# Zoom ranges for unified files
+ZOOM_RANGES = [
+    (6, 9),    # Low zoom: major features only
+    (10, 12),  # Medium zoom: more detail
+    (13, 17),  # High zoom: full detail
+]
+
 # Layer definitions based on feature types
 LAYER_MAPPING = {
-    # Water features
     'water': [
         'natural=water', 'natural=coastline', 'natural=bay',
         'waterway=riverbank', 'waterway=dock', 'waterway=boatyard',
         'waterway=river', 'waterway=stream', 'waterway=canal',
         'natural=spring', 'natural=wetland'
     ],
-    # Land use and natural areas
     'landuse': [
         'natural=beach', 'natural=sand', 'natural=wood',
         'landuse=forest', 'natural=forest', 'natural=scrub',
@@ -66,7 +77,6 @@ LAYER_MAPPING = {
         'landuse=construction', 'landuse=cemetery', 'landuse=allotments',
         'leisure=stadium', 'leisure=sports_centre', 'leisure=playground'
     ],
-    # Roads and paths
     'roads': [
         'highway=motorway', 'highway=motorway_link',
         'highway=trunk', 'highway=trunk_link',
@@ -80,37 +90,44 @@ LAYER_MAPPING = {
         'highway=cycleway', 'highway=steps',
         'highway=crossing', 'highway=bus_stop'
     ],
-    # Railways
     'railways': [
         'railway=rail', 'railway=subway', 'railway=tram'
     ],
-    # Buildings
     'buildings': [
         'building', 'man_made=tower'
     ],
-    # Amenities
     'amenities': [
         'amenity=parking', 'amenity=hospital',
         'amenity=school', 'amenity=university',
         'amenity=place_of_worship'
     ],
-    # Bridges and aeroways
     'infrastructure': [
         'bridge=yes', 'man_made=bridge',
         'aeroway=runway', 'aeroway=taxiway', 'aeroway=apron',
         'tunnel=yes'
     ],
-    # Natural terrain features
     'terrain': [
         'natural=peak', 'natural=ridge',
         'natural=volcano', 'natural=cliff',
         'natural=tree_row', 'natural=tree'
     ],
-    # Places
     'places': [
         'place=state', 'place=town',
         'place=village', 'place=hamlet'
     ]
+}
+
+# Layer rendering priority (lower = rendered first = behind)
+LAYER_PRIORITY = {
+    'water': 10,
+    'landuse': 20,
+    'terrain': 30,
+    'railways': 40,
+    'roads': 50,
+    'infrastructure': 60,
+    'buildings': 70,
+    'amenities': 80,
+    'places': 90
 }
 
 
@@ -123,7 +140,6 @@ def get_layer_for_tags(tags: Dict[str, str]) -> Optional[str]:
                 if key in tags and tags[key] == value:
                     return layer_name
             else:
-                # Key-only match (e.g., 'building')
                 if feature_key in tags:
                     return layer_name
     return None
@@ -175,28 +191,6 @@ def hex_to_rgb332(hex_color: str) -> int:
         return 0xFF
 
 
-def get_simplification_tolerance(zoom: int) -> float:
-    """Get Douglas-Peucker simplification tolerance based on zoom level."""
-    # Higher zoom = less simplification (more detail)
-    tolerances = {
-        6: 0.001,
-        7: 0.0008,
-        8: 0.0005,
-        9: 0.0003,
-        10: 0.0002,
-        11: 0.00015,
-        12: 0.0001,
-        13: 0.00008,
-        14: 0.00005,
-        15: 0.00003,
-        16: 0.000015,
-        17: 0.000012,
-        18: 0.00001,
-        19: 0.000008,
-    }
-    return tolerances.get(zoom, 0.000005)
-
-
 class OSMHandler(osmium.SimpleHandler):
     """Handler for processing OSM data from PBF files."""
 
@@ -204,24 +198,16 @@ class OSMHandler(osmium.SimpleHandler):
         super().__init__()
         self.config = config
         self.min_zoom, self.max_zoom = zoom_range
-
-        # Storage for features by layer
-        self.features_by_layer: Dict[str, List[Dict]] = defaultdict(list)
-
-        # Statistics
+        self.features: List[Dict] = []
         self.stats = {
             'ways_processed': 0,
             'relations_processed': 0,
             'features_extracted': 0,
             'features_filtered': 0
         }
-
-        # Progress tracking
         self.start_time = time.time()
         self.last_progress_time = time.time()
-        self.progress_interval = 5  # Log every 5 seconds
-
-        # Build set of interesting tags from config
+        self.progress_interval = 5
         self.interesting_tags = self._build_interesting_tags()
 
     def _build_interesting_tags(self) -> Set[str]:
@@ -245,7 +231,6 @@ class OSMHandler(osmium.SimpleHandler):
             extracted = self.stats['features_extracted']
             elapsed = current_time - self.start_time
             mins, secs = divmod(int(elapsed), 60)
-            # Print in-place progress
             print(f"\r  Progress: {ways:,} ways, {extracted:,} features [{mins}m {secs:02d}s]", end='', flush=True)
 
     def _has_interesting_tags(self, tags) -> bool:
@@ -284,7 +269,6 @@ class OSMHandler(osmium.SimpleHandler):
             self.stats['features_filtered'] += 1
             return
 
-        # Get layer and zoom
         layer = get_layer_for_tags(tags)
         if layer is None:
             self.stats['features_filtered'] += 1
@@ -295,7 +279,6 @@ class OSMHandler(osmium.SimpleHandler):
             self.stats['features_filtered'] += 1
             return
 
-        # Build geometry from node locations (provided by osmium with locations=True)
         coords = []
         for node in w.nodes:
             if node.location.valid():
@@ -305,7 +288,6 @@ class OSMHandler(osmium.SimpleHandler):
             self.stats['features_filtered'] += 1
             return
 
-        # Determine geometry type
         is_closed = len(coords) >= 4 and coords[0] == coords[-1]
         is_area = is_closed and (
             'building' in tags or
@@ -317,12 +299,14 @@ class OSMHandler(osmium.SimpleHandler):
             tags.get('area') == 'yes'
         )
 
-        # Get attributes
         color = get_color_for_tags(tags, self.config)
         priority = get_priority_for_tags(tags, self.config)
         color_rgb332 = hex_to_rgb332(color)
 
-        # Create feature
+        # Combine layer priority with feature priority
+        layer_base_priority = LAYER_PRIORITY.get(layer, 50)
+        combined_priority = layer_base_priority + (priority % 10)
+
         feature = {
             'geometry_type': 'Polygon' if is_area else 'LineString',
             'coordinates': coords,
@@ -330,14 +314,13 @@ class OSMHandler(osmium.SimpleHandler):
                 'osm_id': w.id,
                 'min_zoom': min_zoom,
                 'color_rgb332': color_rgb332,
-                'priority': priority,
+                'priority': combined_priority,
                 'layer': layer,
-                # Store primary tag for reference
                 'feature_type': self._get_primary_tag(tags)
             }
         }
 
-        self.features_by_layer[layer].append(feature)
+        self.features.append(feature)
         self.stats['features_extracted'] += 1
 
     def _get_primary_tag(self, tags: Dict[str, str]) -> str:
@@ -351,27 +334,32 @@ class OSMHandler(osmium.SimpleHandler):
     def relation(self, r):
         """Process relation - for multipolygons, etc."""
         self.stats['relations_processed'] += 1
-        # TODO: Handle multipolygon relations for complex areas
         pass
 
 
-def write_fgb_layer(features: List[Dict], output_path: str, layer_name: str):
-    """Write features to FlatGeobuf file using GeoPandas."""
+def write_unified_fgb(features: List[Dict], output_path: str, max_zoom: int):
+    """Write all features to a single unified FlatGeobuf file."""
     if not GEOPANDAS_AVAILABLE:
         logger.error("GeoPandas not available. Install with: pip install geopandas")
         return False
 
     if not features:
-        logger.warning(f"No features to write for layer {layer_name}")
+        logger.warning(f"No features to write")
         return False
 
-    logger.debug(f"Writing {len(features)} features to {output_path}")
+    # Filter features for this zoom range
+    filtered_features = [f for f in features if f['properties']['min_zoom'] <= max_zoom]
 
-    # Convert features to GeoDataFrame
+    if not filtered_features:
+        logger.warning(f"No features for max zoom {max_zoom}")
+        return False
+
+    logger.info(f"Writing {len(filtered_features)} features to {output_path}")
+
     geometries = []
     properties_list = []
 
-    for feature in features:
+    for feature in filtered_features:
         coords = feature['coordinates']
         geom_type = feature['geometry_type']
         props = feature['properties']
@@ -389,7 +377,6 @@ def write_fgb_layer(features: List[Dict], output_path: str, layer_name: str):
                         geometries.append(geom)
                         properties_list.append(props)
                     else:
-                        # Try to fix invalid polygon
                         geom = geom.buffer(0)
                         if geom.is_valid and not geom.is_empty:
                             geometries.append(geom)
@@ -399,15 +386,12 @@ def write_fgb_layer(features: List[Dict], output_path: str, layer_name: str):
             continue
 
     if not geometries:
-        logger.warning(f"No valid geometries for layer {layer_name}")
+        logger.warning(f"No valid geometries")
         return False
 
-    # Create GeoDataFrame
     gdf = gpd.GeoDataFrame(properties_list, geometry=geometries, crs="EPSG:4326")
 
-    # Write to FlatGeobuf with spatial index
     try:
-        # Suppress pyogrio/fiona logging during write
         import warnings
         pyogrio_logger = logging.getLogger('pyogrio')
         fiona_logger = logging.getLogger('fiona')
@@ -420,11 +404,11 @@ def write_fgb_layer(features: List[Dict], output_path: str, layer_name: str):
             warnings.simplefilter("ignore")
             gdf.to_file(output_path, driver="FlatGeobuf", spatial_index=True)
 
-        # Restore logging levels
         pyogrio_logger.setLevel(old_pyogrio_level)
         fiona_logger.setLevel(old_fiona_level)
 
-        logger.debug(f"Successfully wrote {len(gdf)} features to {output_path}")
+        file_size_mb = os.path.getsize(output_path) / (1024 * 1024)
+        logger.info(f"Successfully wrote {len(gdf)} features ({file_size_mb:.2f} MB)")
         return True
     except Exception as e:
         logger.error(f"Error writing FlatGeobuf: {e}")
@@ -433,17 +417,14 @@ def write_fgb_layer(features: List[Dict], output_path: str, layer_name: str):
 
 def convert_pbf_to_fgb(input_pbf: str, output_dir: str, config_file: str,
                         zoom_range: Tuple[int, int] = (6, 17)):
-    """Main conversion function."""
+    """Main conversion function - generates unified files per zoom range."""
 
-    # Load configuration
     logger.info(f"Loading configuration from {config_file}")
     with open(config_file, 'r') as f:
         config = json.load(f)
 
-    # Create output directory
     os.makedirs(output_dir, exist_ok=True)
 
-    # Process PBF file
     file_size_mb = os.path.getsize(input_pbf) / (1024 * 1024)
     logger.info(f"Processing PBF file: {input_pbf} ({file_size_mb:.1f} MB)")
     logger.info(f"Zoom range: {zoom_range[0]}-{zoom_range[1]}")
@@ -451,13 +432,10 @@ def convert_pbf_to_fgb(input_pbf: str, output_dir: str, config_file: str,
     start_time = time.time()
 
     handler = OSMHandler(config, zoom_range)
-
-    # First pass: cache nodes and extract features
     logger.info("Processing OSM data (this may take a while for large files)...")
     handler.apply_file(input_pbf, locations=True, idx='flex_mem')
-    print()  # New line after progress
+    print()
 
-    # Log statistics
     elapsed = time.time() - start_time
     logger.info(f"Processing completed in {elapsed:.2f}s")
     logger.info(f"Statistics:")
@@ -465,56 +443,29 @@ def convert_pbf_to_fgb(input_pbf: str, output_dir: str, config_file: str,
     logger.info(f"  Features extracted: {handler.stats['features_extracted']:,}")
     logger.info(f"  Features filtered: {handler.stats['features_filtered']:,}")
 
-    # Write FlatGeobuf files by zoom level and layer
-    logger.info("Writing FlatGeobuf files by zoom level...")
+    # Write unified FGB files per zoom range
+    logger.info("Writing unified FlatGeobuf files...")
 
     files_written = []
-    total_files = 0
-    zoom_sizes = {}  # zoom -> size in bytes
+    total_size = 0
 
-    # Calculate total expected files for progress bar
-    num_zooms = zoom_range[1] - zoom_range[0] + 1
-    num_layers = len(handler.features_by_layer)
-    total_expected = num_zooms * num_layers
-    current_file = 0
-    bar_width = 40
+    for min_z, max_z in ZOOM_RANGES:
+        # Skip ranges outside requested zoom
+        if max_z < zoom_range[0] or min_z > zoom_range[1]:
+            continue
 
-    for zoom in range(zoom_range[0], zoom_range[1] + 1):
-        # Create zoom directory
-        zoom_dir = os.path.join(output_dir, str(zoom))
-        os.makedirs(zoom_dir, exist_ok=True)
+        # Adjust range to requested bounds
+        actual_min = max(min_z, zoom_range[0])
+        actual_max = min(max_z, zoom_range[1])
 
-        zoom_files = 0
-        zoom_features = 0
-        zoom_size = 0
+        output_filename = f"z{actual_min}-{actual_max}.fgb"
+        output_path = os.path.join(output_dir, output_filename)
 
-        for layer_name, features in handler.features_by_layer.items():
-            current_file += 1
+        if write_unified_fgb(handler.features, output_path, actual_max):
+            files_written.append(output_path)
+            total_size += os.path.getsize(output_path)
 
-            # Update progress bar
-            progress = current_file / total_expected
-            filled = int(bar_width * progress)
-            bar = '█' * filled + '░' * (bar_width - filled)
-            print(f"\r  [{bar}] {current_file}/{total_expected} (zoom {zoom}: {layer_name})", end='', flush=True)
-
-            # Filter features for this zoom level (min_zoom <= current zoom)
-            zoom_features_list = [f for f in features if f['properties']['min_zoom'] <= zoom]
-
-            if zoom_features_list:
-                output_path = os.path.join(zoom_dir, f"{layer_name}.fgb")
-                if write_fgb_layer(zoom_features_list, output_path, layer_name):
-                    files_written.append(output_path)
-                    file_size = os.path.getsize(output_path)
-                    zoom_files += 1
-                    zoom_features += len(zoom_features_list)
-                    zoom_size += file_size
-                    total_files += 1
-
-        zoom_sizes[zoom] = zoom_size
-
-    print()  # New line after progress bar
-
-    # Calculate total time in hh:mm:ss
+    # Summary
     total_time = time.time() - start_time
     hours, remainder = divmod(int(total_time), 3600)
     minutes, seconds = divmod(remainder, 60)
@@ -525,26 +476,17 @@ def convert_pbf_to_fgb(input_pbf: str, output_dir: str, config_file: str,
     else:
         time_str = f"{total_time:.2f}s"
 
-    # Calculate total size
-    total_size = sum(zoom_sizes.values())
-
-    # Summary
     logger.info("=" * 50)
     logger.info("Conversion Summary")
     logger.info("=" * 50)
     logger.info(f"Input: {input_pbf}")
     logger.info(f"Output directory: {output_dir}")
-    logger.info(f"Zoom levels: {zoom_range[0]}-{zoom_range[1]}")
-    logger.info(f"Total files written: {total_files}")
+    logger.info(f"Files written:")
+    for filepath in files_written:
+        size_mb = os.path.getsize(filepath) / (1024 * 1024)
+        logger.info(f"  {os.path.basename(filepath)}: {size_mb:.2f} MB")
+    logger.info(f"Total size: {total_size / (1024 * 1024):.2f} MB")
     logger.info(f"Total time: {time_str}")
-    logger.info("")
-    logger.info("Size by zoom level:")
-    for zoom in sorted(zoom_sizes.keys()):
-        size_mb = zoom_sizes[zoom] / (1024 * 1024)
-        logger.info(f"  Zoom {zoom:2d}: {size_mb:8.2f} MB")
-    logger.info(f"  {'─' * 20}")
-    total_mb = total_size / (1024 * 1024)
-    logger.info(f"  Total:   {total_mb:8.2f} MB")
     logger.info("=" * 50)
 
     return files_written
@@ -552,29 +494,24 @@ def convert_pbf_to_fgb(input_pbf: str, output_dir: str, config_file: str,
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Convert OpenStreetMap PBF to FlatGeobuf format',
+        description='Convert OpenStreetMap PBF to unified FlatGeobuf format',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
     python pbf_to_fgb.py andorra.pbf ./output features.json
     python pbf_to_fgb.py spain.pbf ./output features.json --zoom 10-17
 
-Output structure:
+Output structure (unified files):
     output_dir/
-    ├── 6/
-    │   ├── water.fgb
-    │   ├── roads.fgb (motorway, trunk, primary only)
-    │   └── ...
-    ├── 10/
-    │   ├── water.fgb
-    │   ├── roads.fgb (+ secondary, tertiary)
-    │   └── railways.fgb
-    ├── 14/
-    │   ├── roads.fgb (+ residential, service)
-    │   ├── buildings.fgb
-    │   └── ...
-    └── 17/
-        └── ... (all features)
+    ├── z6-9.fgb     # All layers for zooms 6-9
+    ├── z10-12.fgb   # All layers for zooms 10-12
+    └── z13-17.fgb   # All layers for zooms 13-17
+
+Each file contains ALL layers combined with properties:
+    - layer: Layer name for render ordering
+    - priority: Render priority (lower = behind)
+    - color_rgb332: 8-bit color
+    - min_zoom: Minimum zoom for visibility
         """
     )
 
@@ -586,7 +523,6 @@ Output structure:
 
     args = parser.parse_args()
 
-    # Validate input file
     if not os.path.exists(args.input_pbf):
         logger.error(f"Input file not found: {args.input_pbf}")
         sys.exit(1)
@@ -595,18 +531,15 @@ Output structure:
         logger.error(f"Config file not found: {args.config_file}")
         sys.exit(1)
 
-    # Check dependencies
     if not GEOPANDAS_AVAILABLE:
         logger.error("GeoPandas is required. Install with: pip install geopandas pyogrio")
         sys.exit(1)
 
-    # Parse zoom range
     if '-' in args.zoom:
         min_zoom, max_zoom = map(int, args.zoom.split('-'))
     else:
         min_zoom = max_zoom = int(args.zoom)
 
-    # Run conversion
     convert_pbf_to_fgb(args.input_pbf, args.output_dir, args.config_file, (min_zoom, max_zoom))
 
 
