@@ -2,7 +2,7 @@
 """
 FlatGeobuf Viewer - ESP32 Map Simulator
 
-Simulates the ESP32 map rendering behavior using unified FlatGeobuf files.
+Simulates the ESP32 map rendering behavior using tile-based FlatGeobuf files.
 Displays a 768x768 viewport (3x3 tiles of 256px) centered on given coordinates.
 
 Usage:
@@ -14,9 +14,8 @@ import sys
 import math
 import argparse
 import logging
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Set
 import json
-import re
 
 try:
     import pygame
@@ -27,8 +26,8 @@ except ImportError:
 
 try:
     import geopandas as gpd
+    import pandas as pd
     from shapely.geometry import box, Point, LineString, Polygon
-    from shapely.ops import transform
     GEOPANDAS_AVAILABLE = True
 except ImportError:
     GEOPANDAS_AVAILABLE = False
@@ -65,13 +64,18 @@ def num2deg(xtile: float, ytile: float, zoom: int) -> Tuple[float, float]:
 
 
 def get_bbox_for_viewport(center_lat: float, center_lon: float, zoom: int) -> Tuple[float, float, float, float]:
-    """Calculate bounding box for 768x768 viewport centered on coordinates."""
+    """Calculate bounding box for 768x768 viewport based on 3x3 tile grid."""
+    # Get center tile
     center_x, center_y = deg2num(center_lat, center_lon, zoom)
-    tiles_extent = VIEWPORT_SIZE / TILE_SIZE / 2.0
-    min_tile_x = center_x - tiles_extent
-    max_tile_x = center_x + tiles_extent
-    min_tile_y = center_y - tiles_extent
-    max_tile_y = center_y + tiles_extent
+    center_tile_x = int(center_x)
+    center_tile_y = int(center_y)
+
+    # Bbox covers exactly 3x3 tiles around center tile
+    min_tile_x = center_tile_x - 1
+    max_tile_x = center_tile_x + 2  # +2 because we need the right edge of tile +1
+    min_tile_y = center_tile_y - 1
+    max_tile_y = center_tile_y + 2  # +2 because we need the bottom edge of tile +1
+
     max_lat, min_lon = num2deg(min_tile_x, min_tile_y, zoom)
     min_lat, max_lon = num2deg(max_tile_x, max_tile_y, zoom)
     return (min_lon, min_lat, max_lon, max_lat)
@@ -101,19 +105,19 @@ def darken_color(rgb: Tuple[int, int, int], amount: float = 0.3) -> Tuple[int, i
 
 
 class FGBViewer:
-    """FlatGeobuf map viewer simulating ESP32 behavior with unified files."""
+    """FlatGeobuf map viewer simulating ESP32 behavior with tile-based files."""
 
     def __init__(self, fgb_dir: str, config_file: str = None):
         self.fgb_dir = fgb_dir
         self.config = {}
-        self.zoom_files: Dict[Tuple[int, int], str] = {}  # (min_zoom, max_zoom) -> filepath
+        self.available_zooms: Set[int] = set()
 
         if config_file and os.path.exists(config_file):
             with open(config_file, 'r') as f:
                 self.config = json.load(f)
             logger.info(f"Loaded config from {config_file}")
 
-        self._index_files()
+        self._index_tiles()
 
         self.center_lat = 0.0
         self.center_lon = 0.0
@@ -124,40 +128,52 @@ class FGBViewer:
         self.show_tile_grid = False
         self.last_query_stats = {}
 
-    def _index_files(self):
-        """Index available unified FGB files."""
+    def _index_tiles(self):
+        """Index available zoom levels from tile structure."""
         if not os.path.isdir(self.fgb_dir):
             logger.error(f"Directory not found: {self.fgb_dir}")
             return
 
-        # Look for unified files like z6-9.fgb, z10-12.fgb, z13-17.fgb
-        pattern = re.compile(r'^z(\d+)-(\d+)\.fgb$')
+        # Scan for zoom level directories (numbers)
+        for name in os.listdir(self.fgb_dir):
+            zoom_path = os.path.join(self.fgb_dir, name)
+            if os.path.isdir(zoom_path) and name.isdigit():
+                zoom = int(name)
+                # Verify it has tile subdirectories
+                for x_name in os.listdir(zoom_path):
+                    x_path = os.path.join(zoom_path, x_name)
+                    if os.path.isdir(x_path) and x_name.isdigit():
+                        self.available_zooms.add(zoom)
+                        break
 
-        for filename in os.listdir(self.fgb_dir):
-            match = pattern.match(filename)
-            if match:
-                min_z = int(match.group(1))
-                max_z = int(match.group(2))
-                filepath = os.path.join(self.fgb_dir, filename)
-                self.zoom_files[(min_z, max_z)] = filepath
-                file_size = os.path.getsize(filepath) / (1024 * 1024)
-                logger.info(f"Indexed: {filename} (z{min_z}-{max_z}, {file_size:.1f} MB)")
-
-        if self.zoom_files:
-            logger.info(f"Total unified files: {len(self.zoom_files)}")
+        if self.available_zooms:
+            zooms_str = ", ".join(map(str, sorted(self.available_zooms)))
+            logger.info(f"Available zoom levels: {zooms_str}")
         else:
-            logger.warning("No unified FGB files found (expected z*-*.fgb)")
+            logger.warning("No tile directories found (expected z/x/y.fgb structure)")
 
-    def _get_file_for_zoom(self) -> Optional[str]:
-        """Get the FGB file for the current zoom level."""
-        for (min_z, max_z), filepath in self.zoom_files.items():
-            if min_z <= self.zoom <= max_z:
-                return filepath
-        # Fallback: return file with highest max_zoom
-        if self.zoom_files:
-            best_range = max(self.zoom_files.keys(), key=lambda x: x[1])
-            return self.zoom_files[best_range]
-        return None
+    def _get_tiles_for_viewport(self) -> List[Tuple[int, int]]:
+        """Get list of tiles (x, y) that cover the current viewport."""
+        center_x, center_y = deg2num(self.center_lat, self.center_lon, self.zoom)
+        center_tile_x = int(center_x)
+        center_tile_y = int(center_y)
+
+        tiles = []
+        # 3x3 grid around center
+        for dy in range(-1, 2):
+            for dx in range(-1, 2):
+                tile_x = center_tile_x + dx
+                tile_y = center_tile_y + dy
+                # Validate tile coordinates
+                max_tile = 2 ** self.zoom - 1
+                if 0 <= tile_x <= max_tile and 0 <= tile_y <= max_tile:
+                    tiles.append((tile_x, tile_y))
+
+        return tiles
+
+    def _get_tile_path(self, x: int, y: int) -> str:
+        """Get file path for a tile."""
+        return os.path.join(self.fgb_dir, str(self.zoom), str(x), f"{y}.fgb")
 
     def set_center(self, lat: float, lon: float, zoom: int = None):
         """Set viewport center and optionally zoom."""
@@ -166,41 +182,60 @@ class FGBViewer:
         if zoom is not None:
             self.zoom = zoom
         self.bbox = get_bbox_for_viewport(self.center_lat, self.center_lon, self.zoom)
-        logger.info(f"Viewport centered at ({lat:.6f}, {lon:.6f}) zoom {self.zoom}")
 
     def query_features(self) -> Optional[gpd.GeoDataFrame]:
-        """Query features from unified file within current bbox."""
+        """Query features from tiles within current viewport."""
         if self.bbox is None:
-            return None
-
-        filepath = self._get_file_for_zoom()
-        if filepath is None:
             return None
 
         import time
         start = time.time()
 
-        try:
-            result = gpd.read_file(filepath, bbox=self.bbox)
-            elapsed = (time.time() - start) * 1000
+        tiles = self._get_tiles_for_viewport()
+        all_gdfs = []
+        tiles_loaded = 0
+        tiles_missing = 0
 
-            # Filter by min_zoom if available
-            if 'min_zoom' in result.columns:
-                result = result[result['min_zoom'] <= self.zoom]
+        for tile_x, tile_y in tiles:
+            tile_path = self._get_tile_path(tile_x, tile_y)
+            if os.path.exists(tile_path):
+                try:
+                    gdf = gpd.read_file(tile_path)
+                    if len(gdf) > 0:
+                        all_gdfs.append(gdf)
+                    tiles_loaded += 1
+                except Exception as e:
+                    logger.warning(f"Error reading tile {tile_path}: {e}")
+            else:
+                tiles_missing += 1
 
-            bytes_read = result.memory_usage(deep=True).sum() if len(result) > 0 else 0
+        elapsed = (time.time() - start) * 1000
 
+        if not all_gdfs:
             self.last_query_stats = {
-                'file': os.path.basename(filepath),
-                'features': len(result),
-                'time_ms': elapsed,
-                'read_kb': bytes_read / 1024
+                'tiles_loaded': 0,
+                'tiles_missing': tiles_missing,
+                'features': 0,
+                'time_ms': elapsed
             }
-
-            return result
-        except Exception as e:
-            logger.error(f"Query error: {e}")
             return None
+
+        # Combine all tile features
+        result = pd.concat(all_gdfs, ignore_index=True)
+        result = gpd.GeoDataFrame(result, crs="EPSG:4326")
+
+        # Filter by min_zoom if available
+        if 'min_zoom' in result.columns:
+            result = result[result['min_zoom'] <= self.zoom]
+
+        self.last_query_stats = {
+            'tiles_loaded': tiles_loaded,
+            'tiles_missing': tiles_missing,
+            'features': len(result),
+            'time_ms': elapsed
+        }
+
+        return result
 
     def render_to_surface(self, surface: pygame.Surface):
         """Render all visible features to pygame surface."""
@@ -236,6 +271,27 @@ class FGBViewer:
 
         geom_type = geom.geom_type
 
+        if geom_type == 'Point':
+            self._render_point(surface, geom, color)
+        elif geom_type == 'LineString':
+            self._render_linestring(surface, geom, color)
+        elif geom_type == 'Polygon':
+            self._render_polygon(surface, geom, color)
+        elif geom_type == 'MultiLineString':
+            for line in geom.geoms:
+                self._render_linestring(surface, line, color)
+        elif geom_type == 'MultiPolygon':
+            for poly in geom.geoms:
+                self._render_polygon(surface, poly, color)
+        elif geom_type == 'GeometryCollection':
+            for g in geom.geoms:
+                self._render_geometry(surface, g, color)
+
+    def _render_geometry(self, surface: pygame.Surface, geom, color: Tuple[int, int, int]):
+        """Render any geometry type."""
+        if geom is None or geom.is_empty:
+            return
+        geom_type = geom.geom_type
         if geom_type == 'Point':
             self._render_point(surface, geom, color)
         elif geom_type == 'LineString':
@@ -285,14 +341,37 @@ class FGBViewer:
                 pygame.draw.polygon(surface, color, points, 1)
 
     def _draw_tile_grid(self, surface: pygame.Surface):
-        """Draw tile grid overlay."""
+        """Draw tile grid overlay with tile coordinates."""
         grid_color = (100, 100, 100)
+        text_color = (80, 80, 80)
+        font = pygame.font.SysFont(None, 14)
+
+        # Draw grid lines
         for i in range(4):
             x = i * TILE_SIZE
             pygame.draw.line(surface, grid_color, (x, 0), (x, VIEWPORT_SIZE), 1)
         for i in range(4):
             y = i * TILE_SIZE
             pygame.draw.line(surface, grid_color, (0, y), (VIEWPORT_SIZE, y), 1)
+
+        # Draw tile coordinates
+        tiles = self._get_tiles_for_viewport()
+        center_x, center_y = deg2num(self.center_lat, self.center_lon, self.zoom)
+        center_tile_x = int(center_x)
+        center_tile_y = int(center_y)
+
+        for dy in range(-1, 2):
+            for dx in range(-1, 2):
+                tile_x = center_tile_x + dx
+                tile_y = center_tile_y + dy
+                # Screen position for this tile
+                screen_x = (dx + 1) * TILE_SIZE + 5
+                screen_y = (dy + 1) * TILE_SIZE + 5
+                tile_path = self._get_tile_path(tile_x, tile_y)
+                exists = os.path.exists(tile_path)
+                color = (0, 100, 0) if exists else (150, 50, 50)
+                label = font.render(f"{tile_x}/{tile_y}", True, color)
+                surface.blit(label, (screen_x, screen_y))
 
 
 def draw_button(surface, text, rect, bg_color, fg_color, border_color, font, pressed=False):
@@ -320,19 +399,19 @@ def format_coord(decimal: float, is_latitude: bool = True) -> str:
 
 def main():
     parser = argparse.ArgumentParser(
-        description='FlatGeobuf Map Viewer - ESP32 Simulator (Unified Files)',
+        description='FlatGeobuf Map Viewer - ESP32 Simulator (Tile Structure)',
         epilog="""
 Controls:
     Arrow keys / Mouse drag: Pan map
     Mouse wheel / [ ] keys: Zoom in/out
     B: Toggle background color
     F: Toggle polygon fill
-    G: Toggle tile grid
+    G: Toggle tile grid (shows tile coordinates)
     Q / ESC: Quit
         """
     )
 
-    parser.add_argument('fgb_dir', help='Directory containing unified FGB files')
+    parser.add_argument('fgb_dir', help='Directory containing tile-based FGB files (z/x/y.fgb)')
     parser.add_argument('--lat', type=float, required=True, help='Center latitude')
     parser.add_argument('--lon', type=float, required=True, help='Center longitude')
     parser.add_argument('--zoom', type=int, default=14, help='Zoom level (default: 14)')
@@ -353,7 +432,7 @@ Controls:
 
     pygame.init()
     screen = pygame.display.set_mode((WINDOW_WIDTH, WINDOW_HEIGHT))
-    pygame.display.set_caption(f"FGB Viewer (Unified) - {os.path.basename(args.fgb_dir)}")
+    pygame.display.set_caption(f"FGB Viewer (Tiles) - {os.path.basename(args.fgb_dir)}")
 
     font = pygame.font.SysFont(None, 18)
     font_small = pygame.font.SysFont(None, 14)
@@ -499,10 +578,9 @@ Controls:
             screen.blit(font_small.render("Query Stats:", True, info_color), (VIEWPORT_SIZE + 10, stats_y))
             if viewer.last_query_stats:
                 s = viewer.last_query_stats
-                screen.blit(font_small.render(f"  File: {s.get('file', 'N/A')}", True, (150, 150, 150)), (VIEWPORT_SIZE + 10, stats_y + 18))
+                screen.blit(font_small.render(f"  Tiles: {s.get('tiles_loaded', 0)}/{s.get('tiles_loaded', 0) + s.get('tiles_missing', 0)}", True, (150, 150, 150)), (VIEWPORT_SIZE + 10, stats_y + 18))
                 screen.blit(font_small.render(f"  Features: {s.get('features', 0)}", True, (150, 150, 150)), (VIEWPORT_SIZE + 10, stats_y + 32))
                 screen.blit(font_small.render(f"  Time: {s.get('time_ms', 0):.0f}ms", True, (150, 150, 150)), (VIEWPORT_SIZE + 10, stats_y + 46))
-                screen.blit(font_small.render(f"  Data: {s.get('read_kb', 0):.0f}KB", True, (150, 150, 150)), (VIEWPORT_SIZE + 10, stats_y + 60))
 
             # Status bar
             pygame.draw.rect(screen, (30, 30, 30), (0, VIEWPORT_SIZE, WINDOW_WIDTH, STATUSBAR_HEIGHT))
@@ -514,6 +592,11 @@ Controls:
                 meters_per_pixel = 156543.03392 * math.cos(math.radians(viewer.center_lat)) / (2 ** viewer.zoom)
                 res_text = f"Resolution: {meters_per_pixel:.2f} m/px"
                 screen.blit(font_small.render(res_text, True, (200, 200, 200)), (10, VIEWPORT_SIZE + 30))
+
+                # Show available zooms
+                if viewer.available_zooms:
+                    zooms_str = f"Available: {min(viewer.available_zooms)}-{max(viewer.available_zooms)}"
+                    screen.blit(font_small.render(zooms_str, True, (150, 150, 150)), (400, VIEWPORT_SIZE + 10))
 
             pygame.display.flip()
             need_redraw = False

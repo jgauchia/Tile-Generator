@@ -1,18 +1,22 @@
 #!/usr/bin/env python3
 """
-PBF to FlatGeobuf Converter
+PBF to FlatGeobuf Converter - Tile Structure
 
-Converts OpenStreetMap .pbf files to FlatGeobuf (.fgb) format with spatial indexing.
-Generates ONE unified file per zoom range with all layers combined.
+Converts OpenStreetMap .pbf files to FlatGeobuf (.fgb) format with tile structure.
+Generates individual FGB files per tile (z/x/y structure like PNG tiles).
 
 Usage:
     python pbf_to_fgb.py input.pbf output_dir features.json [--zoom 6-17]
 
 Output structure:
     output_dir/
-    ├── z6-9.fgb     # All layers combined for zooms 6-9
-    ├── z10-12.fgb   # All layers combined for zooms 10-12
-    └── z13-17.fgb   # All layers combined for zooms 13-17
+    ├── 13/
+    │   ├── 4123/
+    │   │   ├── 2456.fgb
+    │   │   └── ...
+    │   └── ...
+    └── 14/
+        └── ...
 """
 
 import os
@@ -20,6 +24,7 @@ import sys
 import json
 import argparse
 import logging
+import math
 from typing import Dict, List, Optional, Tuple, Set
 from collections import defaultdict
 import time
@@ -32,30 +37,15 @@ except ImportError:
     sys.exit(1)
 
 try:
-    import fiona
-    from fiona.crs import from_epsg
-    FIONA_AVAILABLE = True
-except ImportError:
-    FIONA_AVAILABLE = False
-
-try:
     import geopandas as gpd
-    from shapely.geometry import LineString, Polygon, MultiPolygon, Point, mapping
+    from shapely.geometry import LineString, Polygon, MultiPolygon, Point, box
     from shapely.ops import transform
-    from shapely import simplify
     GEOPANDAS_AVAILABLE = True
 except ImportError:
     GEOPANDAS_AVAILABLE = False
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
-
-# Zoom ranges for unified files
-ZOOM_RANGES = [
-    (6, 9),    # Low zoom: major features only
-    (10, 12),  # Medium zoom: more detail
-    (13, 17),  # High zoom: full detail
-]
 
 # Layer definitions based on feature types
 LAYER_MAPPING = {
@@ -129,6 +119,39 @@ LAYER_PRIORITY = {
     'amenities': 80,
     'places': 90
 }
+
+
+def lon_to_tile_x(lon: float, zoom: int) -> int:
+    """Convert longitude to tile X coordinate."""
+    n = 2.0 ** zoom
+    return int((lon + 180.0) / 360.0 * n)
+
+
+def lat_to_tile_y(lat: float, zoom: int) -> int:
+    """Convert latitude to tile Y coordinate."""
+    n = 2.0 ** zoom
+    lat_rad = math.radians(lat)
+    return int((1.0 - math.asinh(math.tan(lat_rad)) / math.pi) / 2.0 * n)
+
+
+def tile_bounds(x: int, y: int, zoom: int) -> Tuple[float, float, float, float]:
+    """Get bounding box for a tile (min_lon, min_lat, max_lon, max_lat)."""
+    n = 2.0 ** zoom
+    min_lon = x / n * 360.0 - 180.0
+    max_lon = (x + 1) / n * 360.0 - 180.0
+    max_lat = math.degrees(math.atan(math.sinh(math.pi * (1 - 2 * y / n))))
+    min_lat = math.degrees(math.atan(math.sinh(math.pi * (1 - 2 * (y + 1) / n))))
+    return (min_lon, min_lat, max_lon, max_lat)
+
+
+def get_feature_tiles(coords: List[Tuple[float, float]], zoom: int) -> Set[Tuple[int, int]]:
+    """Get all tiles that a feature intersects at given zoom level."""
+    tiles = set()
+    for lon, lat in coords:
+        x = lon_to_tile_x(lon, zoom)
+        y = lat_to_tile_y(lat, zoom)
+        tiles.add((x, y))
+    return tiles
 
 
 def get_layer_for_tags(tags: Dict[str, str]) -> Optional[str]:
@@ -337,29 +360,24 @@ class OSMHandler(osmium.SimpleHandler):
         pass
 
 
-def write_unified_fgb(features: List[Dict], output_path: str, max_zoom: int):
-    """Write all features to a single unified FlatGeobuf file."""
+def write_tile_fgb(features: List[Dict], output_path: str):
+    """Write features to a single tile FlatGeobuf file.
+
+    Features are NOT clipped to tile boundaries to avoid visible seams.
+    Each feature is stored complete in every tile it touches.
+    The renderer clips to viewport naturally.
+    """
     if not GEOPANDAS_AVAILABLE:
-        logger.error("GeoPandas not available. Install with: pip install geopandas")
+        logger.error("GeoPandas not available")
         return False
 
     if not features:
-        logger.warning(f"No features to write")
         return False
-
-    # Filter features for this zoom range
-    filtered_features = [f for f in features if f['properties']['min_zoom'] <= max_zoom]
-
-    if not filtered_features:
-        logger.warning(f"No features for max zoom {max_zoom}")
-        return False
-
-    logger.info(f"Writing {len(filtered_features)} features to {output_path}")
 
     geometries = []
     properties_list = []
 
-    for feature in filtered_features:
+    for feature in features:
         coords = feature['coordinates']
         geom_type = feature['geometry_type']
         props = feature['properties']
@@ -368,56 +386,47 @@ def write_unified_fgb(features: List[Dict], output_path: str, max_zoom: int):
             if geom_type == 'LineString':
                 if len(coords) >= 2:
                     geom = LineString(coords)
-                    geometries.append(geom)
-                    properties_list.append(props)
+                    if not geom.is_empty:
+                        geometries.append(geom)
+                        properties_list.append(props)
             elif geom_type == 'Polygon':
                 if len(coords) >= 4:
                     geom = Polygon(coords)
-                    if geom.is_valid:
+                    if not geom.is_valid:
+                        geom = geom.buffer(0)
+                    if geom.is_valid and not geom.is_empty:
                         geometries.append(geom)
                         properties_list.append(props)
-                    else:
-                        geom = geom.buffer(0)
-                        if geom.is_valid and not geom.is_empty:
-                            geometries.append(geom)
-                            properties_list.append(props)
         except Exception as e:
-            logger.debug(f"Error creating geometry: {e}")
             continue
 
     if not geometries:
-        logger.warning(f"No valid geometries")
         return False
+
+    # Create output directory
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
     gdf = gpd.GeoDataFrame(properties_list, geometry=geometries, crs="EPSG:4326")
 
     try:
         import warnings
+        # Silence pyogrio "Created X records" messages
         pyogrio_logger = logging.getLogger('pyogrio')
-        fiona_logger = logging.getLogger('fiona')
-        old_pyogrio_level = pyogrio_logger.level
-        old_fiona_level = fiona_logger.level
-        pyogrio_logger.setLevel(logging.ERROR)
-        fiona_logger.setLevel(logging.ERROR)
-
+        old_level = pyogrio_logger.level
+        pyogrio_logger.setLevel(logging.WARNING)
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             gdf.to_file(output_path, driver="FlatGeobuf", spatial_index=True)
-
-        pyogrio_logger.setLevel(old_pyogrio_level)
-        fiona_logger.setLevel(old_fiona_level)
-
-        file_size_mb = os.path.getsize(output_path) / (1024 * 1024)
-        logger.info(f"Successfully wrote {len(gdf)} features ({file_size_mb:.2f} MB)")
+        pyogrio_logger.setLevel(old_level)
         return True
     except Exception as e:
-        logger.error(f"Error writing FlatGeobuf: {e}")
+        logger.error(f"Error writing {output_path}: {e}")
         return False
 
 
 def convert_pbf_to_fgb(input_pbf: str, output_dir: str, config_file: str,
                         zoom_range: Tuple[int, int] = (6, 17)):
-    """Main conversion function - generates unified files per zoom range."""
+    """Main conversion function - generates tile-based FGB files."""
 
     logger.info(f"Loading configuration from {config_file}")
     with open(config_file, 'r') as f:
@@ -443,27 +452,52 @@ def convert_pbf_to_fgb(input_pbf: str, output_dir: str, config_file: str,
     logger.info(f"  Features extracted: {handler.stats['features_extracted']:,}")
     logger.info(f"  Features filtered: {handler.stats['features_filtered']:,}")
 
-    # Write unified FGB files per zoom range
-    logger.info("Writing unified FlatGeobuf files...")
+    # Group features by tile for each zoom level
+    logger.info("Generating tile-based FlatGeobuf files...")
 
-    files_written = []
+    total_tiles = 0
     total_size = 0
 
-    for min_z, max_z in ZOOM_RANGES:
-        # Skip ranges outside requested zoom
-        if max_z < zoom_range[0] or min_z > zoom_range[1]:
+    for zoom in range(zoom_range[0], zoom_range[1] + 1):
+        # Group features by tile at this zoom level
+        tile_features: Dict[Tuple[int, int], List[Dict]] = defaultdict(list)
+
+        for feature in handler.features:
+            # Only include features visible at this zoom
+            if feature['properties']['min_zoom'] > zoom:
+                continue
+
+            # Get all tiles this feature touches
+            tiles = get_feature_tiles(feature['coordinates'], zoom)
+            for tile in tiles:
+                tile_features[tile].append(feature)
+
+        if not tile_features:
             continue
 
-        # Adjust range to requested bounds
-        actual_min = max(min_z, zoom_range[0])
-        actual_max = min(max_z, zoom_range[1])
+        num_tiles = len(tile_features)
+        tiles_written = 0
+        tile_items = list(tile_features.items())
 
-        output_filename = f"z{actual_min}-{actual_max}.fgb"
-        output_path = os.path.join(output_dir, output_filename)
+        for i, ((x, y), features) in enumerate(tile_items):
+            # Progress bar
+            progress = (i + 1) / num_tiles
+            bar_width = 30
+            filled = int(bar_width * progress)
+            bar = '█' * filled + '░' * (bar_width - filled)
+            print(f"\r  Zoom {zoom:2d}: [{bar}] {i+1}/{num_tiles} tiles", end='', flush=True)
 
-        if write_unified_fgb(handler.features, output_path, actual_max):
-            files_written.append(output_path)
-            total_size += os.path.getsize(output_path)
+            # Create directory structure: output_dir/zoom/x/y.fgb
+            tile_dir = os.path.join(output_dir, str(zoom), str(x))
+            tile_path = os.path.join(tile_dir, f"{y}.fgb")
+
+            if write_tile_fgb(features, tile_path):
+                tiles_written += 1
+                total_size += os.path.getsize(tile_path)
+
+        # Clear line and show final count
+        print(f"\r  Zoom {zoom:2d}: {tiles_written} tiles written" + " " * 30)
+        total_tiles += tiles_written
 
     # Summary
     total_time = time.time() - start_time
@@ -481,33 +515,34 @@ def convert_pbf_to_fgb(input_pbf: str, output_dir: str, config_file: str,
     logger.info("=" * 50)
     logger.info(f"Input: {input_pbf}")
     logger.info(f"Output directory: {output_dir}")
-    logger.info(f"Files written:")
-    for filepath in files_written:
-        size_mb = os.path.getsize(filepath) / (1024 * 1024)
-        logger.info(f"  {os.path.basename(filepath)}: {size_mb:.2f} MB")
+    logger.info(f"Total tiles: {total_tiles}")
     logger.info(f"Total size: {total_size / (1024 * 1024):.2f} MB")
     logger.info(f"Total time: {time_str}")
     logger.info("=" * 50)
 
-    return files_written
+    return total_tiles
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Convert OpenStreetMap PBF to unified FlatGeobuf format',
+        description='Convert OpenStreetMap PBF to tile-based FlatGeobuf format',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
     python pbf_to_fgb.py andorra.pbf ./output features.json
     python pbf_to_fgb.py spain.pbf ./output features.json --zoom 10-17
 
-Output structure (unified files):
+Output structure (tile-based):
     output_dir/
-    ├── z6-9.fgb     # All layers for zooms 6-9
-    ├── z10-12.fgb   # All layers for zooms 10-12
-    └── z13-17.fgb   # All layers for zooms 13-17
+    ├── 13/
+    │   ├── 4123/
+    │   │   ├── 2456.fgb
+    │   │   └── ...
+    │   └── ...
+    └── 14/
+        └── ...
 
-Each file contains ALL layers combined with properties:
+Each tile FGB file contains features clipped to that tile with properties:
     - layer: Layer name for render ordering
     - priority: Render priority (lower = behind)
     - color_rgb332: 8-bit color
@@ -516,7 +551,7 @@ Each file contains ALL layers combined with properties:
     )
 
     parser.add_argument('input_pbf', help='Input PBF file path')
-    parser.add_argument('output_dir', help='Output directory for FGB files')
+    parser.add_argument('output_dir', help='Output directory for FGB tiles')
     parser.add_argument('config_file', help='Features configuration JSON file')
     parser.add_argument('--zoom', default='6-17',
                         help='Zoom level range (e.g., "6-17" or "12")')

@@ -5,10 +5,11 @@ Converts OpenStreetMap PBF files to FlatGeobuf (.fgb) format with R-Tree spatial
 ## Features
 
 - **Direct PBF processing** - No intermediate formats (GOL, Docker, etc.)
-- **R-Tree spatial index** - Fast bounding box queries
-- **Zoom-level organization** - Separate files per zoom level for optimal file size
+- **Tile-based structure** - Standard z/x/y tile layout (like PNG/OSM tiles)
+- **R-Tree spatial index** - Fast bounding box queries per tile
+- **Feature clipping** - Features clipped to tile boundaries
 - **Feature filtering** - Configurable via `features.json`
-- **ESP32 optimized** - Small files, efficient for SD card access
+- **ESP32 optimized** - Small tiles (~100KB-1MB), efficient for SD card access
 
 ## Requirements
 
@@ -32,7 +33,7 @@ pip install geopandas pyogrio shapely pygame osmium
 
 ## Usage
 
-### 1. Convert PBF to FlatGeobuf
+### 1. Convert PBF to FlatGeobuf Tiles
 
 ```bash
 source venv/bin/activate
@@ -54,7 +55,7 @@ python pbf_to_fgb.py <input.pbf> <output_dir> features.json [--zoom 6-17]
 python pbf_to_fgb.py catalonia.osm.pbf ./fgb_output features.json --zoom 6-17
 ```
 
-### 2. View Generated Files
+### 2. View Generated Tiles
 
 ```bash
 python fgb_viewer.py <fgb_dir> --lat <latitude> --lon <longitude> [--zoom <level>]
@@ -64,7 +65,7 @@ python fgb_viewer.py <fgb_dir> --lat <latitude> --lon <longitude> [--zoom <level
 
 | Argument | Description | Default |
 |----------|-------------|---------|
-| `fgb_dir` | Directory with FGB files | Required |
+| `fgb_dir` | Directory with FGB tiles | Required |
 | `--lat` | Center latitude | Required |
 | `--lon` | Center longitude | Required |
 | `--zoom` | Zoom level (1-18) | `14` |
@@ -92,37 +93,28 @@ python fgb_viewer.py ./fgb_output --lat 41.3851 --lon 2.1734 --zoom 14
 ```
 fgb_output/
 ├── 6/
-│   ├── water.fgb
-│   ├── roads.fgb
-│   └── landuse.fgb
-├── 7/
-│   └── ...
-├── 10/
-│   ├── roads.fgb      (+ secondary roads)
-│   └── railways.fgb
-├── 14/
-│   ├── roads.fgb      (+ residential)
-│   ├── buildings.fgb
-│   └── ...
+│   ├── 32/
+│   │   ├── 23.fgb
+│   │   └── 24.fgb
+│   └── 33/
+│       └── ...
+├── 13/
+│   ├── 4123/
+│   │   ├── 2456.fgb
+│   │   ├── 2457.fgb
+│   │   └── ...
+│   └── 4124/
+│       └── ...
 └── 17/
-    └── ... (all features)
+    └── ...
 ```
 
-Each zoom level directory contains only features visible at that zoom level, resulting in smaller files optimized for R-Tree queries.
+Standard z/x/y tile structure where:
+- First level: zoom level
+- Second level: tile X coordinate
+- Third level: tile Y coordinate (.fgb file)
 
-### Layer Files
-
-| Layer | Contents |
-|-------|----------|
-| `water.fgb` | Coastlines, water bodies, rivers |
-| `landuse.fgb` | Forests, parks, residential areas |
-| `roads.fgb` | All road types |
-| `railways.fgb` | Rail lines |
-| `buildings.fgb` | Building footprints |
-| `amenities.fgb` | Hospitals, schools, parking |
-| `infrastructure.fgb` | Bridges, tunnels, airports |
-| `terrain.fgb` | Peaks, cliffs |
-| `places.fgb` | Towns, villages |
+Each tile contains ALL layers (water, roads, buildings, etc.) combined with properties for filtering and rendering.
 
 ## Feature Configuration
 
@@ -158,7 +150,7 @@ The `features.json` file defines which OSM features to include:
 
 ## FlatGeobuf Properties
 
-Each feature in the FGB files contains:
+Each feature in the FGB tiles contains:
 
 | Property | Type | Description |
 |----------|------|-------------|
@@ -171,19 +163,34 @@ Each feature in the FGB files contains:
 
 ## ESP32 Implementation
 
-The generated FGB files are optimized for ESP32:
+The generated FGB tiles are optimized for ESP32:
 
-1. **Directory selection**: Use current zoom to select folder
-2. **R-Tree query**: Read index, seek to matching features
-3. **Partial reads**: Use `fseek()`/`fread()` for bbox queries
-4. **Properties**: Read `color_rgb332`, `priority` for rendering
+1. **Calculate tiles**: Use lat/lon/zoom to find tile x,y coordinates
+2. **Load 3x3 grid**: Load 9 tiles around center position
+3. **Read tile**: Each tile is small, can be read sequentially
+4. **Render features**: Use `priority` for layer ordering, `color_rgb332` for colors
 
-### Advantages over tile-based formats
+### Advantages of tile-based structure
 
-- No tile coordinate calculations
-- Query any bounding box directly
-- Smaller total file size
-- Efficient SD card access with R-Tree seeks
+- Small files (~100KB-1MB per tile)
+- Sequential SD card reads (no random seeks)
+- Standard tile naming (compatible with OSM tools)
+- Easy to update specific areas
+- Familiar structure for map developers
+
+### SD Card Structure
+
+Copy the output directory to your SD card:
+
+```
+/sdcard/FGBMAP/
+├── 6/
+│   └── ...
+├── 13/
+│   └── ...
+└── 17/
+    └── ...
+```
 
 ## Download PBF Files
 
