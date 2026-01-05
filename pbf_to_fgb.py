@@ -214,6 +214,21 @@ def hex_to_rgb332(hex_color: str) -> int:
         return 0xFF
 
 
+def get_simplify_tolerance(zoom: int) -> float:
+    """
+    Calculate simplification tolerance based on zoom level.
+
+    At each zoom, a tile is 256 pixels wide and covers:
+        tile_width_degrees = 360 / (2^zoom)
+        pixel_size_degrees = tile_width_degrees / 256
+
+    We use 1 pixel as tolerance - points closer than this are redundant.
+    """
+    tile_width_degrees = 360.0 / (2.0 ** zoom)
+    pixel_size_degrees = tile_width_degrees / 256.0
+    return pixel_size_degrees
+
+
 class OSMHandler(osmium.SimpleHandler):
     """Handler for processing OSM data from PBF files."""
 
@@ -360,19 +375,40 @@ class OSMHandler(osmium.SimpleHandler):
         pass
 
 
-def write_tile_fgb(features: List[Dict], output_path: str):
+def count_coords(geom) -> int:
+    """Count total coordinates in a geometry."""
+    if hasattr(geom, 'exterior'):  # Polygon
+        return len(geom.exterior.coords) + sum(len(ring.coords) for ring in geom.interiors)
+    elif hasattr(geom, 'coords'):  # LineString/Point
+        return len(geom.coords)
+    return 0
+
+
+# Global simplification statistics
+simplify_stats = {'nodes_before': 0, 'nodes_after': 0}
+
+
+def write_tile_fgb(features: List[Dict], output_path: str, zoom: int):
     """Write features to a single tile FlatGeobuf file.
 
     Features are NOT clipped to tile boundaries to avoid visible seams.
     Each feature is stored complete in every tile it touches.
     The renderer clips to viewport naturally.
+
+    Geometries are simplified based on zoom level - points representing
+    less than 1 pixel are removed to reduce file size.
     """
+    global simplify_stats
+
     if not GEOPANDAS_AVAILABLE:
         logger.error("GeoPandas not available")
         return False
 
     if not features:
         return False
+
+    # Calculate simplification tolerance (1 pixel in degrees)
+    tolerance = get_simplify_tolerance(zoom)
 
     geometries = []
     properties_list = []
@@ -386,7 +422,13 @@ def write_tile_fgb(features: List[Dict], output_path: str):
             if geom_type == 'LineString':
                 if len(coords) >= 2:
                     geom = LineString(coords)
-                    if not geom.is_empty:
+                    nodes_before = len(geom.coords)
+                    # Simplify: remove points closer than 1 pixel
+                    geom = geom.simplify(tolerance, preserve_topology=True)
+                    # After simplification, ensure still valid LineString (min 2 points)
+                    if not geom.is_empty and len(geom.coords) >= 2:
+                        simplify_stats['nodes_before'] += nodes_before
+                        simplify_stats['nodes_after'] += len(geom.coords)
                         geometries.append(geom)
                         properties_list.append(props)
             elif geom_type == 'Polygon':
@@ -394,7 +436,12 @@ def write_tile_fgb(features: List[Dict], output_path: str):
                     geom = Polygon(coords)
                     if not geom.is_valid:
                         geom = geom.buffer(0)
+                    nodes_before = count_coords(geom)
+                    # Simplify: remove points closer than 1 pixel
+                    geom = geom.simplify(tolerance, preserve_topology=True)
                     if geom.is_valid and not geom.is_empty:
+                        simplify_stats['nodes_before'] += nodes_before
+                        simplify_stats['nodes_after'] += count_coords(geom)
                         geometries.append(geom)
                         properties_list.append(props)
         except Exception as e:
@@ -427,6 +474,8 @@ def write_tile_fgb(features: List[Dict], output_path: str):
 def convert_pbf_to_fgb(input_pbf: str, output_dir: str, config_file: str,
                         zoom_range: Tuple[int, int] = (6, 17)):
     """Main conversion function - generates tile-based FGB files."""
+    global simplify_stats
+    simplify_stats = {'nodes_before': 0, 'nodes_after': 0}
 
     logger.info(f"Loading configuration from {config_file}")
     with open(config_file, 'r') as f:
@@ -491,7 +540,7 @@ def convert_pbf_to_fgb(input_pbf: str, output_dir: str, config_file: str,
             tile_dir = os.path.join(output_dir, str(zoom), str(x))
             tile_path = os.path.join(tile_dir, f"{y}.fgb")
 
-            if write_tile_fgb(features, tile_path):
+            if write_tile_fgb(features, tile_path, zoom):
                 tiles_written += 1
                 total_size += os.path.getsize(tile_path)
 
@@ -510,6 +559,14 @@ def convert_pbf_to_fgb(input_pbf: str, output_dir: str, config_file: str,
     else:
         time_str = f"{total_time:.2f}s"
 
+    # Simplification statistics
+    nodes_before = simplify_stats['nodes_before']
+    nodes_after = simplify_stats['nodes_after']
+    if nodes_before > 0:
+        reduction = (1 - nodes_after / nodes_before) * 100
+    else:
+        reduction = 0
+
     logger.info("=" * 50)
     logger.info("Conversion Summary")
     logger.info("=" * 50)
@@ -517,6 +574,9 @@ def convert_pbf_to_fgb(input_pbf: str, output_dir: str, config_file: str,
     logger.info(f"Output directory: {output_dir}")
     logger.info(f"Total tiles: {total_tiles}")
     logger.info(f"Total size: {total_size / (1024 * 1024):.2f} MB")
+    logger.info(f"Nodes before simplification: {nodes_before:,}")
+    logger.info(f"Nodes after simplification: {nodes_after:,}")
+    logger.info(f"Node reduction: {reduction:.1f}%")
     logger.info(f"Total time: {time_str}")
     logger.info("=" * 50)
 
