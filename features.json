@@ -1,4 +1,7 @@
 {
+  "_comment": "Priority system: layer_base + (priority % 10). Lower = behind, Higher = front",
+  "_layers": "water:10, landuse:20, terrain:30, railways:40, roads:50, infrastructure:60, buildings:70, amenities:80, places:90",
+
   "natural=coastline": {
     "zoom": 6,
     "color": "#88c9fa",
@@ -7,22 +10,22 @@
   "natural=water": {
     "zoom": 12,
     "color": "#88c9fa",
-    "priority": 10
+    "priority": 11
   },
   "natural=bay": {
     "zoom": 12,
     "color": "#88c9fa",
-    "priority": 10
+    "priority": 11
   },
   "waterway=riverbank": {
     "zoom": 12,
     "color": "#88c9fa",
-    "priority": 10
+    "priority": 12
   },
   "waterway=dock": {
     "zoom": 14,
     "color": "#88c9fa",
-    "priority": 10
+    "priority": 12
   },
   "waterway=river": {
     "zoom": 8,
@@ -32,12 +35,12 @@
   "waterway=stream": {
     "zoom": 12,
     "color": "#88c9fa",
-    "priority": 15
+    "priority": 16
   },
   "waterway=canal": {
     "zoom": 12,
     "color": "#88c9fa",
-    "priority": 15
+    "priority": 16
   },
 
   "natural=beach": {
@@ -53,119 +56,144 @@
   "natural=wetland": {
     "zoom": 12,
     "color": "#c2e0e4",
-    "priority": 20
+    "priority": 21
   },
 
   "natural=wood": {
     "zoom": 12,
     "color": "#9bc184",
-    "priority": 25
+    "priority": 22
   },
   "landuse=forest": {
     "zoom": 12,
     "color": "#9bc184",
-    "priority": 25
+    "priority": 22
   },
   "natural=scrub": {
     "zoom": 14,
     "color": "#b5d0a3",
-    "priority": 25
+    "priority": 22
   },
   "natural=heath": {
     "zoom": 14,
     "color": "#d4d8a3",
-    "priority": 25
+    "priority": 22
   },
   "natural=grassland": {
     "zoom": 14,
     "color": "#c8e6a9",
-    "priority": 25
+    "priority": 22
   },
   "landuse=farmland": {
     "zoom": 12,
     "color": "#e8e4b5",
-    "priority": 25
-  },
-
-  "landuse=park": {
-    "zoom": 12,
-    "color": "#b5e3b5",
-    "priority": 30
-  },
-  "leisure=park": {
-    "zoom": 12,
-    "color": "#b5e3b5",
-    "priority": 30
-  },
-  "leisure=nature_reserve": {
-    "zoom": 12,
-    "color": "#b5e3b5",
-    "priority": 30
-  },
-  "leisure=golf_course": {
-    "zoom": 14,
-    "color": "#b5e3b5",
-    "priority": 30
+    "priority": 23
   },
 
   "landuse=residential": {
     "zoom": 12,
     "color": "#e8e6e3",
-    "priority": 35
+    "priority": 24
   },
   "landuse=commercial": {
     "zoom": 14,
     "color": "#f0e0d0",
-    "priority": 35
+    "priority": 24
   },
   "landuse=retail": {
     "zoom": 14,
     "color": "#f0e0d0",
-    "priority": 35
+    "priority": 24
   },
   "landuse=industrial": {
     "zoom": 12,
     "color": "#d8d8d8",
-    "priority": 35
+    "priority": 24
   },
-
   "landuse=cemetery": {
     "zoom": 14,
     "color": "#c0c0c0",
-    "priority": 35
+    "priority": 24
+  },
+
+  "landuse=park": {
+    "zoom": 12,
+    "color": "#b5e3b5",
+    "priority": 26
+  },
+  "leisure=park": {
+    "zoom": 12,
+    "color": "#b5e3b5",
+    "priority": 26
+  },
+  "leisure=garden": {
+    "zoom": 14,
+    "color": "#c8e6c8",
+    "priority": 26
+  },
+  "leisure=playground": {
+    "zoom": 15,
+    "color": "#c8e6c8",
+    "priority": 26
+  },
+  "leisure=nature_reserve": {
+    "zoom": 12,
+    "color": "#b5e3b5",
+    "priority": 25
+  },
+  "leisure=golf_course": {
+    "zoom": 14,
+    "color": "#b5e3b5",
+    "priority": 25
+  },
+  "leisure=recreation_ground": {
+    "zoom": 14,
+    "color": "#c8e6c8",
+    "priority": 25
+  },
+  "landuse=recreation_ground": {
+    "zoom": 14,
+    "color": "#c8e6c8",
+    "priority": 25
+  },
+
+  "amenity=parking": {
+    "zoom": 15,
+    "color": "#c0c0c0",
+    "priority": 27
   },
 
   "natural=peak": {
     "zoom": 14,
     "color": "#8b7355",
-    "priority": 40
+    "priority": 30
   },
   "natural=volcano": {
     "zoom": 14,
     "color": "#d84200",
-    "priority": 40
+    "priority": 30
   },
   "natural=cliff": {
     "zoom": 15,
     "color": "#8b7355",
-    "priority": 40
+    "priority": 31
   },
 
   "railway=rail": {
     "zoom": 8,
     "color": "#808080",
-    "priority": 50
+    "priority": 40
   },
   "railway=subway": {
     "zoom": 14,
     "color": "#808080",
-    "priority": 50
+    "priority": 41
   },
 
   "tunnel=yes": {
     "zoom": 14,
     "color": "#a0a0a0",
-    "priority": 55
+    "priority": 50
   },
 
   "highway=motorway": {
@@ -288,7 +316,7 @@
   "aeroway=apron": {
     "zoom": 14,
     "color": "#d8d8d8",
-    "priority": 75
+    "priority": 74
   },
 
   "building": {
@@ -299,24 +327,19 @@
   "leisure=stadium": {
     "zoom": 14,
     "color": "#dddddd",
-    "priority": 80
+    "priority": 81
   },
   "leisure=sports_centre": {
     "zoom": 15,
     "color": "#dddddd",
-    "priority": 80
+    "priority": 81
   },
   "leisure=pitch": {
     "zoom": 15,
     "color": "#c8e6a9",
-    "priority": 80
+    "priority": 79
   },
 
-  "amenity=parking": {
-    "zoom": 15,
-    "color": "#e8e8e8",
-    "priority": 85
-  },
   "amenity=hospital": {
     "zoom": 14,
     "color": "#ffcccc",

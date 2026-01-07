@@ -32,6 +32,7 @@ import time
 try:
     import osmium
     from osmium import osm
+    import osmium.geom
 except ImportError:
     print("Error: osmium not found. Install with: pip install osmium")
     sys.exit(1)
@@ -40,6 +41,7 @@ try:
     import geopandas as gpd
     from shapely.geometry import LineString, Polygon, MultiPolygon, Point, box
     from shapely.ops import transform
+    import shapely.wkb
     GEOPANDAS_AVAILABLE = True
 except ImportError:
     GEOPANDAS_AVAILABLE = False
@@ -62,10 +64,12 @@ LAYER_MAPPING = {
         'landuse=grass', 'landuse=orchard', 'landuse=vineyard',
         'landuse=farmland', 'landuse=park', 'leisure=park',
         'leisure=nature_reserve', 'leisure=garden', 'leisure=pitch',
-        'leisure=golf_course', 'landuse=residential', 'place=suburb',
+        'leisure=golf_course', 'leisure=recreation_ground', 'landuse=recreation_ground',
+        'landuse=residential', 'place=suburb',
         'landuse=commercial', 'landuse=retail', 'landuse=industrial',
         'landuse=construction', 'landuse=cemetery', 'landuse=allotments',
-        'leisure=stadium', 'leisure=sports_centre', 'leisure=playground'
+        'leisure=stadium', 'leisure=sports_centre', 'leisure=playground',
+        'amenity=parking'
     ],
     'roads': [
         'highway=motorway', 'highway=motorway_link',
@@ -87,7 +91,7 @@ LAYER_MAPPING = {
         'building', 'man_made=tower'
     ],
     'amenities': [
-        'amenity=parking', 'amenity=hospital',
+        'amenity=hospital',
         'amenity=school', 'amenity=university',
         'amenity=place_of_worship'
     ],
@@ -144,13 +148,36 @@ def tile_bounds(x: int, y: int, zoom: int) -> Tuple[float, float, float, float]:
     return (min_lon, min_lat, max_lon, max_lat)
 
 
-def get_feature_tiles(coords: List[Tuple[float, float]], zoom: int) -> Set[Tuple[int, int]]:
-    """Get all tiles that a feature intersects at given zoom level."""
+def get_feature_tiles(coords: List[Tuple[float, float]], zoom: int, is_polygon: bool = False) -> Set[Tuple[int, int]]:
+    """Get all tiles that a feature intersects at given zoom level.
+
+    For polygons, uses bbox to ensure all covered tiles are included,
+    not just tiles containing vertices.
+    """
     tiles = set()
-    for lon, lat in coords:
-        x = lon_to_tile_x(lon, zoom)
-        y = lat_to_tile_y(lat, zoom)
-        tiles.add((x, y))
+
+    if is_polygon and len(coords) >= 3:
+        # For polygons, get all tiles in the bounding box
+        lons = [c[0] for c in coords]
+        lats = [c[1] for c in coords]
+        min_lon, max_lon = min(lons), max(lons)
+        min_lat, max_lat = min(lats), max(lats)
+
+        min_x = lon_to_tile_x(min_lon, zoom)
+        max_x = lon_to_tile_x(max_lon, zoom)
+        min_y = lat_to_tile_y(max_lat, zoom)  # Note: lat is inverted
+        max_y = lat_to_tile_y(min_lat, zoom)
+
+        for x in range(min_x, max_x + 1):
+            for y in range(min_y, max_y + 1):
+                tiles.add((x, y))
+    else:
+        # For lines, just use vertex positions
+        for lon, lat in coords:
+            x = lon_to_tile_x(lon, zoom)
+            y = lat_to_tile_y(lat, zoom)
+            tiles.add((x, y))
+
     return tiles
 
 
@@ -240,6 +267,7 @@ class OSMHandler(osmium.SimpleHandler):
         self.stats = {
             'ways_processed': 0,
             'relations_processed': 0,
+            'areas_processed': 0,
             'features_extracted': 0,
             'features_filtered': 0
         }
@@ -247,6 +275,8 @@ class OSMHandler(osmium.SimpleHandler):
         self.last_progress_time = time.time()
         self.progress_interval = 5
         self.interesting_tags = self._build_interesting_tags()
+        self.processed_way_ids: Set[int] = set()  # Track ways processed as areas
+        self.wkbfab = osmium.geom.WKBFactory()  # For extracting geometries from areas
 
     def _build_interesting_tags(self) -> Set[str]:
         """Build set of tag keys we're interested in."""
@@ -293,7 +323,11 @@ class OSMHandler(osmium.SimpleHandler):
         return False
 
     def way(self, w):
-        """Process way - extract roads, buildings, etc."""
+        """Process way - extract roads and linear features only.
+
+        Closed ways (areas) are handled by the area() callback to properly
+        support multipolygon relations.
+        """
         self.stats['ways_processed'] += 1
         self._log_progress()
 
@@ -326,27 +360,58 @@ class OSMHandler(osmium.SimpleHandler):
             self.stats['features_filtered'] += 1
             return
 
+        # Check if this is a closed way that should be an area
         is_closed = len(coords) >= 4 and coords[0] == coords[-1]
-        is_area = is_closed and (
+        is_area_tags = (
             'building' in tags or
             'landuse' in tags or
-            'natural' in tags and tags.get('natural') in ['water', 'wood', 'forest', 'beach', 'sand', 'wetland', 'grassland', 'scrub', 'heath'] or
-            'leisure' in tags and tags.get('leisure') in ['park', 'garden', 'pitch', 'golf_course', 'nature_reserve', 'playground', 'sports_centre', 'stadium'] or
-            'amenity' in tags and tags.get('amenity') in ['parking'] or
-            'waterway' in tags and tags.get('waterway') in ['riverbank', 'dock', 'boatyard'] or
+            ('natural' in tags and tags.get('natural') in ['water', 'wood', 'forest', 'beach', 'sand', 'wetland', 'grassland', 'scrub', 'heath']) or
+            ('leisure' in tags and tags.get('leisure') in ['park', 'garden', 'pitch', 'golf_course', 'nature_reserve', 'playground', 'sports_centre', 'stadium']) or
+            ('amenity' in tags and tags.get('amenity') in ['parking', 'school', 'university', 'hospital']) or
+            ('waterway' in tags and tags.get('waterway') in ['riverbank', 'dock', 'boatyard']) or
             tags.get('area') == 'yes'
         )
 
+        # Process closed areas as Polygon (parks, buildings, etc.)
+        # Note: area() only handles multipolygon relations in pyosmium 3.6,
+        # so we must process closed ways here
+        if is_closed and is_area_tags:
+            color = get_color_for_tags(tags, self.config)
+            priority = get_priority_for_tags(tags, self.config)
+            color_rgb332 = hex_to_rgb332(color)
+
+            layer_base_priority = LAYER_PRIORITY.get(layer, 50)
+            combined_priority = layer_base_priority + (priority % 10)
+
+            feature = {
+                'geometry_type': 'Polygon',
+                'coordinates': coords,
+                'properties': {
+                    'osm_id': w.id,
+                    'min_zoom': min_zoom,
+                    'color_rgb332': color_rgb332,
+                    'priority': combined_priority,
+                    'layer': layer,
+                    'feature_type': self._get_primary_tag(tags)
+                }
+            }
+
+            self.features.append(feature)
+            self.stats['features_extracted'] += 1
+            # Track this way to avoid duplicate in area() if it's also a relation
+            self.processed_way_ids.add(w.id)
+            return
+
+        # Process as LineString (roads, rivers, etc.)
         color = get_color_for_tags(tags, self.config)
         priority = get_priority_for_tags(tags, self.config)
         color_rgb332 = hex_to_rgb332(color)
 
-        # Combine layer priority with feature priority
         layer_base_priority = LAYER_PRIORITY.get(layer, 50)
         combined_priority = layer_base_priority + (priority % 10)
 
         feature = {
-            'geometry_type': 'Polygon' if is_area else 'LineString',
+            'geometry_type': 'LineString',
             'coordinates': coords,
             'properties': {
                 'osm_id': w.id,
@@ -370,9 +435,86 @@ class OSMHandler(osmium.SimpleHandler):
         return 'unknown'
 
     def relation(self, r):
-        """Process relation - for multipolygons, etc."""
+        """Process relation - count only, areas handled by area() callback."""
         self.stats['relations_processed'] += 1
-        pass
+
+    def area(self, a):
+        """Process area - handles both closed ways and multipolygon relations.
+
+        Uses WKBFactory to extract geometry, then converts to coordinate list.
+        """
+        self.stats['areas_processed'] += 1
+        self._log_progress()
+
+        if not self._has_interesting_tags(a.tags):
+            self.stats['features_filtered'] += 1
+            return
+
+        tags = self._tags_to_dict(a.tags)
+
+        if not self._is_feature_in_config(tags):
+            self.stats['features_filtered'] += 1
+            return
+
+        layer = get_layer_for_tags(tags)
+        if layer is None:
+            self.stats['features_filtered'] += 1
+            return
+
+        min_zoom = get_zoom_for_tags(tags, self.config)
+        if min_zoom > self.max_zoom:
+            self.stats['features_filtered'] += 1
+            return
+
+        # Skip if this way was already processed in way() callback
+        if a.from_way() and a.orig_id() in self.processed_way_ids:
+            return
+
+        # Extract geometry using WKBFactory
+        try:
+            wkb = self.wkbfab.create_multipolygon(a)
+            geom = shapely.wkb.loads(wkb, hex=True)
+
+            color = get_color_for_tags(tags, self.config)
+            priority = get_priority_for_tags(tags, self.config)
+            color_rgb332 = hex_to_rgb332(color)
+
+            layer_base_priority = LAYER_PRIORITY.get(layer, 50)
+            combined_priority = layer_base_priority + (priority % 10)
+
+            # Handle both Polygon and MultiPolygon
+            polygons = []
+            if geom.geom_type == 'Polygon':
+                polygons = [geom]
+            elif geom.geom_type == 'MultiPolygon':
+                polygons = list(geom.geoms)
+
+            for poly in polygons:
+                if poly.is_empty or not poly.exterior:
+                    continue
+
+                coords = list(poly.exterior.coords)
+                if len(coords) < 4:
+                    continue
+
+                feature = {
+                    'geometry_type': 'Polygon',
+                    'coordinates': coords,
+                    'properties': {
+                        'osm_id': a.orig_id(),
+                        'min_zoom': min_zoom,
+                        'color_rgb332': color_rgb332,
+                        'priority': combined_priority,
+                        'layer': layer,
+                        'feature_type': self._get_primary_tag(tags)
+                    }
+                }
+
+                self.features.append(feature)
+                self.stats['features_extracted'] += 1
+
+        except Exception as e:
+            self.stats['features_filtered'] += 1
 
 
 def count_coords(geom) -> int:
@@ -490,7 +632,9 @@ def convert_pbf_to_fgb(input_pbf: str, output_dir: str, config_file: str,
     start_time = time.time()
 
     handler = OSMHandler(config, zoom_range)
-    logger.info("Processing OSM data (this may take a while for large files)...")
+    logger.info("Processing OSM data with multipolygon support (2 passes)...")
+
+    # pyosmium 3.x automatically does two passes when area() callback exists
     handler.apply_file(input_pbf, locations=True, idx='flex_mem')
     print()
 
@@ -498,6 +642,7 @@ def convert_pbf_to_fgb(input_pbf: str, output_dir: str, config_file: str,
     logger.info(f"Processing completed in {elapsed:.2f}s")
     logger.info(f"Statistics:")
     logger.info(f"  Ways processed: {handler.stats['ways_processed']:,}")
+    logger.info(f"  Areas processed: {handler.stats['areas_processed']:,}")
     logger.info(f"  Features extracted: {handler.stats['features_extracted']:,}")
     logger.info(f"  Features filtered: {handler.stats['features_filtered']:,}")
 
@@ -506,6 +651,11 @@ def convert_pbf_to_fgb(input_pbf: str, output_dir: str, config_file: str,
 
     total_tiles = 0
     total_size = 0
+
+    # Statistics tracking
+    feature_tile_counts = []  # (osm_id, feature_type, geom_type, layer, num_tiles, zoom)
+    tiles_by_layer = defaultdict(int)
+    tiles_by_geom_type = defaultdict(int)
 
     for zoom in range(zoom_range[0], zoom_range[1] + 1):
         # Group features by tile at this zoom level
@@ -517,7 +667,23 @@ def convert_pbf_to_fgb(input_pbf: str, output_dir: str, config_file: str,
                 continue
 
             # Get all tiles this feature touches
-            tiles = get_feature_tiles(feature['coordinates'], zoom)
+            is_polygon = feature['geometry_type'] == 'Polygon'
+            tiles = get_feature_tiles(feature['coordinates'], zoom, is_polygon)
+
+            # Track statistics
+            num_tiles = len(tiles)
+            if num_tiles > 1:  # Only track features in multiple tiles
+                feature_tile_counts.append((
+                    feature['properties']['osm_id'],
+                    feature['properties']['feature_type'],
+                    feature['geometry_type'],
+                    feature['properties']['layer'],
+                    num_tiles,
+                    zoom
+                ))
+            tiles_by_layer[feature['properties']['layer']] += num_tiles
+            tiles_by_geom_type[feature['geometry_type']] += num_tiles
+
             for tile in tiles:
                 tile_features[tile].append(feature)
 
@@ -578,6 +744,53 @@ def convert_pbf_to_fgb(input_pbf: str, output_dir: str, config_file: str,
     logger.info(f"Nodes after simplification: {nodes_after:,}")
     logger.info(f"Node reduction: {reduction:.1f}%")
     logger.info(f"Total time: {time_str}")
+
+    # Feature-tile distribution statistics
+    logger.info("")
+    logger.info("=" * 50)
+    logger.info("Feature-Tile Distribution Statistics")
+    logger.info("=" * 50)
+
+    # Tiles by geometry type
+    logger.info("")
+    logger.info("Tile assignments by geometry type:")
+    for geom_type, count in sorted(tiles_by_geom_type.items(), key=lambda x: -x[1]):
+        logger.info(f"  {geom_type}: {count:,} tile assignments")
+
+    # Tiles by layer
+    logger.info("")
+    logger.info("Tile assignments by layer:")
+    for layer, count in sorted(tiles_by_layer.items(), key=lambda x: -x[1]):
+        logger.info(f"  {layer}: {count:,} tile assignments")
+
+    # Top features by tile count
+    if feature_tile_counts:
+        # Sort by num_tiles descending
+        sorted_features = sorted(feature_tile_counts, key=lambda x: -x[4])
+
+        # Top 20 features
+        logger.info("")
+        logger.info("Top 20 features by tile coverage:")
+        logger.info(f"  {'OSM ID':<12} {'Type':<25} {'Geom':<10} {'Layer':<12} {'Tiles':>8} {'Zoom':>5}")
+        logger.info(f"  {'-'*12} {'-'*25} {'-'*10} {'-'*12} {'-'*8} {'-'*5}")
+        for osm_id, feat_type, geom_type, layer, num_tiles, zoom in sorted_features[:20]:
+            logger.info(f"  {osm_id:<12} {feat_type:<25} {geom_type:<10} {layer:<12} {num_tiles:>8,} {zoom:>5}")
+
+        # Summary stats
+        all_tile_counts = [x[4] for x in feature_tile_counts]
+        avg_tiles = sum(all_tile_counts) / len(all_tile_counts) if all_tile_counts else 0
+        max_tiles = max(all_tile_counts) if all_tile_counts else 0
+        features_over_100 = sum(1 for x in all_tile_counts if x > 100)
+        features_over_1000 = sum(1 for x in all_tile_counts if x > 1000)
+
+        logger.info("")
+        logger.info("Multi-tile feature statistics:")
+        logger.info(f"  Features spanning multiple tiles: {len(feature_tile_counts):,}")
+        logger.info(f"  Average tiles per multi-tile feature: {avg_tiles:.1f}")
+        logger.info(f"  Maximum tiles for single feature: {max_tiles:,}")
+        logger.info(f"  Features covering >100 tiles: {features_over_100:,}")
+        logger.info(f"  Features covering >1000 tiles: {features_over_1000:,}")
+
     logger.info("=" * 50)
 
     return total_tiles

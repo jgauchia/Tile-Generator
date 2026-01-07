@@ -127,6 +127,8 @@ class FGBViewer:
         self.fill_polygons = True
         self.show_tile_grid = False
         self.last_query_stats = {}
+        self.cached_features = None  # Store features for click identification
+        self.selected_feature = None  # Currently selected feature info
 
     def _index_tiles(self):
         """Index available zoom levels from tile structure."""
@@ -246,11 +248,15 @@ class FGBViewer:
 
         features = self.query_features()
         if features is None or len(features) == 0:
+            self.cached_features = None
             return
 
         # Sort by priority if available
         if 'priority' in features.columns:
             features = features.sort_values('priority')
+
+        # Cache for click identification
+        self.cached_features = features
 
         for idx, row in features.iterrows():
             self._render_feature(surface, row)
@@ -372,6 +378,66 @@ class FGBViewer:
                 color = (0, 100, 0) if exists else (150, 50, 50)
                 label = font.render(f"{tile_x}/{tile_y}", True, color)
                 surface.blit(label, (screen_x, screen_y))
+
+    def identify_feature_at(self, pixel_x: int, pixel_y: int) -> Optional[dict]:
+        """Identify feature at given pixel coordinates.
+
+        Returns dict with feature info or None if no feature found.
+        """
+        if self.cached_features is None or self.bbox is None:
+            return None
+
+        # Convert pixel to lat/lon
+        min_lon, min_lat, max_lon, max_lat = self.bbox
+        lon = min_lon + (pixel_x / VIEWPORT_SIZE) * (max_lon - min_lon)
+        lat = max_lat - (pixel_y / VIEWPORT_SIZE) * (max_lat - min_lat)
+
+        click_point = Point(lon, lat)
+
+        # Search features in reverse priority order (top features first)
+        features_sorted = self.cached_features.sort_values('priority', ascending=False) if 'priority' in self.cached_features.columns else self.cached_features
+
+        for idx, row in features_sorted.iterrows():
+            geom = row.geometry
+            if geom is None or geom.is_empty:
+                continue
+
+            # Check if point is within/near the geometry
+            if geom.geom_type == 'Polygon' or geom.geom_type == 'MultiPolygon':
+                if geom.contains(click_point):
+                    return self._feature_to_dict(row)
+            elif geom.geom_type == 'LineString' or geom.geom_type == 'MultiLineString':
+                # For lines, use a small buffer (tolerance in degrees ~5 pixels)
+                tolerance = (max_lon - min_lon) / VIEWPORT_SIZE * 5
+                if geom.buffer(tolerance).contains(click_point):
+                    return self._feature_to_dict(row)
+            elif geom.geom_type == 'Point':
+                tolerance = (max_lon - min_lon) / VIEWPORT_SIZE * 10
+                if click_point.distance(geom) < tolerance:
+                    return self._feature_to_dict(row)
+
+        return None
+
+    def _feature_to_dict(self, row) -> dict:
+        """Convert feature row to dict with relevant info."""
+        info = {}
+        if 'feature_type' in row.index:
+            info['type'] = row['feature_type']
+        if 'layer' in row.index:
+            info['layer'] = row['layer']
+        if 'color_rgb332' in row.index and row['color_rgb332']:
+            r, g, b = rgb332_to_rgb888(int(row['color_rgb332']))
+            info['color'] = f"#{r:02x}{g:02x}{b:02x}"
+        else:
+            info['color'] = 'N/A'
+        if 'priority' in row.index:
+            info['priority'] = int(row['priority'])
+        if 'min_zoom' in row.index:
+            info['min_zoom'] = int(row['min_zoom'])
+        if 'osm_id' in row.index:
+            info['osm_id'] = int(row['osm_id'])
+        info['geom_type'] = row.geometry.geom_type if row.geometry else 'N/A'
+        return info
 
 
 def draw_button(surface, text, rect, bg_color, fg_color, border_color, font, pressed=False):
@@ -509,9 +575,16 @@ Controls:
                         viewer.show_tile_grid = not viewer.show_tile_grid
                         need_redraw = True
                     elif mx < VIEWPORT_SIZE and my < VIEWPORT_SIZE:
+                        # Left click = drag
                         dragging = True
                         drag_start = (mx, my)
                         drag_center_start = (viewer.center_lat, viewer.center_lon)
+
+                elif event.button == 3:  # Right click = identify feature
+                    if mx < VIEWPORT_SIZE and my < VIEWPORT_SIZE:
+                        feature_info = viewer.identify_feature_at(mx, my)
+                        viewer.selected_feature = feature_info
+                        need_redraw = True
 
                 elif event.button == 4:
                     if viewer.zoom < 19:
@@ -581,6 +654,20 @@ Controls:
                 screen.blit(font_small.render(f"  Tiles: {s.get('tiles_loaded', 0)}/{s.get('tiles_loaded', 0) + s.get('tiles_missing', 0)}", True, (150, 150, 150)), (VIEWPORT_SIZE + 10, stats_y + 18))
                 screen.blit(font_small.render(f"  Features: {s.get('features', 0)}", True, (150, 150, 150)), (VIEWPORT_SIZE + 10, stats_y + 32))
                 screen.blit(font_small.render(f"  Time: {s.get('time_ms', 0):.0f}ms", True, (150, 150, 150)), (VIEWPORT_SIZE + 10, stats_y + 46))
+
+            # Selected feature info
+            feature_y = stats_y + 80
+            screen.blit(font_small.render("Click Feature:", True, info_color), (VIEWPORT_SIZE + 10, feature_y))
+            if viewer.selected_feature:
+                f = viewer.selected_feature
+                line_y = feature_y + 18
+                highlight_color = (100, 200, 100)
+                for key, value in f.items():
+                    text = f"  {key}: {value}"
+                    screen.blit(font_small.render(text, True, highlight_color), (VIEWPORT_SIZE + 10, line_y))
+                    line_y += 14
+            else:
+                screen.blit(font_small.render("  (click on map)", True, (100, 100, 100)), (VIEWPORT_SIZE + 10, feature_y + 18))
 
             # Status bar
             pygame.draw.rect(screen, (30, 30, 30), (0, VIEWPORT_SIZE, WINDOW_WIDTH, STATUSBAR_HEIGHT))
