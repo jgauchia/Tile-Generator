@@ -91,11 +91,11 @@ def latlon_to_pixel(lat: float, lon: float, bbox: Tuple[float, float, float, flo
     return px, py
 
 
-def rgb332_to_rgb888(c: int) -> Tuple[int, int, int]:
-    """Convert RGB332 to RGB888."""
-    r = (c & 0xE0)
-    g = (c & 0x1C) << 3
-    b = (c & 0x03) << 6
+def rgb565_to_rgb888(c: int) -> Tuple[int, int, int]:
+    """Convert RGB565 to RGB888."""
+    r = ((c >> 11) & 0x1F) << 3
+    g = ((c >> 5) & 0x3F) << 2
+    b = (c & 0x1F) << 3
     return (r, g, b)
 
 
@@ -270,8 +270,8 @@ class FGBViewer:
         if geom is None or geom.is_empty:
             return
 
-        if 'color_rgb332' in feature.index and feature['color_rgb332']:
-            color = rgb332_to_rgb888(int(feature['color_rgb332']))
+        if 'color_rgb565' in feature.index and feature['color_rgb565']:
+            color = rgb565_to_rgb888(int(feature['color_rgb565']))
         else:
             color = (200, 200, 200)
 
@@ -425,8 +425,8 @@ class FGBViewer:
             info['type'] = row['feature_type']
         if 'layer' in row.index:
             info['layer'] = row['layer']
-        if 'color_rgb332' in row.index and row['color_rgb332']:
-            r, g, b = rgb332_to_rgb888(int(row['color_rgb332']))
+        if 'color_rgb565' in row.index and row['color_rgb565']:
+            r, g, b = rgb565_to_rgb888(int(row['color_rgb565']))
             info['color'] = f"#{r:02x}{g:02x}{b:02x}"
         else:
             info['color'] = 'N/A'

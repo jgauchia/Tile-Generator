@@ -179,7 +179,7 @@ The `features.json` file defines which OSM features to include:
 | Field | Description |
 |-------|-------------|
 | `zoom` | Minimum zoom level for feature visibility |
-| `color` | Hex color (converted to RGB332 internally) |
+| `color` | Hex color (converted to RGB565 internally) |
 | `priority` | Render order (lower = background, higher = foreground) |
 
 ## FlatGeobuf Properties
@@ -188,7 +188,7 @@ Each feature in the FGB tiles contains:
 
 | Property | Type | Description |
 |----------|------|-------------|
-| `color_rgb332` | int | 8-bit color (RGB332 format) |
+| `color_rgb565` | int | 16-bit color (RGB565 format) |
 | `min_zoom` | int | Minimum zoom level |
 | `priority` | int | Rendering priority |
 | `feature_type` | string | OSM tag (e.g., `highway=primary`) |
@@ -204,7 +204,7 @@ The generated FGB tiles are optimized for ESP32:
 3. **Load 3x3 grid**: Load 9 tiles around center position
 4. **Read features**: Each tile is small, read sequentially without random seeks
 5. **Sort by priority**: Lower priority = rendered first (background)
-6. **Render features**: Use `priority` for layer ordering, `color_rgb332` for colors
+6. **Render features**: Use `priority` for layer ordering, `color_rgb565` for colors
 
 ### Tile Coordinate Calculation
 

@@ -228,17 +228,18 @@ def get_priority_for_tags(tags: Dict[str, str], config: Dict) -> int:
     return 50
 
 
-def hex_to_rgb332(hex_color: str) -> int:
-    """Convert hex color to RGB332 format."""
+def hex_to_rgb565(hex_color: str) -> int:
+    """Convert hex color to RGB565 format (16-bit: RRRRRGGGGGGBBBBB)."""
     try:
         if not hex_color or not hex_color.startswith("#"):
-            return 0xFF
+            return 0xFFFF
         r = int(hex_color[1:3], 16)
         g = int(hex_color[3:5], 16)
         b = int(hex_color[5:7], 16)
-        return ((r & 0xE0) | ((g & 0xE0) >> 3) | (b >> 6))
+        # RGB565: 5 bits R, 6 bits G, 5 bits B
+        return ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3)
     except:
-        return 0xFF
+        return 0xFFFF
 
 
 def get_simplify_tolerance(zoom: int) -> float:
@@ -366,8 +367,8 @@ class OSMHandler(osmium.SimpleHandler):
             'building' in tags or
             'landuse' in tags or
             ('natural' in tags and tags.get('natural') in ['water', 'wood', 'forest', 'beach', 'sand', 'wetland', 'grassland', 'scrub', 'heath']) or
-            ('leisure' in tags and tags.get('leisure') in ['park', 'garden', 'pitch', 'golf_course', 'nature_reserve', 'playground', 'sports_centre', 'stadium']) or
-            ('amenity' in tags and tags.get('amenity') in ['parking', 'school', 'university', 'hospital']) or
+            ('leisure' in tags and tags.get('leisure') in ['park', 'garden', 'pitch', 'golf_course', 'nature_reserve', 'playground', 'sports_centre', 'stadium', 'common']) or
+            ('amenity' in tags and tags.get('amenity') in ['parking', 'school', 'university', 'hospital', 'marketplace']) or
             ('waterway' in tags and tags.get('waterway') in ['riverbank', 'dock', 'boatyard']) or
             tags.get('area') == 'yes'
         )
@@ -375,10 +376,11 @@ class OSMHandler(osmium.SimpleHandler):
         # Process closed areas as Polygon (parks, buildings, etc.)
         # Note: area() only handles multipolygon relations in pyosmium 3.6,
         # so we must process closed ways here
-        if is_closed and is_area_tags:
+        # Skip highways - always process as lines to avoid covering other features
+        if is_closed and is_area_tags and 'highway' not in tags:
             color = get_color_for_tags(tags, self.config)
             priority = get_priority_for_tags(tags, self.config)
-            color_rgb332 = hex_to_rgb332(color)
+            color_rgb565 = hex_to_rgb565(color)
 
             layer_base_priority = LAYER_PRIORITY.get(layer, 50)
             combined_priority = layer_base_priority + (priority % 10)
@@ -389,7 +391,7 @@ class OSMHandler(osmium.SimpleHandler):
                 'properties': {
                     'osm_id': w.id,
                     'min_zoom': min_zoom,
-                    'color_rgb332': color_rgb332,
+                    'color_rgb565': color_rgb565,
                     'priority': combined_priority,
                     'layer': layer,
                     'feature_type': self._get_primary_tag(tags)
@@ -405,7 +407,7 @@ class OSMHandler(osmium.SimpleHandler):
         # Process as LineString (roads, rivers, etc.)
         color = get_color_for_tags(tags, self.config)
         priority = get_priority_for_tags(tags, self.config)
-        color_rgb332 = hex_to_rgb332(color)
+        color_rgb565 = hex_to_rgb565(color)
 
         layer_base_priority = LAYER_PRIORITY.get(layer, 50)
         combined_priority = layer_base_priority + (priority % 10)
@@ -416,7 +418,7 @@ class OSMHandler(osmium.SimpleHandler):
             'properties': {
                 'osm_id': w.id,
                 'min_zoom': min_zoom,
-                'color_rgb332': color_rgb332,
+                'color_rgb565': color_rgb565,
                 'priority': combined_priority,
                 'layer': layer,
                 'feature_type': self._get_primary_tag(tags)
@@ -461,6 +463,11 @@ class OSMHandler(osmium.SimpleHandler):
             self.stats['features_filtered'] += 1
             return
 
+        # Skip highways - they should be lines, not polygons that cover other features
+        if 'highway' in tags:
+            self.stats['features_filtered'] += 1
+            return
+
         min_zoom = get_zoom_for_tags(tags, self.config)
         if min_zoom > self.max_zoom:
             self.stats['features_filtered'] += 1
@@ -477,7 +484,7 @@ class OSMHandler(osmium.SimpleHandler):
 
             color = get_color_for_tags(tags, self.config)
             priority = get_priority_for_tags(tags, self.config)
-            color_rgb332 = hex_to_rgb332(color)
+            color_rgb565 = hex_to_rgb565(color)
 
             layer_base_priority = LAYER_PRIORITY.get(layer, 50)
             combined_priority = layer_base_priority + (priority % 10)
@@ -503,7 +510,7 @@ class OSMHandler(osmium.SimpleHandler):
                     'properties': {
                         'osm_id': a.orig_id(),
                         'min_zoom': min_zoom,
-                        'color_rgb332': color_rgb332,
+                        'color_rgb565': color_rgb565,
                         'priority': combined_priority,
                         'layer': layer,
                         'feature_type': self._get_primary_tag(tags)
@@ -818,7 +825,7 @@ Output structure (tile-based):
 Each tile FGB file contains features clipped to that tile with properties:
     - layer: Layer name for render ordering
     - priority: Render priority (lower = behind)
-    - color_rgb332: 8-bit color
+    - color_rgb565: 16-bit color (RGB565)
     - min_zoom: Minimum zoom for visibility
         """
     )
