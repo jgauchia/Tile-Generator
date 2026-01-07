@@ -191,7 +191,6 @@ Each feature in the FGB tiles contains:
 | `color_rgb565` | int | 16-bit color (RGB565 format) |
 | `min_zoom` | int | Minimum zoom level |
 | `priority` | int | Rendering priority |
-| `layer` | string | Layer name |
 
 ## ESP32 Implementation
 
