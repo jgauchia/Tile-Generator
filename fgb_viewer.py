@@ -421,8 +421,6 @@ class FGBViewer:
     def _feature_to_dict(self, row) -> dict:
         """Convert feature row to dict with relevant info."""
         info = {}
-        if 'feature_type' in row.index:
-            info['type'] = row['feature_type']
         if 'layer' in row.index:
             info['layer'] = row['layer']
         if 'color_rgb565' in row.index and row['color_rgb565']:

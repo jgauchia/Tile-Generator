@@ -392,8 +392,7 @@ class OSMHandler(osmium.SimpleHandler):
                     'min_zoom': min_zoom,
                     'color_rgb565': color_rgb565,
                     'priority': combined_priority,
-                    'layer': layer,
-                    'feature_type': self._get_primary_tag(tags)
+                    'layer': layer
                 }
             }
 
@@ -418,21 +417,12 @@ class OSMHandler(osmium.SimpleHandler):
                 'min_zoom': min_zoom,
                 'color_rgb565': color_rgb565,
                 'priority': combined_priority,
-                'layer': layer,
-                'feature_type': self._get_primary_tag(tags)
+                'layer': layer
             }
         }
 
         self.features.append(feature)
         self.stats['features_extracted'] += 1
-
-    def _get_primary_tag(self, tags: Dict[str, str]) -> str:
-        """Get the primary identifying tag for a feature."""
-        priority_keys = ['highway', 'railway', 'waterway', 'building', 'natural', 'landuse', 'leisure', 'amenity', 'aeroway']
-        for key in priority_keys:
-            if key in tags:
-                return f"{key}={tags[key]}"
-        return 'unknown'
 
     def relation(self, r):
         """Process relation - count only, areas handled by area() callback."""
@@ -509,8 +499,7 @@ class OSMHandler(osmium.SimpleHandler):
                         'min_zoom': min_zoom,
                         'color_rgb565': color_rgb565,
                         'priority': combined_priority,
-                        'layer': layer,
-                        'feature_type': self._get_primary_tag(tags)
+                        'layer': layer
                     }
                 }
 
@@ -657,7 +646,7 @@ def convert_pbf_to_fgb(input_pbf: str, output_dir: str, config_file: str,
     total_size = 0
 
     # Statistics tracking
-    feature_tile_counts = []  # (feature_type, geom_type, layer, num_tiles, zoom)
+    feature_tile_counts = []  # (geom_type, layer, num_tiles, zoom)
     tiles_by_layer = defaultdict(int)
     tiles_by_geom_type = defaultdict(int)
 
@@ -678,7 +667,6 @@ def convert_pbf_to_fgb(input_pbf: str, output_dir: str, config_file: str,
             num_tiles = len(tiles)
             if num_tiles > 1:  # Only track features in multiple tiles
                 feature_tile_counts.append((
-                    feature['properties']['feature_type'],
                     feature['geometry_type'],
                     feature['properties']['layer'],
                     num_tiles,
@@ -769,18 +757,18 @@ def convert_pbf_to_fgb(input_pbf: str, output_dir: str, config_file: str,
     # Top features by tile count
     if feature_tile_counts:
         # Sort by num_tiles descending
-        sorted_features = sorted(feature_tile_counts, key=lambda x: -x[3])
+        sorted_features = sorted(feature_tile_counts, key=lambda x: -x[2])
 
         # Top 20 features
         logger.info("")
         logger.info("Top 20 features by tile coverage:")
-        logger.info(f"  {'Type':<25} {'Geom':<10} {'Layer':<12} {'Tiles':>8} {'Zoom':>5}")
-        logger.info(f"  {'-'*25} {'-'*10} {'-'*12} {'-'*8} {'-'*5}")
-        for feat_type, geom_type, layer, num_tiles, zoom in sorted_features[:20]:
-            logger.info(f"  {feat_type:<25} {geom_type:<10} {layer:<12} {num_tiles:>8,} {zoom:>5}")
+        logger.info(f"  {'Geom':<10} {'Layer':<12} {'Tiles':>8} {'Zoom':>5}")
+        logger.info(f"  {'-'*10} {'-'*12} {'-'*8} {'-'*5}")
+        for geom_type, layer, num_tiles, zoom in sorted_features[:20]:
+            logger.info(f"  {geom_type:<10} {layer:<12} {num_tiles:>8,} {zoom:>5}")
 
         # Summary stats
-        all_tile_counts = [x[3] for x in feature_tile_counts]
+        all_tile_counts = [x[2] for x in feature_tile_counts]
         avg_tiles = sum(all_tile_counts) / len(all_tile_counts) if all_tile_counts else 0
         max_tiles = max(all_tile_counts) if all_tile_counts else 0
         features_over_100 = sum(1 for x in all_tile_counts if x > 100)
