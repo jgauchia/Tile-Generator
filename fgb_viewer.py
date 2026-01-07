@@ -434,8 +434,6 @@ class FGBViewer:
             info['priority'] = int(row['priority'])
         if 'min_zoom' in row.index:
             info['min_zoom'] = int(row['min_zoom'])
-        if 'osm_id' in row.index:
-            info['osm_id'] = int(row['osm_id'])
         info['geom_type'] = row.geometry.geom_type if row.geometry else 'N/A'
         return info
 
