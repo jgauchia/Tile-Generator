@@ -226,9 +226,9 @@ class FGBViewer:
         result = pd.concat(all_gdfs, ignore_index=True)
         result = gpd.GeoDataFrame(result, crs="EPSG:4326")
 
-        # Filter by min_zoom if available
-        if 'min_zoom' in result.columns:
-            result = result[result['min_zoom'] <= self.zoom]
+        # Filter by min_zoom (unpacked from zoom_priority high nibble)
+        if 'zoom_priority' in result.columns:
+            result = result[(result['zoom_priority'].astype(int) // 16) <= self.zoom]
 
         self.last_query_stats = {
             'tiles_loaded': tiles_loaded,
@@ -251,9 +251,9 @@ class FGBViewer:
             self.cached_features = None
             return
 
-        # Sort by priority if available
-        if 'priority' in features.columns:
-            features = features.sort_values('priority')
+        # Sort by priority (unpacked from zoom_priority low nibble)
+        if 'zoom_priority' in features.columns:
+            features = features.iloc[(features['zoom_priority'].astype(int) % 16).argsort()]
 
         # Cache for click identification
         self.cached_features = features
@@ -426,10 +426,10 @@ class FGBViewer:
             info['color'] = f"#{r:02x}{g:02x}{b:02x}"
         else:
             info['color'] = 'N/A'
-        if 'priority' in row.index:
-            info['priority'] = int(row['priority'])
-        if 'min_zoom' in row.index:
-            info['min_zoom'] = int(row['min_zoom'])
+        if 'zoom_priority' in row.index:
+            zp = int(row['zoom_priority'])
+            info['min_zoom'] = zp >> 4
+            info['priority'] = (zp & 0x0F) * 7
         info['geom_type'] = row.geometry.geom_type if row.geometry else 'N/A'
         return info
 

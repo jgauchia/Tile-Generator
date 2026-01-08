@@ -189,8 +189,11 @@ Each feature in the FGB tiles contains:
 | Property | Type | Description |
 |----------|------|-------------|
 | `color_rgb565` | int | 16-bit color (RGB565 format) |
-| `min_zoom` | int | Minimum zoom level |
-| `priority` | int | Rendering priority |
+| `zoom_priority` | int | Packed byte: high nibble = min_zoom (0-15), low nibble = priority/7 (0-15) |
+
+To unpack `zoom_priority`:
+- `min_zoom = zoom_priority >> 4`
+- `priority = (zoom_priority & 0x0F) * 7`
 
 ## ESP32 Implementation
 

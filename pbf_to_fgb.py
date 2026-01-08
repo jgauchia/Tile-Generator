@@ -242,6 +242,17 @@ def hex_to_rgb565(hex_color: str) -> int:
         return 0xFFFF
 
 
+def pack_zoom_priority(min_zoom: int, priority: int) -> int:
+    """Pack min_zoom and priority into a single byte.
+
+    High nibble: min_zoom (0-15)
+    Low nibble: priority / 7 (0-15)
+    """
+    zoom_nibble = min(min_zoom, 15) & 0x0F
+    priority_nibble = min(priority // 7, 15) & 0x0F
+    return (zoom_nibble << 4) | priority_nibble
+
+
 def get_simplify_tolerance(zoom: int) -> float:
     """
     Calculate simplification tolerance based on zoom level.
@@ -389,9 +400,8 @@ class OSMHandler(osmium.SimpleHandler):
                 'geometry_type': 'Polygon',
                 'coordinates': coords,
                 'properties': {
-                    'min_zoom': min_zoom,
                     'color_rgb565': color_rgb565,
-                    'priority': combined_priority
+                    'zoom_priority': pack_zoom_priority(min_zoom, combined_priority)
                 }
             }
 
@@ -413,9 +423,8 @@ class OSMHandler(osmium.SimpleHandler):
             'geometry_type': 'LineString',
             'coordinates': coords,
             'properties': {
-                'min_zoom': min_zoom,
                 'color_rgb565': color_rgb565,
-                'priority': combined_priority
+                'zoom_priority': pack_zoom_priority(min_zoom, combined_priority)
             }
         }
 
@@ -494,9 +503,8 @@ class OSMHandler(osmium.SimpleHandler):
                     'geometry_type': 'Polygon',
                     'coordinates': coords,
                     'properties': {
-                        'min_zoom': min_zoom,
                         'color_rgb565': color_rgb565,
-                        'priority': combined_priority
+                        'zoom_priority': pack_zoom_priority(min_zoom, combined_priority)
                     }
                 }
 
@@ -652,7 +660,9 @@ def convert_pbf_to_fgb(input_pbf: str, output_dir: str, config_file: str,
 
         for feature in handler.features:
             # Only include features visible at this zoom
-            if feature['properties']['min_zoom'] > zoom:
+            # Unpack min_zoom from zoom_priority (high nibble)
+            min_zoom = feature['properties']['zoom_priority'] >> 4
+            if min_zoom > zoom:
                 continue
 
             # Get all tiles this feature touches
