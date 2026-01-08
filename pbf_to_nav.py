@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
 """
-PBF to FlatGeobuf Converter - Tile Structure
+PBF to NAV Tile Converter
 
-Converts OpenStreetMap .pbf files to FlatGeobuf (.fgb) format with tile structure.
-Generates individual FGB files per tile (z/x/y structure like PNG tiles).
+Converts OpenStreetMap .pbf files to NAV binary format (.nav) with tile structure.
+NAV format uses int32 coordinates (scaled by 1e7) for ~50% size reduction vs FlatGeobuf.
 
 Usage:
-    python pbf_to_fgb.py input.pbf output_dir features.json [--zoom 6-17]
+    python pbf_to_nav.py input.pbf output_dir features.json [--zoom 6-17]
 
 Output structure:
     output_dir/
     ├── 13/
     │   ├── 4123/
-    │   │   ├── 2456.fgb
+    │   │   ├── 2456.nav
     │   │   └── ...
     │   └── ...
     └── 14/
@@ -25,7 +25,8 @@ import json
 import argparse
 import logging
 import math
-from typing import Dict, List, Optional, Tuple, Set
+import struct
+from typing import Dict, List, Tuple, Set
 from collections import defaultdict
 import time
 
@@ -38,16 +39,38 @@ except ImportError:
     sys.exit(1)
 
 try:
-    import geopandas as gpd
-    from shapely.geometry import LineString, Polygon, MultiPolygon, Point, box
-    from shapely.ops import transform
+    from shapely.geometry import Polygon
     import shapely.wkb
-    GEOPANDAS_AVAILABLE = True
+    SHAPELY_AVAILABLE = True
 except ImportError:
-    GEOPANDAS_AVAILABLE = False
+    SHAPELY_AVAILABLE = False
+    print("Warning: shapely not found. Multipolygon support disabled.")
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+# NAV format constants
+NAV_MAGIC = b'NAV1'
+NAV_VERSION = 1
+COORD_SCALE = 10000000  # 1e7 for ~1cm precision
+
+# Geometry types
+GEOM_POINT = 1
+GEOM_LINESTRING = 2
+GEOM_POLYGON = 3
+
+# Layer rendering priority (lower = rendered first = behind)
+LAYER_PRIORITY = {
+    'water': 10,
+    'landuse': 20,
+    'terrain': 30,
+    'railways': 40,
+    'roads': 50,
+    'infrastructure': 60,
+    'buildings': 70,
+    'amenities': 80,
+    'places': 90
+}
 
 # Layer definitions based on feature types
 LAYER_MAPPING = {
@@ -111,19 +134,6 @@ LAYER_MAPPING = {
     ]
 }
 
-# Layer rendering priority (lower = rendered first = behind)
-LAYER_PRIORITY = {
-    'water': 10,
-    'landuse': 20,
-    'terrain': 30,
-    'railways': 40,
-    'roads': 50,
-    'infrastructure': 60,
-    'buildings': 70,
-    'amenities': 80,
-    'places': 90
-}
-
 
 def lon_to_tile_x(lon: float, zoom: int) -> int:
     """Convert longitude to tile X coordinate."""
@@ -149,15 +159,10 @@ def tile_bounds(x: int, y: int, zoom: int) -> Tuple[float, float, float, float]:
 
 
 def get_feature_tiles(coords: List[Tuple[float, float]], zoom: int, is_polygon: bool = False) -> Set[Tuple[int, int]]:
-    """Get all tiles that a feature intersects at given zoom level.
-
-    For polygons, uses bbox to ensure all covered tiles are included,
-    not just tiles containing vertices.
-    """
+    """Get all tiles that a feature intersects at given zoom level."""
     tiles = set()
 
     if is_polygon and len(coords) >= 3:
-        # For polygons, get all tiles in the bounding box
         lons = [c[0] for c in coords]
         lats = [c[1] for c in coords]
         min_lon, max_lon = min(lons), max(lons)
@@ -165,14 +170,13 @@ def get_feature_tiles(coords: List[Tuple[float, float]], zoom: int, is_polygon: 
 
         min_x = lon_to_tile_x(min_lon, zoom)
         max_x = lon_to_tile_x(max_lon, zoom)
-        min_y = lat_to_tile_y(max_lat, zoom)  # Note: lat is inverted
+        min_y = lat_to_tile_y(max_lat, zoom)
         max_y = lat_to_tile_y(min_lat, zoom)
 
         for x in range(min_x, max_x + 1):
             for y in range(min_y, max_y + 1):
                 tiles.add((x, y))
     else:
-        # For lines, just use vertex positions
         for lon, lat in coords:
             x = lon_to_tile_x(lon, zoom)
             y = lat_to_tile_y(lat, zoom)
@@ -181,7 +185,7 @@ def get_feature_tiles(coords: List[Tuple[float, float]], zoom: int, is_polygon: 
     return tiles
 
 
-def get_layer_for_tags(tags: Dict[str, str]) -> Optional[str]:
+def get_layer_for_tags(tags: Dict[str, str]) -> str:
     """Determine which layer a feature belongs to based on its tags."""
     for layer_name, feature_keys in LAYER_MAPPING.items():
         for feature_key in feature_keys:
@@ -229,40 +233,32 @@ def get_priority_for_tags(tags: Dict[str, str], config: Dict) -> int:
 
 
 def hex_to_rgb565(hex_color: str) -> int:
-    """Convert hex color to RGB565 format (16-bit: RRRRRGGGGGGBBBBB)."""
+    """Convert hex color to RGB565 format."""
     try:
         if not hex_color or not hex_color.startswith("#"):
             return 0xFFFF
         r = int(hex_color[1:3], 16)
         g = int(hex_color[3:5], 16)
         b = int(hex_color[5:7], 16)
-        # RGB565: 5 bits R, 6 bits G, 5 bits B
         return ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3)
     except:
         return 0xFFFF
 
 
 def pack_zoom_priority(min_zoom: int, priority: int) -> int:
-    """Pack min_zoom and priority into a single byte.
-
-    High nibble: min_zoom (0-15)
-    Low nibble: priority / 7 (0-15)
-    """
+    """Pack min_zoom and priority into a single byte."""
     zoom_nibble = min(min_zoom, 15) & 0x0F
     priority_nibble = min(priority // 7, 15) & 0x0F
     return (zoom_nibble << 4) | priority_nibble
 
 
+def coord_to_int32(lon: float, lat: float) -> Tuple[int, int]:
+    """Convert float coordinates to int32 (scaled by 1e7)."""
+    return (int(lon * COORD_SCALE), int(lat * COORD_SCALE))
+
+
 def get_simplify_tolerance(zoom: int) -> float:
-    """
-    Calculate simplification tolerance based on zoom level.
-
-    At each zoom, a tile is 256 pixels wide and covers:
-        tile_width_degrees = 360 / (2^zoom)
-        pixel_size_degrees = tile_width_degrees / 256
-
-    We use 1 pixel as tolerance - points closer than this are redundant.
-    """
+    """Calculate simplification tolerance based on zoom level."""
     tile_width_degrees = 360.0 / (2.0 ** zoom)
     pixel_size_degrees = tile_width_degrees / 256.0
     return pixel_size_degrees
@@ -287,8 +283,8 @@ class OSMHandler(osmium.SimpleHandler):
         self.last_progress_time = time.time()
         self.progress_interval = 5
         self.interesting_tags = self._build_interesting_tags()
-        self.processed_way_ids: Set[int] = set()  # Track ways processed as areas
-        self.wkbfab = osmium.geom.WKBFactory()  # For extracting geometries from areas
+        self.processed_way_ids: Set[int] = set()
+        self.wkbfab = osmium.geom.WKBFactory()
 
     def _build_interesting_tags(self) -> Set[str]:
         """Build set of tag keys we're interested in."""
@@ -335,11 +331,7 @@ class OSMHandler(osmium.SimpleHandler):
         return False
 
     def way(self, w):
-        """Process way - extract roads and linear features only.
-
-        Closed ways (areas) are handled by the area() callback to properly
-        support multipolygon relations.
-        """
+        """Process way - extract roads and linear features."""
         self.stats['ways_processed'] += 1
         self._log_progress()
 
@@ -372,7 +364,6 @@ class OSMHandler(osmium.SimpleHandler):
             self.stats['features_filtered'] += 1
             return
 
-        # Check if this is a closed way that should be an area
         is_closed = len(coords) >= 4 and coords[0] == coords[-1]
         is_area_tags = (
             'building' in tags or
@@ -384,62 +375,39 @@ class OSMHandler(osmium.SimpleHandler):
             tags.get('area') == 'yes'
         )
 
-        # Process closed areas as Polygon (parks, buildings, etc.)
-        # Note: area() only handles multipolygon relations in pyosmium 3.6,
-        # so we must process closed ways here
-        # Skip highways - always process as lines to avoid covering other features
-        if is_closed and is_area_tags and 'highway' not in tags:
-            color = get_color_for_tags(tags, self.config)
-            priority = get_priority_for_tags(tags, self.config)
-            color_rgb565 = hex_to_rgb565(color)
-
-            layer_base_priority = LAYER_PRIORITY.get(layer, 50)
-            combined_priority = layer_base_priority + (priority % 10)
-
-            feature = {
-                'geometry_type': 'Polygon',
-                'coordinates': coords,
-                'properties': {
-                    'color_rgb565': color_rgb565,
-                    'zoom_priority': pack_zoom_priority(min_zoom, combined_priority)
-                }
-            }
-
-            self.features.append(feature)
-            self.stats['features_extracted'] += 1
-            # Track this way to avoid duplicate in area() if it's also a relation
-            self.processed_way_ids.add(w.id)
-            return
-
-        # Process as LineString (roads, rivers, etc.)
         color = get_color_for_tags(tags, self.config)
         priority = get_priority_for_tags(tags, self.config)
         color_rgb565 = hex_to_rgb565(color)
-
         layer_base_priority = LAYER_PRIORITY.get(layer, 50)
         combined_priority = layer_base_priority + (priority % 10)
 
-        feature = {
-            'geometry_type': 'LineString',
-            'coordinates': coords,
-            'properties': {
+        if is_closed and is_area_tags and 'highway' not in tags:
+            feature = {
+                'geom_type': GEOM_POLYGON,
+                'coords': coords,
                 'color_rgb565': color_rgb565,
                 'zoom_priority': pack_zoom_priority(min_zoom, combined_priority)
             }
-        }
+            self.features.append(feature)
+            self.stats['features_extracted'] += 1
+            self.processed_way_ids.add(w.id)
+            return
 
+        feature = {
+            'geom_type': GEOM_LINESTRING,
+            'coords': coords,
+            'color_rgb565': color_rgb565,
+            'zoom_priority': pack_zoom_priority(min_zoom, combined_priority)
+        }
         self.features.append(feature)
         self.stats['features_extracted'] += 1
 
     def relation(self, r):
-        """Process relation - count only, areas handled by area() callback."""
+        """Process relation."""
         self.stats['relations_processed'] += 1
 
     def area(self, a):
-        """Process area - handles both closed ways and multipolygon relations.
-
-        Uses WKBFactory to extract geometry, then converts to coordinate list.
-        """
+        """Process area - handles multipolygon relations."""
         self.stats['areas_processed'] += 1
         self._log_progress()
 
@@ -458,7 +426,6 @@ class OSMHandler(osmium.SimpleHandler):
             self.stats['features_filtered'] += 1
             return
 
-        # Skip highways - they should be lines, not polygons that cover other features
         if 'highway' in tags:
             self.stats['features_filtered'] += 1
             return
@@ -468,11 +435,9 @@ class OSMHandler(osmium.SimpleHandler):
             self.stats['features_filtered'] += 1
             return
 
-        # Skip if this way was already processed in way() callback
         if a.from_way() and a.orig_id() in self.processed_way_ids:
             return
 
-        # Extract geometry using WKBFactory
         try:
             wkb = self.wkbfab.create_multipolygon(a)
             geom = shapely.wkb.loads(wkb, hex=True)
@@ -480,11 +445,9 @@ class OSMHandler(osmium.SimpleHandler):
             color = get_color_for_tags(tags, self.config)
             priority = get_priority_for_tags(tags, self.config)
             color_rgb565 = hex_to_rgb565(color)
-
             layer_base_priority = LAYER_PRIORITY.get(layer, 50)
             combined_priority = layer_base_priority + (priority % 10)
 
-            # Handle both Polygon and MultiPolygon
             polygons = []
             if geom.geom_type == 'Polygon':
                 polygons = [geom]
@@ -500,14 +463,11 @@ class OSMHandler(osmium.SimpleHandler):
                     continue
 
                 feature = {
-                    'geometry_type': 'Polygon',
-                    'coordinates': coords,
-                    'properties': {
-                        'color_rgb565': color_rgb565,
-                        'zoom_priority': pack_zoom_priority(min_zoom, combined_priority)
-                    }
+                    'geom_type': GEOM_POLYGON,
+                    'coords': coords,
+                    'color_rgb565': color_rgb565,
+                    'zoom_priority': pack_zoom_priority(min_zoom, combined_priority)
                 }
-
                 self.features.append(feature)
                 self.stats['features_extracted'] += 1
 
@@ -515,107 +475,94 @@ class OSMHandler(osmium.SimpleHandler):
             self.stats['features_filtered'] += 1
 
 
-def count_coords(geom) -> int:
-    """Count total coordinates in a geometry."""
-    if hasattr(geom, 'exterior'):  # Polygon
-        return len(geom.exterior.coords) + sum(len(ring.coords) for ring in geom.interiors)
-    elif hasattr(geom, 'coords'):  # LineString/Point
-        return len(geom.coords)
-    return 0
+def simplify_coords(coords: List[Tuple[float, float]], tolerance: float) -> List[Tuple[float, float]]:
+    """Simple Douglas-Peucker-like simplification."""
+    if len(coords) <= 2:
+        return coords
+
+    # Use shapely for simplification if available
+    if SHAPELY_AVAILABLE:
+        from shapely.geometry import LineString
+        line = LineString(coords)
+        simplified = line.simplify(tolerance, preserve_topology=True)
+        return list(simplified.coords)
+
+    return coords
 
 
-# Global simplification statistics
-simplify_stats = {'nodes_before': 0, 'nodes_after': 0}
-
-
-def write_tile_fgb(features: List[Dict], output_path: str, zoom: int):
-    """Write features to a single tile FlatGeobuf file.
-
-    Features are NOT clipped to tile boundaries to avoid visible seams.
-    Each feature is stored complete in every tile it touches.
-    The renderer clips to viewport naturally.
-
-    Geometries are simplified based on zoom level - points representing
-    less than 1 pixel are removed to reduce file size.
-    """
-    global simplify_stats
-
-    if not GEOPANDAS_AVAILABLE:
-        logger.error("GeoPandas not available")
-        return False
-
+def write_nav_tile(features: List[Dict], output_path: str, zoom: int) -> bool:
+    """Write features to NAV binary tile format."""
     if not features:
         return False
 
-    # Calculate simplification tolerance (1 pixel in degrees)
     tolerance = get_simplify_tolerance(zoom)
 
-    geometries = []
-    properties_list = []
+    # Calculate bounding box
+    all_lons = []
+    all_lats = []
+    for f in features:
+        for lon, lat in f['coords']:
+            all_lons.append(lon)
+            all_lats.append(lat)
 
-    for feature in features:
-        coords = feature['coordinates']
-        geom_type = feature['geometry_type']
-        props = feature['properties']
-
-        try:
-            if geom_type == 'LineString':
-                if len(coords) >= 2:
-                    geom = LineString(coords)
-                    nodes_before = len(geom.coords)
-                    # Simplify: remove points closer than 1 pixel
-                    geom = geom.simplify(tolerance, preserve_topology=True)
-                    # After simplification, ensure still valid LineString (min 2 points)
-                    if not geom.is_empty and len(geom.coords) >= 2:
-                        simplify_stats['nodes_before'] += nodes_before
-                        simplify_stats['nodes_after'] += len(geom.coords)
-                        geometries.append(geom)
-                        properties_list.append(props)
-            elif geom_type == 'Polygon':
-                if len(coords) >= 4:
-                    geom = Polygon(coords)
-                    if not geom.is_valid:
-                        geom = geom.buffer(0)
-                    nodes_before = count_coords(geom)
-                    # Simplify: remove points closer than 1 pixel
-                    geom = geom.simplify(tolerance, preserve_topology=True)
-                    if geom.is_valid and not geom.is_empty:
-                        simplify_stats['nodes_before'] += nodes_before
-                        simplify_stats['nodes_after'] += count_coords(geom)
-                        geometries.append(geom)
-                        properties_list.append(props)
-        except Exception as e:
-            continue
-
-    if not geometries:
+    if not all_lons:
         return False
+
+    min_lon = min(all_lons)
+    min_lat = min(all_lats)
+    max_lon = max(all_lons)
+    max_lat = max(all_lats)
 
     # Create output directory
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
-    gdf = gpd.GeoDataFrame(properties_list, geometry=geometries, crs="EPSG:4326")
+    with open(output_path, 'wb') as f:
+        # Write header (20 bytes)
+        f.write(NAV_MAGIC)  # 4 bytes
+        f.write(struct.pack('<B', NAV_VERSION))  # 1 byte
+        f.write(struct.pack('<H', len(features)))  # 2 bytes
+        f.write(struct.pack('<B', 0))  # 1 byte reserved
+        f.write(struct.pack('<i', int(min_lon * COORD_SCALE)))  # 4 bytes
+        f.write(struct.pack('<i', int(min_lat * COORD_SCALE)))  # 4 bytes
+        f.write(struct.pack('<i', int(max_lon * COORD_SCALE)))  # 4 bytes
+        f.write(struct.pack('<i', int(max_lat * COORD_SCALE)))  # 4 bytes
 
-    try:
-        import warnings
-        # Silence pyogrio "Created X records" messages
-        pyogrio_logger = logging.getLogger('pyogrio')
-        old_level = pyogrio_logger.level
-        pyogrio_logger.setLevel(logging.WARNING)
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            gdf.to_file(output_path, driver="FlatGeobuf", spatial_index=True)
-        pyogrio_logger.setLevel(old_level)
-        return True
-    except Exception as e:
-        logger.error(f"Error writing {output_path}: {e}")
-        return False
+        # Write features
+        for feature in features:
+            coords = feature['coords']
+
+            # Simplify coordinates
+            if len(coords) > 2:
+                coords = simplify_coords(coords, tolerance)
+
+            # Skip if too few coordinates after simplification
+            if feature['geom_type'] == GEOM_LINESTRING and len(coords) < 2:
+                continue
+            if feature['geom_type'] == GEOM_POLYGON and len(coords) < 4:
+                continue
+
+            # Write feature header
+            f.write(struct.pack('<B', feature['geom_type']))  # 1 byte
+            f.write(struct.pack('<H', feature['color_rgb565']))  # 2 bytes
+            f.write(struct.pack('<B', feature['zoom_priority']))  # 1 byte
+            f.write(struct.pack('<H', len(coords)))  # 2 bytes
+
+            # Write coordinates as int32
+            for lon, lat in coords:
+                f.write(struct.pack('<i', int(lon * COORD_SCALE)))
+                f.write(struct.pack('<i', int(lat * COORD_SCALE)))
+
+            # For polygons, write ring info (single ring for now)
+            if feature['geom_type'] == GEOM_POLYGON:
+                f.write(struct.pack('<B', 1))  # 1 ring
+                f.write(struct.pack('<H', len(coords)))  # ring end
+
+    return True
 
 
-def convert_pbf_to_fgb(input_pbf: str, output_dir: str, config_file: str,
+def convert_pbf_to_nav(input_pbf: str, output_dir: str, config_file: str,
                         zoom_range: Tuple[int, int] = (6, 17)):
-    """Main conversion function - generates tile-based FGB files."""
-    global simplify_stats
-    simplify_stats = {'nodes_before': 0, 'nodes_after': 0}
+    """Main conversion function - generates NAV tile files."""
 
     logger.info(f"Loading configuration from {config_file}")
     with open(config_file, 'r') as f:
@@ -626,13 +573,12 @@ def convert_pbf_to_fgb(input_pbf: str, output_dir: str, config_file: str,
     file_size_mb = os.path.getsize(input_pbf) / (1024 * 1024)
     logger.info(f"Processing PBF file: {input_pbf} ({file_size_mb:.1f} MB)")
     logger.info(f"Zoom range: {zoom_range[0]}-{zoom_range[1]}")
+    logger.info(f"Output format: NAV binary tiles (.nav)")
 
     start_time = time.time()
 
     handler = OSMHandler(config, zoom_range)
-    logger.info("Processing OSM data with multipolygon support (2 passes)...")
-
-    # pyosmium 3.x automatically does two passes when area() callback exists
+    logger.info("Processing OSM data...")
     handler.apply_file(input_pbf, locations=True, idx='flex_mem')
     print()
 
@@ -644,40 +590,21 @@ def convert_pbf_to_fgb(input_pbf: str, output_dir: str, config_file: str,
     logger.info(f"  Features extracted: {handler.stats['features_extracted']:,}")
     logger.info(f"  Features filtered: {handler.stats['features_filtered']:,}")
 
-    # Group features by tile for each zoom level
-    logger.info("Generating tile-based FlatGeobuf files...")
+    logger.info("Generating NAV tile files...")
 
     total_tiles = 0
     total_size = 0
 
-    # Statistics tracking
-    feature_tile_counts = []  # (geom_type, num_tiles, zoom)
-    tiles_by_geom_type = defaultdict(int)
-
     for zoom in range(zoom_range[0], zoom_range[1] + 1):
-        # Group features by tile at this zoom level
         tile_features: Dict[Tuple[int, int], List[Dict]] = defaultdict(list)
 
         for feature in handler.features:
-            # Only include features visible at this zoom
-            # Unpack min_zoom from zoom_priority (high nibble)
-            min_zoom = feature['properties']['zoom_priority'] >> 4
+            min_zoom = feature['zoom_priority'] >> 4
             if min_zoom > zoom:
                 continue
 
-            # Get all tiles this feature touches
-            is_polygon = feature['geometry_type'] == 'Polygon'
-            tiles = get_feature_tiles(feature['coordinates'], zoom, is_polygon)
-
-            # Track statistics
-            num_tiles = len(tiles)
-            if num_tiles > 1:  # Only track features in multiple tiles
-                feature_tile_counts.append((
-                    feature['geometry_type'],
-                    num_tiles,
-                    zoom
-                ))
-            tiles_by_geom_type[feature['geometry_type']] += num_tiles
+            is_polygon = feature['geom_type'] == GEOM_POLYGON
+            tiles = get_feature_tiles(feature['coords'], zoom, is_polygon)
 
             for tile in tiles:
                 tile_features[tile].append(feature)
@@ -690,26 +617,22 @@ def convert_pbf_to_fgb(input_pbf: str, output_dir: str, config_file: str,
         tile_items = list(tile_features.items())
 
         for i, ((x, y), features) in enumerate(tile_items):
-            # Progress bar
             progress = (i + 1) / num_tiles
             bar_width = 30
             filled = int(bar_width * progress)
             bar = '█' * filled + '░' * (bar_width - filled)
             print(f"\r  Zoom {zoom:2d}: [{bar}] {i+1}/{num_tiles} tiles", end='', flush=True)
 
-            # Create directory structure: output_dir/zoom/x/y.fgb
             tile_dir = os.path.join(output_dir, str(zoom), str(x))
-            tile_path = os.path.join(tile_dir, f"{y}.fgb")
+            tile_path = os.path.join(tile_dir, f"{y}.nav")
 
-            if write_tile_fgb(features, tile_path, zoom):
+            if write_nav_tile(features, tile_path, zoom):
                 tiles_written += 1
                 total_size += os.path.getsize(tile_path)
 
-        # Clear line and show final count
         print(f"\r  Zoom {zoom:2d}: {tiles_written} tiles written" + " " * 30)
         total_tiles += tiles_written
 
-    # Summary
     total_time = time.time() - start_time
     hours, remainder = divmod(int(total_time), 3600)
     minutes, seconds = divmod(remainder, 60)
@@ -720,66 +643,15 @@ def convert_pbf_to_fgb(input_pbf: str, output_dir: str, config_file: str,
     else:
         time_str = f"{total_time:.2f}s"
 
-    # Simplification statistics
-    nodes_before = simplify_stats['nodes_before']
-    nodes_after = simplify_stats['nodes_after']
-    if nodes_before > 0:
-        reduction = (1 - nodes_after / nodes_before) * 100
-    else:
-        reduction = 0
-
     logger.info("=" * 50)
     logger.info("Conversion Summary")
     logger.info("=" * 50)
     logger.info(f"Input: {input_pbf}")
     logger.info(f"Output directory: {output_dir}")
+    logger.info(f"Format: NAV binary tiles (.nav)")
     logger.info(f"Total tiles: {total_tiles}")
     logger.info(f"Total size: {total_size / (1024 * 1024):.2f} MB")
-    logger.info(f"Nodes before simplification: {nodes_before:,}")
-    logger.info(f"Nodes after simplification: {nodes_after:,}")
-    logger.info(f"Node reduction: {reduction:.1f}%")
     logger.info(f"Total time: {time_str}")
-
-    # Feature-tile distribution statistics
-    logger.info("")
-    logger.info("=" * 50)
-    logger.info("Feature-Tile Distribution Statistics")
-    logger.info("=" * 50)
-
-    # Tiles by geometry type
-    logger.info("")
-    logger.info("Tile assignments by geometry type:")
-    for geom_type, count in sorted(tiles_by_geom_type.items(), key=lambda x: -x[1]):
-        logger.info(f"  {geom_type}: {count:,} tile assignments")
-
-    # Top features by tile count
-    if feature_tile_counts:
-        # Sort by num_tiles descending
-        sorted_features = sorted(feature_tile_counts, key=lambda x: -x[1])
-
-        # Top 20 features
-        logger.info("")
-        logger.info("Top 20 features by tile coverage:")
-        logger.info(f"  {'Geom':<10} {'Tiles':>8} {'Zoom':>5}")
-        logger.info(f"  {'-'*10} {'-'*8} {'-'*5}")
-        for geom_type, num_tiles, zoom in sorted_features[:20]:
-            logger.info(f"  {geom_type:<10} {num_tiles:>8,} {zoom:>5}")
-
-        # Summary stats
-        all_tile_counts = [x[1] for x in feature_tile_counts]
-        avg_tiles = sum(all_tile_counts) / len(all_tile_counts) if all_tile_counts else 0
-        max_tiles = max(all_tile_counts) if all_tile_counts else 0
-        features_over_100 = sum(1 for x in all_tile_counts if x > 100)
-        features_over_1000 = sum(1 for x in all_tile_counts if x > 1000)
-
-        logger.info("")
-        logger.info("Multi-tile feature statistics:")
-        logger.info(f"  Features spanning multiple tiles: {len(feature_tile_counts):,}")
-        logger.info(f"  Average tiles per multi-tile feature: {avg_tiles:.1f}")
-        logger.info(f"  Maximum tiles for single feature: {max_tiles:,}")
-        logger.info(f"  Features covering >100 tiles: {features_over_100:,}")
-        logger.info(f"  Features covering >1000 tiles: {features_over_1000:,}")
-
     logger.info("=" * 50)
 
     return total_tiles
@@ -787,33 +659,22 @@ def convert_pbf_to_fgb(input_pbf: str, output_dir: str, config_file: str,
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Convert OpenStreetMap PBF to tile-based FlatGeobuf format',
+        description='Convert OpenStreetMap PBF to NAV binary tile format',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
+NAV Format - IceNav Navigation Tiles:
+  - int32 coordinates (scaled by 1e7) for ~50% size reduction
+  - Simple binary format optimized for ESP32
+  - Same z/x/y tile structure as standard map tiles
+
 Examples:
-    python pbf_to_fgb.py andorra.pbf ./output features.json
-    python pbf_to_fgb.py spain.pbf ./output features.json --zoom 10-17
-
-Output structure (tile-based):
-    output_dir/
-    ├── 13/
-    │   ├── 4123/
-    │   │   ├── 2456.fgb
-    │   │   └── ...
-    │   └── ...
-    └── 14/
-        └── ...
-
-Each tile FGB file contains features clipped to that tile with properties:
-    - layer: Layer name for render ordering
-    - priority: Render priority (lower = behind)
-    - color_rgb565: 16-bit color (RGB565)
-    - min_zoom: Minimum zoom for visibility
+    python pbf_to_nav.py andorra.pbf ./output features.json
+    python pbf_to_nav.py spain.pbf ./output features.json --zoom 10-17
         """
     )
 
     parser.add_argument('input_pbf', help='Input PBF file path')
-    parser.add_argument('output_dir', help='Output directory for FGB tiles')
+    parser.add_argument('output_dir', help='Output directory for NAV tiles')
     parser.add_argument('config_file', help='Features configuration JSON file')
     parser.add_argument('--zoom', default='6-17',
                         help='Zoom level range (e.g., "6-17" or "12")')
@@ -828,16 +689,12 @@ Each tile FGB file contains features clipped to that tile with properties:
         logger.error(f"Config file not found: {args.config_file}")
         sys.exit(1)
 
-    if not GEOPANDAS_AVAILABLE:
-        logger.error("GeoPandas is required. Install with: pip install geopandas pyogrio")
-        sys.exit(1)
-
     if '-' in args.zoom:
         min_zoom, max_zoom = map(int, args.zoom.split('-'))
     else:
         min_zoom = max_zoom = int(args.zoom)
 
-    convert_pbf_to_fgb(args.input_pbf, args.output_dir, args.config_file, (min_zoom, max_zoom))
+    convert_pbf_to_nav(args.input_pbf, args.output_dir, args.config_file, (min_zoom, max_zoom))
 
 
 if __name__ == '__main__':

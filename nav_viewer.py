@@ -1,21 +1,20 @@
 #!/usr/bin/env python3
 """
-FlatGeobuf Viewer - ESP32 Map Simulator
+NAV Tile Viewer - ESP32 Map Simulator
 
-Simulates the ESP32 map rendering behavior using tile-based FlatGeobuf files.
-Displays a 768x768 viewport (3x3 tiles of 256px) centered on given coordinates.
+Displays NAV binary tiles in a 768x768 viewport (3x3 tiles of 256px).
 
 Usage:
-    python fgb_viewer.py fgb_dir --lat 42.5063 --lon 1.5218 [--zoom 14]
+    python nav_viewer.py nav_dir --lat 42.5063 --lon 1.5218 [--zoom 14]
 """
 
 import os
 import sys
 import math
+import struct
 import argparse
 import logging
 from typing import Dict, List, Tuple, Optional, Set
-import json
 
 try:
     import pygame
@@ -24,29 +23,29 @@ except ImportError:
     PYGAME_AVAILABLE = False
     print("Warning: pygame not found. Install with: pip install pygame")
 
-try:
-    import geopandas as gpd
-    import pandas as pd
-    from shapely.geometry import box, Point, LineString, Polygon
-    GEOPANDAS_AVAILABLE = True
-except ImportError:
-    GEOPANDAS_AVAILABLE = False
-    print("Warning: geopandas not found. Install with: pip install geopandas pyogrio")
-
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Constants matching ESP32 implementation
+# Constants
 TILE_SIZE = 256
-VIEWPORT_SIZE = 768  # 3x3 tiles
+VIEWPORT_SIZE = 768
 TOOLBAR_WIDTH = 200
 STATUSBAR_HEIGHT = 60
 WINDOW_WIDTH = VIEWPORT_SIZE + TOOLBAR_WIDTH
 WINDOW_HEIGHT = VIEWPORT_SIZE + STATUSBAR_HEIGHT
 
+# NAV format constants
+NAV_MAGIC = b'NAV1'
+COORD_SCALE = 10000000  # 1e7
+
+# Geometry types
+GEOM_POINT = 1
+GEOM_LINESTRING = 2
+GEOM_POLYGON = 3
+
 
 def deg2num(lat_deg: float, lon_deg: float, zoom: int) -> Tuple[float, float]:
-    """Convert lat/lon to tile numbers (floating point for sub-tile precision)."""
+    """Convert lat/lon to tile numbers."""
     lat_rad = math.radians(lat_deg)
     n = 2.0 ** zoom
     xtile = (lon_deg + 180.0) / 360.0 * n
@@ -64,17 +63,15 @@ def num2deg(xtile: float, ytile: float, zoom: int) -> Tuple[float, float]:
 
 
 def get_bbox_for_viewport(center_lat: float, center_lon: float, zoom: int) -> Tuple[float, float, float, float]:
-    """Calculate bounding box for 768x768 viewport based on 3x3 tile grid."""
-    # Get center tile
+    """Calculate bounding box for 3x3 tile viewport."""
     center_x, center_y = deg2num(center_lat, center_lon, zoom)
     center_tile_x = int(center_x)
     center_tile_y = int(center_y)
 
-    # Bbox covers exactly 3x3 tiles around center tile
     min_tile_x = center_tile_x - 1
-    max_tile_x = center_tile_x + 2  # +2 because we need the right edge of tile +1
+    max_tile_x = center_tile_x + 2
     min_tile_y = center_tile_y - 1
-    max_tile_y = center_tile_y + 2  # +2 because we need the bottom edge of tile +1
+    max_tile_y = center_tile_y + 2
 
     max_lat, min_lon = num2deg(min_tile_x, min_tile_y, zoom)
     min_lat, max_lon = num2deg(max_tile_x, max_tile_y, zoom)
@@ -82,7 +79,7 @@ def get_bbox_for_viewport(center_lat: float, center_lon: float, zoom: int) -> Tu
 
 
 def latlon_to_pixel(lat: float, lon: float, bbox: Tuple[float, float, float, float]) -> Tuple[int, int]:
-    """Convert lat/lon to pixel coordinates within viewport."""
+    """Convert lat/lon to pixel coordinates."""
     min_lon, min_lat, max_lon, max_lat = bbox
     x_norm = (lon - min_lon) / (max_lon - min_lon)
     y_norm = (max_lat - lat) / (max_lat - min_lat)
@@ -100,23 +97,82 @@ def rgb565_to_rgb888(c: int) -> Tuple[int, int, int]:
 
 
 def darken_color(rgb: Tuple[int, int, int], amount: float = 0.3) -> Tuple[int, int, int]:
-    """Darken RGB color by specified amount."""
+    """Darken RGB color."""
     return tuple(max(0, int(v * (1 - amount))) for v in rgb)
 
 
-class FGBViewer:
-    """FlatGeobuf map viewer simulating ESP32 behavior with tile-based files."""
+class NavFeature:
+    """Parsed NAV feature."""
+    def __init__(self):
+        self.geom_type = 0
+        self.color_rgb565 = 0xFFFF
+        self.zoom_priority = 0
+        self.coords = []  # List of (lon, lat) floats
 
-    def __init__(self, fgb_dir: str, config_file: str = None):
-        self.fgb_dir = fgb_dir
-        self.config = {}
+    @property
+    def min_zoom(self):
+        return self.zoom_priority >> 4
+
+    @property
+    def priority(self):
+        return (self.zoom_priority & 0x0F) * 7
+
+
+def read_nav_tile(path: str) -> List[NavFeature]:
+    """Read NAV tile file and return list of features."""
+    features = []
+
+    try:
+        with open(path, 'rb') as f:
+            # Read header (20 bytes)
+            magic = f.read(4)
+            if magic != NAV_MAGIC:
+                logger.warning(f"Invalid magic in {path}")
+                return features
+
+            version = struct.unpack('<B', f.read(1))[0]
+            feature_count = struct.unpack('<H', f.read(2))[0]
+            reserved = struct.unpack('<B', f.read(1))[0]
+            bbox = struct.unpack('<4i', f.read(16))
+
+            # Read features
+            for _ in range(feature_count):
+                feature = NavFeature()
+
+                # Feature header (6 bytes)
+                feature.geom_type = struct.unpack('<B', f.read(1))[0]
+                feature.color_rgb565 = struct.unpack('<H', f.read(2))[0]
+                feature.zoom_priority = struct.unpack('<B', f.read(1))[0]
+                coord_count = struct.unpack('<H', f.read(2))[0]
+
+                # Read coordinates
+                for _ in range(coord_count):
+                    lon_int = struct.unpack('<i', f.read(4))[0]
+                    lat_int = struct.unpack('<i', f.read(4))[0]
+                    lon = lon_int / COORD_SCALE
+                    lat = lat_int / COORD_SCALE
+                    feature.coords.append((lon, lat))
+
+                # For polygons, read ring info
+                if feature.geom_type == GEOM_POLYGON:
+                    ring_count = struct.unpack('<B', f.read(1))[0]
+                    for _ in range(ring_count):
+                        ring_end = struct.unpack('<H', f.read(2))[0]
+
+                features.append(feature)
+
+    except Exception as e:
+        logger.warning(f"Error reading {path}: {e}")
+
+    return features
+
+
+class NAVViewer:
+    """NAV tile viewer."""
+
+    def __init__(self, nav_dir: str):
+        self.nav_dir = nav_dir
         self.available_zooms: Set[int] = set()
-
-        if config_file and os.path.exists(config_file):
-            with open(config_file, 'r') as f:
-                self.config = json.load(f)
-            logger.info(f"Loaded config from {config_file}")
-
         self._index_tiles()
 
         self.center_lat = 0.0
@@ -127,21 +183,19 @@ class FGBViewer:
         self.fill_polygons = True
         self.show_tile_grid = False
         self.last_query_stats = {}
-        self.cached_features = None  # Store features for click identification
-        self.selected_feature = None  # Currently selected feature info
+        self.cached_features = None
+        self.selected_feature = None
 
     def _index_tiles(self):
-        """Index available zoom levels from tile structure."""
-        if not os.path.isdir(self.fgb_dir):
-            logger.error(f"Directory not found: {self.fgb_dir}")
+        """Index available zoom levels."""
+        if not os.path.isdir(self.nav_dir):
+            logger.error(f"Directory not found: {self.nav_dir}")
             return
 
-        # Scan for zoom level directories (numbers)
-        for name in os.listdir(self.fgb_dir):
-            zoom_path = os.path.join(self.fgb_dir, name)
+        for name in os.listdir(self.nav_dir):
+            zoom_path = os.path.join(self.nav_dir, name)
             if os.path.isdir(zoom_path) and name.isdigit():
                 zoom = int(name)
-                # Verify it has tile subdirectories
                 for x_name in os.listdir(zoom_path):
                     x_path = os.path.join(zoom_path, x_name)
                     if os.path.isdir(x_path) and x_name.isdigit():
@@ -151,22 +205,18 @@ class FGBViewer:
         if self.available_zooms:
             zooms_str = ", ".join(map(str, sorted(self.available_zooms)))
             logger.info(f"Available zoom levels: {zooms_str}")
-        else:
-            logger.warning("No tile directories found (expected z/x/y.fgb structure)")
 
     def _get_tiles_for_viewport(self) -> List[Tuple[int, int]]:
-        """Get list of tiles (x, y) that cover the current viewport."""
+        """Get list of tiles for current viewport."""
         center_x, center_y = deg2num(self.center_lat, self.center_lon, self.zoom)
         center_tile_x = int(center_x)
         center_tile_y = int(center_y)
 
         tiles = []
-        # 3x3 grid around center
         for dy in range(-1, 2):
             for dx in range(-1, 2):
                 tile_x = center_tile_x + dx
                 tile_y = center_tile_y + dy
-                # Validate tile coordinates
                 max_tile = 2 ** self.zoom - 1
                 if 0 <= tile_x <= max_tile and 0 <= tile_y <= max_tile:
                     tiles.append((tile_x, tile_y))
@@ -175,167 +225,110 @@ class FGBViewer:
 
     def _get_tile_path(self, x: int, y: int) -> str:
         """Get file path for a tile."""
-        return os.path.join(self.fgb_dir, str(self.zoom), str(x), f"{y}.fgb")
+        return os.path.join(self.nav_dir, str(self.zoom), str(x), f"{y}.nav")
 
     def set_center(self, lat: float, lon: float, zoom: int = None):
-        """Set viewport center and optionally zoom."""
+        """Set viewport center."""
         self.center_lat = lat
         self.center_lon = lon
         if zoom is not None:
             self.zoom = zoom
         self.bbox = get_bbox_for_viewport(self.center_lat, self.center_lon, self.zoom)
 
-    def query_features(self) -> Optional[gpd.GeoDataFrame]:
-        """Query features from tiles within current viewport."""
+    def query_features(self) -> List[NavFeature]:
+        """Query features from tiles."""
         if self.bbox is None:
-            return None
+            return []
 
         import time
         start = time.time()
 
         tiles = self._get_tiles_for_viewport()
-        all_gdfs = []
+        all_features = []
         tiles_loaded = 0
         tiles_missing = 0
 
         for tile_x, tile_y in tiles:
             tile_path = self._get_tile_path(tile_x, tile_y)
             if os.path.exists(tile_path):
-                try:
-                    gdf = gpd.read_file(tile_path)
-                    if len(gdf) > 0:
-                        all_gdfs.append(gdf)
-                    tiles_loaded += 1
-                except Exception as e:
-                    logger.warning(f"Error reading tile {tile_path}: {e}")
+                features = read_nav_tile(tile_path)
+                # Filter by zoom
+                features = [f for f in features if f.min_zoom <= self.zoom]
+                all_features.extend(features)
+                tiles_loaded += 1
             else:
                 tiles_missing += 1
 
         elapsed = (time.time() - start) * 1000
 
-        if not all_gdfs:
-            self.last_query_stats = {
-                'tiles_loaded': 0,
-                'tiles_missing': tiles_missing,
-                'features': 0,
-                'time_ms': elapsed
-            }
-            return None
-
-        # Combine all tile features
-        result = pd.concat(all_gdfs, ignore_index=True)
-        result = gpd.GeoDataFrame(result, crs="EPSG:4326")
-
-        # Filter by min_zoom (unpacked from zoom_priority high nibble)
-        if 'zoom_priority' in result.columns:
-            result = result[(result['zoom_priority'].astype(int) // 16) <= self.zoom]
-
         self.last_query_stats = {
             'tiles_loaded': tiles_loaded,
             'tiles_missing': tiles_missing,
-            'features': len(result),
+            'features': len(all_features),
             'time_ms': elapsed
         }
 
-        return result
+        return all_features
 
     def render_to_surface(self, surface: pygame.Surface):
-        """Render all visible features to pygame surface."""
+        """Render features to pygame surface."""
         if self.bbox is None:
             return
 
         surface.fill(self.background_color)
 
         features = self.query_features()
-        if features is None or len(features) == 0:
+        if not features:
             self.cached_features = None
             return
 
-        # Sort by priority (unpacked from zoom_priority low nibble)
-        if 'zoom_priority' in features.columns:
-            features = features.iloc[(features['zoom_priority'].astype(int) % 16).argsort()]
-
-        # Cache for click identification
+        # Sort by priority
+        features.sort(key=lambda f: f.priority)
         self.cached_features = features
 
-        for idx, row in features.iterrows():
-            self._render_feature(surface, row)
+        for feature in features:
+            self._render_feature(surface, feature)
 
         if self.show_tile_grid:
             self._draw_tile_grid(surface)
 
-    def _render_feature(self, surface: pygame.Surface, feature):
+    def _render_feature(self, surface: pygame.Surface, feature: NavFeature):
         """Render a single feature."""
-        geom = feature.geometry
-        if geom is None or geom.is_empty:
+        if not feature.coords:
             return
 
-        if 'color_rgb565' in feature.index and feature['color_rgb565']:
-            color = rgb565_to_rgb888(int(feature['color_rgb565']))
-        else:
-            color = (200, 200, 200)
+        color = rgb565_to_rgb888(feature.color_rgb565)
 
-        geom_type = geom.geom_type
+        if feature.geom_type == GEOM_POINT:
+            self._render_point(surface, feature, color)
+        elif feature.geom_type == GEOM_LINESTRING:
+            self._render_linestring(surface, feature, color)
+        elif feature.geom_type == GEOM_POLYGON:
+            self._render_polygon(surface, feature, color)
 
-        if geom_type == 'Point':
-            self._render_point(surface, geom, color)
-        elif geom_type == 'LineString':
-            self._render_linestring(surface, geom, color)
-        elif geom_type == 'Polygon':
-            self._render_polygon(surface, geom, color)
-        elif geom_type == 'MultiLineString':
-            for line in geom.geoms:
-                self._render_linestring(surface, line, color)
-        elif geom_type == 'MultiPolygon':
-            for poly in geom.geoms:
-                self._render_polygon(surface, poly, color)
-        elif geom_type == 'GeometryCollection':
-            for g in geom.geoms:
-                self._render_geometry(surface, g, color)
+    def _render_point(self, surface: pygame.Surface, feature: NavFeature, color: Tuple[int, int, int]):
+        """Render point."""
+        if feature.coords:
+            lon, lat = feature.coords[0]
+            px, py = latlon_to_pixel(lat, lon, self.bbox)
+            if 0 <= px < VIEWPORT_SIZE and 0 <= py < VIEWPORT_SIZE:
+                pygame.draw.circle(surface, color, (px, py), 3)
 
-    def _render_geometry(self, surface: pygame.Surface, geom, color: Tuple[int, int, int]):
-        """Render any geometry type."""
-        if geom is None or geom.is_empty:
-            return
-        geom_type = geom.geom_type
-        if geom_type == 'Point':
-            self._render_point(surface, geom, color)
-        elif geom_type == 'LineString':
-            self._render_linestring(surface, geom, color)
-        elif geom_type == 'Polygon':
-            self._render_polygon(surface, geom, color)
-        elif geom_type == 'MultiLineString':
-            for line in geom.geoms:
-                self._render_linestring(surface, line, color)
-        elif geom_type == 'MultiPolygon':
-            for poly in geom.geoms:
-                self._render_polygon(surface, poly, color)
-
-    def _render_point(self, surface: pygame.Surface, point, color: Tuple[int, int, int]):
-        """Render a point feature."""
-        px, py = latlon_to_pixel(point.y, point.x, self.bbox)
-        if 0 <= px < VIEWPORT_SIZE and 0 <= py < VIEWPORT_SIZE:
-            pygame.draw.circle(surface, color, (px, py), 3)
-
-    def _render_linestring(self, surface: pygame.Surface, line, color: Tuple[int, int, int], width: int = 1):
-        """Render a linestring feature."""
+    def _render_linestring(self, surface: pygame.Surface, feature: NavFeature, color: Tuple[int, int, int]):
+        """Render linestring."""
         points = []
-        for coord in line.coords:
-            px, py = latlon_to_pixel(coord[1], coord[0], self.bbox)
+        for lon, lat in feature.coords:
+            px, py = latlon_to_pixel(lat, lon, self.bbox)
             points.append((px, py))
 
         if len(points) >= 2:
-            pygame.draw.lines(surface, color, False, points, width)
+            pygame.draw.lines(surface, color, False, points, 1)
 
-    def _render_polygon(self, surface: pygame.Surface, polygon, color: Tuple[int, int, int]):
-        """Render a polygon feature."""
-        if polygon.is_empty:
-            return
-
-        exterior = polygon.exterior
+    def _render_polygon(self, surface: pygame.Surface, feature: NavFeature, color: Tuple[int, int, int]):
+        """Render polygon."""
         points = []
-        for coord in exterior.coords:
-            px, py = latlon_to_pixel(coord[1], coord[0], self.bbox)
+        for lon, lat in feature.coords:
+            px, py = latlon_to_pixel(lat, lon, self.bbox)
             points.append((px, py))
 
         if len(points) >= 3:
@@ -347,12 +340,10 @@ class FGBViewer:
                 pygame.draw.polygon(surface, color, points, 1)
 
     def _draw_tile_grid(self, surface: pygame.Surface):
-        """Draw tile grid overlay with tile coordinates."""
+        """Draw tile grid overlay."""
         grid_color = (100, 100, 100)
-        text_color = (80, 80, 80)
         font = pygame.font.SysFont(None, 14)
 
-        # Draw grid lines
         for i in range(4):
             x = i * TILE_SIZE
             pygame.draw.line(surface, grid_color, (x, 0), (x, VIEWPORT_SIZE), 1)
@@ -360,7 +351,6 @@ class FGBViewer:
             y = i * TILE_SIZE
             pygame.draw.line(surface, grid_color, (0, y), (VIEWPORT_SIZE, y), 1)
 
-        # Draw tile coordinates
         tiles = self._get_tiles_for_viewport()
         center_x, center_y = deg2num(self.center_lat, self.center_lon, self.zoom)
         center_tile_x = int(center_x)
@@ -370,7 +360,6 @@ class FGBViewer:
             for dx in range(-1, 2):
                 tile_x = center_tile_x + dx
                 tile_y = center_tile_y + dy
-                # Screen position for this tile
                 screen_x = (dx + 1) * TILE_SIZE + 5
                 screen_y = (dy + 1) * TILE_SIZE + 5
                 tile_path = self._get_tile_path(tile_x, tile_y)
@@ -380,119 +369,97 @@ class FGBViewer:
                 surface.blit(label, (screen_x, screen_y))
 
     def identify_feature_at(self, pixel_x: int, pixel_y: int) -> Optional[dict]:
-        """Identify feature at given pixel coordinates.
-
-        Returns dict with feature info or None if no feature found.
-        """
+        """Identify feature at pixel coordinates."""
         if self.cached_features is None or self.bbox is None:
             return None
 
-        # Convert pixel to lat/lon
         min_lon, min_lat, max_lon, max_lat = self.bbox
         lon = min_lon + (pixel_x / VIEWPORT_SIZE) * (max_lon - min_lon)
         lat = max_lat - (pixel_y / VIEWPORT_SIZE) * (max_lat - min_lat)
 
-        click_point = Point(lon, lat)
-
-        # Search features in reverse priority order (top features first)
-        features_sorted = self.cached_features.sort_values('priority', ascending=False) if 'priority' in self.cached_features.columns else self.cached_features
-
-        for idx, row in features_sorted.iterrows():
-            geom = row.geometry
-            if geom is None or geom.is_empty:
-                continue
-
-            # Check if point is within/near the geometry
-            if geom.geom_type == 'Polygon' or geom.geom_type == 'MultiPolygon':
-                if geom.contains(click_point):
-                    return self._feature_to_dict(row)
-            elif geom.geom_type == 'LineString' or geom.geom_type == 'MultiLineString':
-                # For lines, use a small buffer (tolerance in degrees ~5 pixels)
-                tolerance = (max_lon - min_lon) / VIEWPORT_SIZE * 5
-                if geom.buffer(tolerance).contains(click_point):
-                    return self._feature_to_dict(row)
-            elif geom.geom_type == 'Point':
-                tolerance = (max_lon - min_lon) / VIEWPORT_SIZE * 10
-                if click_point.distance(geom) < tolerance:
-                    return self._feature_to_dict(row)
+        # Search in reverse priority order
+        for feature in reversed(self.cached_features):
+            if self._point_in_feature(lon, lat, feature):
+                return {
+                    'color': f"#{rgb565_to_rgb888(feature.color_rgb565)[0]:02x}{rgb565_to_rgb888(feature.color_rgb565)[1]:02x}{rgb565_to_rgb888(feature.color_rgb565)[2]:02x}",
+                    'min_zoom': feature.min_zoom,
+                    'priority': feature.priority,
+                    'geom_type': ['?', 'Point', 'Line', 'Polygon'][feature.geom_type],
+                    'coords': len(feature.coords)
+                }
 
         return None
 
-    def _feature_to_dict(self, row) -> dict:
-        """Convert feature row to dict with relevant info."""
-        info = {}
-        if 'color_rgb565' in row.index and row['color_rgb565']:
-            r, g, b = rgb565_to_rgb888(int(row['color_rgb565']))
-            info['color'] = f"#{r:02x}{g:02x}{b:02x}"
-        else:
-            info['color'] = 'N/A'
-        if 'zoom_priority' in row.index:
-            zp = int(row['zoom_priority'])
-            info['min_zoom'] = zp >> 4
-            info['priority'] = (zp & 0x0F) * 7
-        info['geom_type'] = row.geometry.geom_type if row.geometry else 'N/A'
-        return info
+    def _point_in_feature(self, lon: float, lat: float, feature: NavFeature) -> bool:
+        """Check if point is in/near feature."""
+        if feature.geom_type == GEOM_POLYGON:
+            # Simple point-in-polygon test
+            n = len(feature.coords)
+            inside = False
+            j = n - 1
+            for i in range(n):
+                xi, yi = feature.coords[i]
+                xj, yj = feature.coords[j]
+                if ((yi > lat) != (yj > lat)) and (lon < (xj - xi) * (lat - yi) / (yj - yi) + xi):
+                    inside = not inside
+                j = i
+            return inside
+        elif feature.geom_type == GEOM_LINESTRING:
+            # Check distance to line segments
+            tolerance = (self.bbox[2] - self.bbox[0]) / VIEWPORT_SIZE * 5
+            for i in range(len(feature.coords) - 1):
+                x1, y1 = feature.coords[i]
+                x2, y2 = feature.coords[i + 1]
+                dist = self._point_to_segment_dist(lon, lat, x1, y1, x2, y2)
+                if dist < tolerance:
+                    return True
+        elif feature.geom_type == GEOM_POINT and feature.coords:
+            x, y = feature.coords[0]
+            tolerance = (self.bbox[2] - self.bbox[0]) / VIEWPORT_SIZE * 10
+            if abs(lon - x) < tolerance and abs(lat - y) < tolerance:
+                return True
+        return False
+
+    def _point_to_segment_dist(self, px, py, x1, y1, x2, y2):
+        """Calculate distance from point to line segment."""
+        dx = x2 - x1
+        dy = y2 - y1
+        if dx == 0 and dy == 0:
+            return math.sqrt((px - x1)**2 + (py - y1)**2)
+        t = max(0, min(1, ((px - x1) * dx + (py - y1) * dy) / (dx * dx + dy * dy)))
+        proj_x = x1 + t * dx
+        proj_y = y1 + t * dy
+        return math.sqrt((px - proj_x)**2 + (py - proj_y)**2)
 
 
-def draw_button(surface, text, rect, bg_color, fg_color, border_color, font, pressed=False):
+def draw_button(surface, text, rect, bg_color, fg_color, border_color, font):
     """Draw a button."""
-    radius = 8
-    pygame.draw.rect(surface, bg_color, rect, border_radius=radius)
-    pygame.draw.rect(surface, border_color, rect, 2, border_radius=radius)
+    pygame.draw.rect(surface, bg_color, rect, border_radius=8)
+    pygame.draw.rect(surface, border_color, rect, 2, border_radius=8)
     label = font.render(text, True, fg_color)
     text_rect = label.get_rect(center=rect.center)
     surface.blit(label, text_rect)
 
 
-def format_coord(decimal: float, is_latitude: bool = True) -> str:
-    """Format decimal coordinate as degrees/minutes/seconds."""
-    sign = "N" if is_latitude else "E"
-    if decimal < 0:
-        sign = "S" if is_latitude else "W"
-    decimal = abs(decimal)
-    degrees = int(decimal)
-    minutes_full = (decimal - degrees) * 60
-    minutes = int(minutes_full)
-    seconds = (minutes_full - minutes) * 60
-    return f"{degrees}°{minutes}'{seconds:.1f}\"{sign}"
-
-
 def main():
-    parser = argparse.ArgumentParser(
-        description='FlatGeobuf Map Viewer - ESP32 Simulator (Tile Structure)',
-        epilog="""
-Controls:
-    Arrow keys / Mouse drag: Pan map
-    Mouse wheel / [ ] keys: Zoom in/out
-    B: Toggle background color
-    F: Toggle polygon fill
-    G: Toggle tile grid (shows tile coordinates)
-    Q / ESC: Quit
-        """
-    )
-
-    parser.add_argument('fgb_dir', help='Directory containing tile-based FGB files (z/x/y.fgb)')
+    parser = argparse.ArgumentParser(description='NAV Tile Viewer')
+    parser.add_argument('nav_dir', help='Directory with NAV tiles')
     parser.add_argument('--lat', type=float, required=True, help='Center latitude')
     parser.add_argument('--lon', type=float, required=True, help='Center longitude')
-    parser.add_argument('--zoom', type=int, default=14, help='Zoom level (default: 14)')
-    parser.add_argument('--config', help='Features configuration JSON file')
+    parser.add_argument('--zoom', type=int, default=14, help='Zoom level')
 
     args = parser.parse_args()
 
     if not PYGAME_AVAILABLE:
-        logger.error("pygame is required. Install with: pip install pygame")
+        logger.error("pygame required")
         sys.exit(1)
 
-    if not GEOPANDAS_AVAILABLE:
-        logger.error("geopandas is required. Install with: pip install geopandas pyogrio")
-        sys.exit(1)
-
-    viewer = FGBViewer(args.fgb_dir, args.config)
+    viewer = NAVViewer(args.nav_dir)
     viewer.set_center(args.lat, args.lon, args.zoom)
 
     pygame.init()
     screen = pygame.display.set_mode((WINDOW_WIDTH, WINDOW_HEIGHT))
-    pygame.display.set_caption(f"FGB Viewer (Tiles) - {os.path.basename(args.fgb_dir)}")
+    pygame.display.set_caption(f"NAV Viewer - {os.path.basename(args.nav_dir)}")
 
     font = pygame.font.SysFont(None, 18)
     font_small = pygame.font.SysFont(None, 14)
@@ -569,12 +536,11 @@ Controls:
                         viewer.show_tile_grid = not viewer.show_tile_grid
                         need_redraw = True
                     elif mx < VIEWPORT_SIZE and my < VIEWPORT_SIZE:
-                        # Left click = drag
                         dragging = True
                         drag_start = (mx, my)
                         drag_center_start = (viewer.center_lat, viewer.center_lon)
 
-                elif event.button == 3:  # Right click = identify feature
+                elif event.button == 3:
                     if mx < VIEWPORT_SIZE and my < VIEWPORT_SIZE:
                         feature_info = viewer.identify_feature_at(mx, my)
                         viewer.selected_feature = feature_info
@@ -637,11 +603,8 @@ Controls:
             screen.blit(font_small.render(f"Lon: {viewer.center_lon:.6f}", True, info_color), (VIEWPORT_SIZE + 10, info_y + 18))
             screen.blit(font_small.render(f"Zoom: {viewer.zoom}", True, info_color), (VIEWPORT_SIZE + 10, info_y + 36))
 
-            screen.blit(font_small.render(format_coord(viewer.center_lat, True), True, info_color), (VIEWPORT_SIZE + 10, info_y + 60))
-            screen.blit(font_small.render(format_coord(viewer.center_lon, False), True, info_color), (VIEWPORT_SIZE + 10, info_y + 78))
-
             # Query stats
-            stats_y = info_y + 110
+            stats_y = info_y + 70
             screen.blit(font_small.render("Query Stats:", True, info_color), (VIEWPORT_SIZE + 10, stats_y))
             if viewer.last_query_stats:
                 s = viewer.last_query_stats
@@ -649,35 +612,25 @@ Controls:
                 screen.blit(font_small.render(f"  Features: {s.get('features', 0)}", True, (150, 150, 150)), (VIEWPORT_SIZE + 10, stats_y + 32))
                 screen.blit(font_small.render(f"  Time: {s.get('time_ms', 0):.0f}ms", True, (150, 150, 150)), (VIEWPORT_SIZE + 10, stats_y + 46))
 
-            # Selected feature info
+            # Selected feature
             feature_y = stats_y + 80
             screen.blit(font_small.render("Click Feature:", True, info_color), (VIEWPORT_SIZE + 10, feature_y))
             if viewer.selected_feature:
-                f = viewer.selected_feature
                 line_y = feature_y + 18
-                highlight_color = (100, 200, 100)
-                for key, value in f.items():
+                for key, value in viewer.selected_feature.items():
                     text = f"  {key}: {value}"
-                    screen.blit(font_small.render(text, True, highlight_color), (VIEWPORT_SIZE + 10, line_y))
+                    screen.blit(font_small.render(text, True, (100, 200, 100)), (VIEWPORT_SIZE + 10, line_y))
                     line_y += 14
             else:
-                screen.blit(font_small.render("  (click on map)", True, (100, 100, 100)), (VIEWPORT_SIZE + 10, feature_y + 18))
+                screen.blit(font_small.render("  (right-click)", True, (100, 100, 100)), (VIEWPORT_SIZE + 10, feature_y + 18))
 
             # Status bar
             pygame.draw.rect(screen, (30, 30, 30), (0, VIEWPORT_SIZE, WINDOW_WIDTH, STATUSBAR_HEIGHT))
-            if viewer.bbox:
-                min_lon, min_lat, max_lon, max_lat = viewer.bbox
-                bbox_text = f"BBox: ({min_lat:.4f}, {min_lon:.4f}) to ({max_lat:.4f}, {max_lon:.4f})"
-                screen.blit(font_small.render(bbox_text, True, (200, 200, 200)), (10, VIEWPORT_SIZE + 10))
+            screen.blit(font_small.render("NAV Format - IceNav Navigation Tiles", True, (200, 200, 200)), (10, VIEWPORT_SIZE + 10))
 
-                meters_per_pixel = 156543.03392 * math.cos(math.radians(viewer.center_lat)) / (2 ** viewer.zoom)
-                res_text = f"Resolution: {meters_per_pixel:.2f} m/px"
-                screen.blit(font_small.render(res_text, True, (200, 200, 200)), (10, VIEWPORT_SIZE + 30))
-
-                # Show available zooms
-                if viewer.available_zooms:
-                    zooms_str = f"Available: {min(viewer.available_zooms)}-{max(viewer.available_zooms)}"
-                    screen.blit(font_small.render(zooms_str, True, (150, 150, 150)), (400, VIEWPORT_SIZE + 10))
+            if viewer.available_zooms:
+                zooms_str = f"Available: {min(viewer.available_zooms)}-{max(viewer.available_zooms)}"
+                screen.blit(font_small.render(zooms_str, True, (150, 150, 150)), (10, VIEWPORT_SIZE + 30))
 
             pygame.display.flip()
             need_redraw = False
