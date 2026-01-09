@@ -85,7 +85,13 @@ python nav_viewer.py ./nav_output --lat 42.5063 --lon 1.5218 --zoom 14
 
 ## NAV Binary Format Specification
 
-NAV is a custom binary format optimized for sequential reading on ESP32. Uses int32 scaled coordinates instead of float64 for compact storage.
+NAV is a proprietary binary format designed as a lightweight alternative to FlatGeobuf for embedded devices with limited resources. Unlike FlatGeobuf (which uses FlatBuffers serialization and R-Tree spatial indexing), NAV uses a minimal sequential structure optimized for ESP32's SD card access patterns.
+
+**Key differences from FlatGeobuf:**
+- No FlatBuffers dependency - pure binary format
+- No R-Tree index - tiles are small enough for sequential reading
+- int32 scaled coordinates instead of float64 (~50% smaller)
+- Minimal header overhead
 
 **File Header (24 bytes):**
 
