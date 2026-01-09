@@ -130,10 +130,10 @@ def read_nav_tile(path: str) -> List[NavFeature]:
                 logger.warning(f"Invalid magic in {path}")
                 return features
 
-            version = struct.unpack('<B', f.read(1))[0]
+            f.read(1)  # version (unused)
             feature_count = struct.unpack('<H', f.read(2))[0]
-            reserved = struct.unpack('<B', f.read(1))[0]
-            bbox = struct.unpack('<4i', f.read(16))
+            f.read(1)  # reserved (unused)
+            f.read(16)  # bbox (unused)
 
             # Read features
             for _ in range(feature_count):
@@ -153,11 +153,10 @@ def read_nav_tile(path: str) -> List[NavFeature]:
                     lat = lat_int / COORD_SCALE
                     feature.coords.append((lon, lat))
 
-                # For polygons, read ring info
+                # For polygons, skip ring info (unused)
                 if feature.geom_type == GEOM_POLYGON:
                     ring_count = struct.unpack('<B', f.read(1))[0]
-                    for _ in range(ring_count):
-                        ring_end = struct.unpack('<H', f.read(2))[0]
+                    f.read(ring_count * 2)  # skip ring ends
 
                 features.append(feature)
 

@@ -148,16 +148,6 @@ def lat_to_tile_y(lat: float, zoom: int) -> int:
     return int((1.0 - math.asinh(math.tan(lat_rad)) / math.pi) / 2.0 * n)
 
 
-def tile_bounds(x: int, y: int, zoom: int) -> Tuple[float, float, float, float]:
-    """Get bounding box for a tile (min_lon, min_lat, max_lon, max_lat)."""
-    n = 2.0 ** zoom
-    min_lon = x / n * 360.0 - 180.0
-    max_lon = (x + 1) / n * 360.0 - 180.0
-    max_lat = math.degrees(math.atan(math.sinh(math.pi * (1 - 2 * y / n))))
-    min_lat = math.degrees(math.atan(math.sinh(math.pi * (1 - 2 * (y + 1) / n))))
-    return (min_lon, min_lat, max_lon, max_lat)
-
-
 def get_feature_tiles(coords: List[Tuple[float, float]], zoom: int, is_polygon: bool = False) -> Set[Tuple[int, int]]:
     """Get all tiles that a feature intersects at given zoom level."""
     tiles = set()
@@ -252,11 +242,6 @@ def pack_zoom_priority(min_zoom: int, priority: int) -> int:
     return (zoom_nibble << 4) | priority_nibble
 
 
-def coord_to_int32(lon: float, lat: float) -> Tuple[int, int]:
-    """Convert float coordinates to int32 (scaled by 1e7)."""
-    return (int(lon * COORD_SCALE), int(lat * COORD_SCALE))
-
-
 def get_simplify_tolerance(zoom: int) -> float:
     """Calculate simplification tolerance based on zoom level."""
     tile_width_degrees = 360.0 / (2.0 ** zoom)
@@ -274,7 +259,6 @@ class OSMHandler(osmium.SimpleHandler):
         self.features: List[Dict] = []
         self.stats = {
             'ways_processed': 0,
-            'relations_processed': 0,
             'areas_processed': 0,
             'features_extracted': 0,
             'features_filtered': 0
@@ -401,10 +385,6 @@ class OSMHandler(osmium.SimpleHandler):
         }
         self.features.append(feature)
         self.stats['features_extracted'] += 1
-
-    def relation(self, r):
-        """Process relation."""
-        self.stats['relations_processed'] += 1
 
     def area(self, a):
         """Process area - handles multipolygon relations."""
