@@ -626,6 +626,9 @@ def convert_pbf_to_nav(input_pbf: str, output_dir: str, config_file: str,
             tile_dir = os.path.join(output_dir, str(zoom), str(x))
             tile_path = os.path.join(tile_dir, f"{y}.nav")
 
+            # Pre-sort by priority (low nibble) for streaming render on ESP32
+            features.sort(key=lambda f: f['zoom_priority'] & 0x0F)
+
             if write_nav_tile(features, tile_path, zoom):
                 tiles_written += 1
                 total_size += os.path.getsize(tile_path)

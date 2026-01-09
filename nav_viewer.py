@@ -282,7 +282,7 @@ class NAVViewer:
             self.cached_features = None
             return
 
-        # Sort by priority
+        # Sort by priority (needed when combining multiple tiles)
         features.sort(key=lambda f: f.priority)
         self.cached_features = features
 
