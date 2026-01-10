@@ -93,18 +93,16 @@ NAV is a proprietary binary format designed as a lightweight alternative to Flat
 - int32 scaled coordinates instead of float64 (~50% smaller)
 - Minimal header overhead
 
-**File Header (24 bytes):**
+**File Header (22 bytes):**
 
 | Offset | Size | Field | Description |
 |--------|------|-------|-------------|
 | 0 | 4 | Magic | `NAV1` (0x4E, 0x41, 0x56, 0x31) |
-| 4 | 1 | Version | Format version (currently 1) |
-| 5 | 2 | Feature count | Number of features (little-endian) |
-| 7 | 1 | Reserved | Padding |
-| 8 | 4 | Min Lon | Bounding box min longitude (int32 scaled) |
-| 12 | 4 | Min Lat | Bounding box min latitude (int32 scaled) |
-| 16 | 4 | Max Lon | Bounding box max longitude (int32 scaled) |
-| 20 | 4 | Max Lat | Bounding box max latitude (int32 scaled) |
+| 4 | 2 | Feature count | Number of features (little-endian) |
+| 6 | 4 | Min Lon | Bounding box min longitude (int32 scaled) |
+| 10 | 4 | Min Lat | Bounding box min latitude (int32 scaled) |
+| 14 | 4 | Max Lon | Bounding box max longitude (int32 scaled) |
+| 18 | 4 | Max Lat | Bounding box max latitude (int32 scaled) |
 
 **Feature Record:**
 
@@ -113,10 +111,20 @@ NAV is a proprietary binary format designed as a lightweight alternative to Flat
 | 1 | Geometry type | 1=Point, 2=LineString, 3=Polygon |
 | 2 | Color | RGB565 color (little-endian) |
 | 1 | Zoom/Priority | High nibble = min_zoom, low nibble = priority/7 |
+| 1 | Width | Line width in pixels (1-15, from OSM `width`/`lanes` tags) |
 | 2 | Coord count | Number of coordinates (little-endian) |
 | 8×N | Coordinates | lon(int32) + lat(int32) pairs |
 | 1 | Ring count | (Polygons only) Number of rings |
 | 2×R | Ring ends | (Polygons only) End index of each ring |
+
+**Width Calculation:**
+
+Width is derived from OSM tags and converted to pixels at the tile's zoom level:
+- `width=*` tag: meters converted to pixels
+- `lanes=*` tag: lanes × 3.5m converted to pixels
+- Default: 1 pixel if no width tag present
+
+Formula: `pixels = width_meters / (156543 × cos(lat) / 2^zoom)`
 
 **Coordinate Scaling:**
 

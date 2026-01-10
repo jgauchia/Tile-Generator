@@ -51,13 +51,28 @@ logger = logging.getLogger(__name__)
 
 # NAV format constants
 NAV_MAGIC = b'NAV1'
-NAV_VERSION = 1
 COORD_SCALE = 10000000  # 1e7 for ~1cm precision
 
 # Geometry types
 GEOM_POINT = 1
 GEOM_LINESTRING = 2
 GEOM_POLYGON = 3
+
+# Tags that support width (LineStrings only)
+WIDTH_TAGS = {'highway', 'railway', 'waterway'}
+
+
+def meters_to_pixels(width_meters: float, zoom: int, lat: float = 45.0) -> int:
+    """Convert width in meters to pixels at given zoom level.
+
+    Uses approximation for given latitude (default 45° for Europe).
+    Formula: meters_per_pixel ≈ 156543 * cos(lat) / 2^zoom
+    """
+    import math
+    meters_per_pixel = 156543.0 * math.cos(math.radians(lat)) / (2 ** zoom)
+    pixels = int(width_meters / meters_per_pixel + 0.5)
+    return max(1, min(15, pixels))  # Clamp to 1-15
+
 
 # Layer rendering priority (lower = rendered first = behind)
 LAYER_PRIORITY = {
@@ -370,21 +385,54 @@ class OSMHandler(osmium.SimpleHandler):
                 'geom_type': GEOM_POLYGON,
                 'coords': coords,
                 'color_rgb565': color_rgb565,
-                'zoom_priority': pack_zoom_priority(min_zoom, combined_priority)
+                'zoom_priority': pack_zoom_priority(min_zoom, combined_priority),
+                'width_meters': 0.0  # Polygons don't use width
             }
             self.features.append(feature)
             self.stats['features_extracted'] += 1
             self.processed_way_ids.add(w.id)
             return
 
+        # Extract width in meters for roads/railways/waterways
+        width_meters = 0.0
+        if any(tag in tags for tag in WIDTH_TAGS):
+            width_meters = self._get_width_meters(tags)
+
         feature = {
             'geom_type': GEOM_LINESTRING,
             'coords': coords,
             'color_rgb565': color_rgb565,
-            'zoom_priority': pack_zoom_priority(min_zoom, combined_priority)
+            'zoom_priority': pack_zoom_priority(min_zoom, combined_priority),
+            'width_meters': width_meters
         }
         self.features.append(feature)
         self.stats['features_extracted'] += 1
+
+    def _get_width_meters(self, tags: Dict[str, str]) -> float:
+        """Extract width in meters from OSM tags.
+
+        Priority:
+        1. width=* tag (meters)
+        2. lanes=* tag (lanes × 3.5m)
+        3. Return 0 (will become 1 pixel default)
+        """
+        # Check for explicit width tag
+        if 'width' in tags:
+            try:
+                width_str = tags['width'].replace('m', '').replace(' ', '').strip()
+                return float(width_str)
+            except (ValueError, TypeError):
+                pass
+
+        # Check for lanes tag
+        if 'lanes' in tags:
+            try:
+                lanes = int(tags['lanes'])
+                return lanes * 3.5  # Standard lane width
+            except (ValueError, TypeError):
+                pass
+
+        return 0.0
 
     def area(self, a):
         """Process area - handles multipolygon relations."""
@@ -446,7 +494,8 @@ class OSMHandler(osmium.SimpleHandler):
                     'geom_type': GEOM_POLYGON,
                     'coords': coords,
                     'color_rgb565': color_rgb565,
-                    'zoom_priority': pack_zoom_priority(min_zoom, combined_priority)
+                    'zoom_priority': pack_zoom_priority(min_zoom, combined_priority),
+                    'width_meters': 0.0  # Polygons don't use width
                 }
                 self.features.append(feature)
                 self.stats['features_extracted'] += 1
@@ -497,11 +546,9 @@ def write_nav_tile(features: List[Dict], output_path: str, zoom: int) -> bool:
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
     with open(output_path, 'wb') as f:
-        # Write header (20 bytes)
+        # Write header (22 bytes)
         f.write(NAV_MAGIC)  # 4 bytes
-        f.write(struct.pack('<B', NAV_VERSION))  # 1 byte
         f.write(struct.pack('<H', len(features)))  # 2 bytes
-        f.write(struct.pack('<B', 0))  # 1 byte reserved
         f.write(struct.pack('<i', int(min_lon * COORD_SCALE)))  # 4 bytes
         f.write(struct.pack('<i', int(min_lat * COORD_SCALE)))  # 4 bytes
         f.write(struct.pack('<i', int(max_lon * COORD_SCALE)))  # 4 bytes
@@ -521,10 +568,18 @@ def write_nav_tile(features: List[Dict], output_path: str, zoom: int) -> bool:
             if feature['geom_type'] == GEOM_POLYGON and len(coords) < 4:
                 continue
 
+            # Calculate width in pixels (convert meters to pixels at this zoom)
+            width_meters = feature.get('width_meters', 0.0)
+            if width_meters > 0:
+                width_pixels = meters_to_pixels(width_meters, zoom)
+            else:
+                width_pixels = 1  # Default width
+
             # Write feature header
             f.write(struct.pack('<B', feature['geom_type']))  # 1 byte
             f.write(struct.pack('<H', feature['color_rgb565']))  # 2 bytes
             f.write(struct.pack('<B', feature['zoom_priority']))  # 1 byte
+            f.write(struct.pack('<B', width_pixels))  # 1 byte (NAV v2)
             f.write(struct.pack('<H', len(coords)))  # 2 bytes
 
             # Write coordinates as int32

@@ -107,6 +107,7 @@ class NavFeature:
         self.geom_type = 0
         self.color_rgb565 = 0xFFFF
         self.zoom_priority = 0
+        self.width = 1  # Line width in pixels (NAV v2)
         self.coords = []  # List of (lon, lat) floats
 
     @property
@@ -124,25 +125,24 @@ def read_nav_tile(path: str) -> List[NavFeature]:
 
     try:
         with open(path, 'rb') as f:
-            # Read header (20 bytes)
+            # Read header (22 bytes)
             magic = f.read(4)
             if magic != NAV_MAGIC:
                 logger.warning(f"Invalid magic in {path}")
                 return features
 
-            f.read(1)  # version (unused)
             feature_count = struct.unpack('<H', f.read(2))[0]
-            f.read(1)  # reserved (unused)
             f.read(16)  # bbox (unused)
 
             # Read features
             for _ in range(feature_count):
                 feature = NavFeature()
 
-                # Feature header (6 bytes)
+                # Feature header (7 bytes)
                 feature.geom_type = struct.unpack('<B', f.read(1))[0]
                 feature.color_rgb565 = struct.unpack('<H', f.read(2))[0]
                 feature.zoom_priority = struct.unpack('<B', f.read(1))[0]
+                feature.width = struct.unpack('<B', f.read(1))[0]
                 coord_count = struct.unpack('<H', f.read(2))[0]
 
                 # Read coordinates
@@ -314,14 +314,20 @@ class NAVViewer:
                 pygame.draw.circle(surface, color, (px, py), 3)
 
     def _render_linestring(self, surface: pygame.Surface, feature: NavFeature, color: Tuple[int, int, int]):
-        """Render linestring."""
+        """Render linestring with width and round joins."""
         points = []
         for lon, lat in feature.coords:
             px, py = latlon_to_pixel(lat, lon, self.bbox)
             points.append((px, py))
 
         if len(points) >= 2:
-            pygame.draw.lines(surface, color, False, points, 1)
+            width = max(1, feature.width)
+            pygame.draw.lines(surface, color, False, points, width)
+            # Add round joins for thick lines
+            if width > 2:
+                radius = width // 2
+                for px, py in points:
+                    pygame.draw.circle(surface, color, (px, py), radius)
 
     def _render_polygon(self, surface: pygame.Surface, feature: NavFeature, color: Tuple[int, int, int]):
         """Render polygon."""
