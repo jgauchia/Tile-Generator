@@ -1,1490 +1,665 @@
-import struct
-import sys
+#!/usr/bin/env python3
+"""
+NAV Tile Viewer - ESP32 Map Simulator
+
+Displays NAV binary tiles in a 768x768 viewport (3x3 tiles of 256px).
+
+Usage:
+    python nav_viewer.py nav_dir --lat 42.5063 --lon 1.5218 [--zoom 14]
+"""
+
 import os
+import sys
 import math
-import pygame
-import threading
+import struct
+import argparse
 import logging
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from collections import OrderedDict
-from functools import lru_cache
+import time
+from typing import Dict, List, Tuple, Optional, Set
 
-# Drawing command codes (solo los usados por tile_generator.py)
-DRAW_COMMANDS = {
-    'LINE': 1,
-    'POLYLINE': 2,
-    'STROKE_POLYGON': 3,
-    'SET_COLOR': 0x80,
-    'SET_COLOR_INDEX': 0x81,
-}
+try:
+    import pygame
+    PYGAME_AVAILABLE = True
+except ImportError:
+    PYGAME_AVAILABLE = False
+    print("Warning: pygame not found. Install with: pip install pygame")
 
-# Tile configuration
-TILE_SIZE = 256
-UINT16_TILE_SIZE = 65536
-
-# Setup logging first
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Default configuration
-DEFAULT_CONFIG = {
-    'tile_size': 256,
-    'viewport_size': 768,
-    'toolbar_width': 160,
-    'statusbar_height': 40,
-    'max_cache_size': 1000,
-    'thread_pool_size': 4,
-    'background_colors': [(0, 0, 0), (255, 255, 255)],
-    'log_level': 'INFO',
-    'config_file': 'features.json',
-    'fps_limit': 30,
-    'fill_polygons': False
-}
-
-class Config:
-    """Configuration management class"""
-    def __init__(self, config_file=None):
-        self.config = DEFAULT_CONFIG.copy()
-        self.config_file = config_file or DEFAULT_CONFIG['config_file']
-        self.load_config()
-    
-    def load_config(self):
-        """Load configuration from file if it exists"""
-        try:
-            if os.path.exists(self.config_file):
-                import json
-                with open(self.config_file, 'r') as f:
-                    file_config = json.load(f)
-                
-                # Merge file config with defaults
-                self.config.update(file_config)
-                logger.info(f"Loaded configuration from {self.config_file}")
-            else:
-                logger.info(f"Config file {self.config_file} not found, using defaults")
-        except Exception as e:
-            logger.error(f"Error loading config file {self.config_file}: {e}")
-            logger.info("Using default configuration")
-    
-    def get(self, key, default=None):
-        """Get configuration value"""
-        return self.config.get(key, default)
-    
-    def set(self, key, value):
-        """Set configuration value"""
-        self.config[key] = value
-    
-    def save_config(self):
-        """Save current configuration to file"""
-        try:
-            import json
-            with open(self.config_file, 'w') as f:
-                json.dump(self.config, f, indent=2)
-            logger.info(f"Saved configuration to {self.config_file}")
-        except Exception as e:
-            logger.error(f"Error saving config file: {e}")
-
-# Global configuration instance
-config = Config()
-
-# Initialize constants from configuration
-TILE_SIZE = config.get('tile_size', 256)
-VIEWPORT_SIZE = config.get('viewport_size', 768)
-TOOLBAR_WIDTH = config.get('toolbar_width', 160)
-STATUSBAR_HEIGHT = config.get('statusbar_height', 40)
+# Constants
+TILE_SIZE = 256
+VIEWPORT_SIZE = 768
+TOOLBAR_WIDTH = 200
+STATUSBAR_HEIGHT = 60
 WINDOW_WIDTH = VIEWPORT_SIZE + TOOLBAR_WIDTH
 WINDOW_HEIGHT = VIEWPORT_SIZE + STATUSBAR_HEIGHT
 
-# Global variables for palette
-GLOBAL_PALETTE = {}
+# NAV format constants
+NAV_MAGIC = b'NAV1'
+COORD_SCALE = 10000000  # 1e7
 
-class TileCache:
-    """LRU Cache for tile surfaces to limit memory usage"""
-    def __init__(self, max_size=None):
-        self.cache = OrderedDict()
-        self.max_size = max_size or config.get('max_cache_size', 1000)
-        self.hits = 0
-        self.misses = 0
-    
-    def get(self, key):
-        """Get tile surface from cache"""
-        if key in self.cache:
-            self.cache.move_to_end(key)
-            self.hits += 1
-            return self.cache[key]
-        self.misses += 1
-        return None
-    
-    def put(self, key, value):
-        """Put tile surface in cache"""
-        if key in self.cache:
-            self.cache.move_to_end(key)
-        else:
-            if len(self.cache) >= self.max_size:
-                removed_key, removed_value = self.cache.popitem(last=False)
-                logger.debug(f"Evicted tile from cache: {removed_key}")
-        self.cache[key] = value
-    
-    def clear(self):
-        """Clear all cached surfaces"""
-        self.cache.clear()
-        logger.info("Tile cache cleared")
-    
-    def get_stats(self):
-        """Get cache statistics"""
-        total = self.hits + self.misses
-        hit_rate = (self.hits / total * 100) if total > 0 else 0
-        return {
-            'size': len(self.cache),
-            'max_size': self.max_size,
-            'hits': self.hits,
-            'misses': self.misses,
-            'hit_rate': hit_rate
-        }
+# Geometry types
+GEOM_POINT = 1
+GEOM_LINESTRING = 2
+GEOM_POLYGON = 3
 
-# Global tile cache instance
-tile_cache = TileCache()
 
-class TileLoader:
-    """Persistent thread pool for tile loading operations"""
-    def __init__(self, max_workers=None):
-        self.executor = ThreadPoolExecutor(max_workers=max_workers or config.get('thread_pool_size', 4))
-        self.active_futures = set()
-    
-    def submit_tile_load(self, tile_info, callback=None):
-        """Submit a tile loading task"""
-        future = self.executor.submit(self._load_single_tile, tile_info)
-        if callback:
-            future.add_done_callback(callback)
-        self.active_futures.add(future)
-        return future
-    
-    def _load_single_tile(self, tile_info):
-        """Load a single tile (internal method) with error recovery"""
-        try:
-            x, y, zoom_level, directory, bg_color, fill_mode = tile_info
-            key = (zoom_level, x, y, bg_color, fill_mode)
-            
-            # Check cache first
-            cached_surface = tile_cache.get(key)
-            if cached_surface is not None:
-                return key, cached_surface
-            
-            tile_file = get_tile_file(directory, x, y)
-            if not tile_file:
-                logger.warning(f"No tile file found for ({x}, {y}) in {directory}")
-                return None, None
-            
-            # Validate tile file exists
-            if not os.path.exists(tile_file):
-                logger.warning(f"Tile file does not exist: {tile_file}")
-                return None, None
-            
-            surface = render_tile_surface({'x': x, 'y': y, 'file': tile_file}, bg_color, fill_mode, False)
-            if surface is None:
-                logger.error(f"Failed to render tile surface for {tile_file}")
-                return None, None
-                
-            tile_cache.put(key, surface)
-            return key, surface
-            
-        except Exception as e:
-            logger.error(f"Error loading tile {tile_info}: {e}")
-            return None, None
-    
-    def cleanup_completed_futures(self):
-        """Remove completed futures from active set"""
-        completed = [f for f in self.active_futures if f.done()]
-        for future in completed:
-            self.active_futures.discard(future)
-        return len(completed)
-    
-    def shutdown(self):
-        """Shutdown the thread pool"""
-        self.executor.shutdown(wait=True)
-        logger.info("Tile loader thread pool shutdown")
-
-# Global tile loader instance
-tile_loader = TileLoader()
-
-def load_global_palette_from_bin(palette_file):
-    """
-    Load the global palette from the binary palette file generated by tile_generator.py.
-    """
-    global GLOBAL_PALETTE
-    try:
-        with open(palette_file, 'rb') as f:
-            # Read 4-byte header for number of colors
-            header = f.read(4)
-            if len(header) < 4:
-                logger.warning(f"Invalid palette file header: {palette_file}")
-                return False
-            
-            num_colors = struct.unpack('<I', header)[0]
-            
-            # Read RGB888 colors (3 bytes per color)
-            palette_data = f.read(num_colors * 3)
-            if len(palette_data) < num_colors * 3:
-                logger.warning(f"Incomplete palette data: {palette_file}")
-                return False
-            
-            # Parse RGB888 colors
-            GLOBAL_PALETTE = {}
-            for i in range(num_colors):
-                offset = i * 3
-                r = palette_data[offset]
-                g = palette_data[offset + 1]
-                b = palette_data[offset + 2]
-                GLOBAL_PALETTE[i] = (r, g, b)
-            
-            logger.info(f"Loaded binary palette: {len(GLOBAL_PALETTE)} colors")
-            return True
-            
-    except Exception as e:
-        logger.warning(f"Could not load palette from {palette_file}: {e}")
-        return False
-
-def load_global_palette_from_config(config_file):
-    """
-    Load the global palette from the features configuration file.
-    """
-    global GLOBAL_PALETTE
-    try:
-        import json
-        with open(config_file, 'r') as f:
-            config = json.load(f)
-        
-        # Extract unique colors from feature definitions only
-        unique_colors = set()
-        for feature_key, feature_config in config.items():
-            if isinstance(feature_config, dict) and 'color' in feature_config:
-                hex_color = feature_config['color']
-                if hex_color and isinstance(hex_color, str) and hex_color.startswith("#"):
-                    unique_colors.add(hex_color)
-        
-        sorted_colors = sorted(list(unique_colors))
-        
-        # Create palette: index -> RGB888
-        GLOBAL_PALETTE = {}
-        for index, hex_color in enumerate(sorted_colors):
-            rgb888 = hex_to_rgb888(hex_color)
-            GLOBAL_PALETTE[index] = rgb888
-        
-        logger.info(f"Loaded dynamic palette: {len(GLOBAL_PALETTE)} colors")
-        return True
-    except Exception as e:
-        logger.warning(f"Could not load palette from config: {e}")
-        logger.info("Will use fallback palette if needed")
-        return False
-
-def hex_to_rgb888(hex_color):
-    """Converts hex color to RGB888"""
-    try:
-        if not hex_color or not hex_color.startswith("#"):
-            return (255, 255, 255)
-        r = int(hex_color[1:3], 16)
-        g = int(hex_color[3:5], 16)
-        b = int(hex_color[5:7], 16)
-        return (r, g, b)
-    except:
-        return (255, 255, 255)
-
-def darken_color(rgb, amount=0.3):
-    """Darken RGB color by specified amount"""
-    return tuple(max(0, int(v * (1 - amount))) for v in rgb)
-
-def skip_command(cmd_type, data, offset):
-    """Skip command data without processing it (incluyendo ancho)"""
-    if cmd_type == 1:  # LINE
-        _, offset = read_varint(data, offset)  # Saltar ancho
-        _, offset = read_zigzag(data, offset)
-        _, offset = read_zigzag(data, offset)
-        _, offset = read_zigzag(data, offset)
-        _, offset = read_zigzag(data, offset)
-    elif cmd_type == 2:  # POLYLINE
-        _, offset = read_varint(data, offset)  # Saltar ancho
-        n_pts, offset = read_varint(data, offset)
-        for _ in range(n_pts):
-            if _ == 0:
-                _, offset = read_zigzag(data, offset)
-                _, offset = read_zigzag(data, offset)
-            else:
-                _, offset = read_zigzag(data, offset)
-                _, offset = read_zigzag(data, offset)
-    elif cmd_type == 3:  # STROKE_POLYGON
-        _, offset = read_varint(data, offset)  # Saltar ancho
-        n_pts, offset = read_varint(data, offset)
-        for _ in range(n_pts):
-            _, offset = read_zigzag(data, offset)
-            _, offset = read_zigzag(data, offset)
-    else:
-        # Para comandos desconocidos, saltar 4 bytes
-        if offset < len(data) - 4:
-            offset += 4
-    
-    return offset
-
-@lru_cache(maxsize=1000)
-def uint16_to_tile_pixel(val):
-    """Convert uint16 coordinate to tile pixel with caching"""
-    return int(round(val * (TILE_SIZE - 1) / (UINT16_TILE_SIZE - 1)))
-
-def get_button_icons():
-    """Create beautiful, modern button icons"""
-    
-    # Background toggle icon (sun/moon)
-    icon_surface_bg = pygame.Surface((24, 24), pygame.SRCALPHA)
-    icon_surface_bg.fill((0, 0, 0, 0))
-    # Sun rays
-    for i in range(8):
-        angle = i * 45
-        x1 = 12 + int(8 * math.cos(math.radians(angle)))
-        y1 = 12 + int(8 * math.sin(math.radians(angle)))
-        x2 = 12 + int(10 * math.cos(math.radians(angle)))
-        y2 = 12 + int(10 * math.sin(math.radians(angle)))
-        pygame.draw.line(icon_surface_bg, (255, 255, 0), (x1, y1), (x2, y2), 2)
-    # Sun center
-    pygame.draw.circle(icon_surface_bg, (255, 255, 0), (12, 12), 6, 0)
-    pygame.draw.circle(icon_surface_bg, (255, 200, 0), (12, 12), 4, 0)
-    
-    # Tile labels icon (document with lines)
-    icon_surface_label = pygame.Surface((24, 24), pygame.SRCALPHA)
-    icon_surface_label.fill((0, 0, 0, 0))
-    # Document background
-    pygame.draw.rect(icon_surface_label, (255, 255, 255), (6, 4, 12, 16), 0)
-    pygame.draw.rect(icon_surface_label, (200, 200, 200), (6, 4, 12, 16), 2)
-    # Document fold
-    pygame.draw.polygon(icon_surface_label, (240, 240, 240), [(18, 4), (18, 8), (14, 8)], 0)
-    pygame.draw.polygon(icon_surface_label, (180, 180, 180), [(18, 4), (18, 8), (14, 8)], 1)
-    # Text lines
-    pygame.draw.line(icon_surface_label, (100, 100, 100), (8, 8), (16, 8), 1)
-    pygame.draw.line(icon_surface_label, (100, 100, 100), (8, 10), (14, 10), 1)
-    pygame.draw.line(icon_surface_label, (100, 100, 100), (8, 12), (16, 12), 1)
-    pygame.draw.line(icon_surface_label, (100, 100, 100), (8, 14), (12, 14), 1)
-    
-    # GPS cursor icon (crosshair with target)
-    icon_surface_gps = pygame.Surface((24, 24), pygame.SRCALPHA)
-    icon_surface_gps.fill((0, 0, 0, 0))
-    # Outer circle
-    pygame.draw.circle(icon_surface_gps, (0, 255, 0), (12, 12), 10, 2)
-    # Inner circle
-    pygame.draw.circle(icon_surface_gps, (0, 255, 0), (12, 12), 6, 2)
-    # Crosshair lines
-    pygame.draw.line(icon_surface_gps, (0, 255, 0), (12, 2), (12, 6), 2)
-    pygame.draw.line(icon_surface_gps, (0, 255, 0), (12, 18), (12, 22), 2)
-    pygame.draw.line(icon_surface_gps, (0, 255, 0), (2, 12), (6, 12), 2)
-    pygame.draw.line(icon_surface_gps, (0, 255, 0), (18, 12), (22, 12), 2)
-    # Center dot
-    pygame.draw.circle(icon_surface_gps, (0, 255, 0), (12, 12), 2, 0)
-    
-    # Fill polygons icon (paint bucket)
-    icon_surface_fill = pygame.Surface((24, 24), pygame.SRCALPHA)
-    icon_surface_fill.fill((0, 0, 0, 0))
-    # Paint bucket body
-    pygame.draw.rect(icon_surface_fill, (255, 100, 100), (8, 6, 8, 10), 0)
-    pygame.draw.rect(icon_surface_fill, (200, 80, 80), (8, 6, 8, 10), 1)
-    # Paint bucket spout
-    pygame.draw.polygon(icon_surface_fill, (255, 100, 100), [(10, 16), (14, 16), (12, 20)], 0)
-    pygame.draw.polygon(icon_surface_fill, (200, 80, 80), [(10, 16), (14, 16), (12, 20)], 1)
-    # Paint drops
-    pygame.draw.circle(icon_surface_fill, (255, 100, 100), (6, 18), 1, 0)
-    pygame.draw.circle(icon_surface_fill, (255, 100, 100), (18, 20), 1, 0)
-    pygame.draw.circle(icon_surface_fill, (255, 100, 100), (4, 22), 1, 0)
-    
-    return icon_surface_bg, icon_surface_label, icon_surface_gps, icon_surface_fill
-
-def index_available_tiles(directory, progress_callback=None):
-    available_tiles = set()
-    if not os.path.isdir(directory):
-        logger.error(f"Directory does not exist: {directory}")
-        return available_tiles
-    x_dirs = [x_str for x_str in os.listdir(directory) if os.path.isdir(os.path.join(directory, x_str))]
-    total_x = len(x_dirs)
-    def index_xdir(x_str):
-        x_path = os.path.join(directory, x_str)
-        try:
-            x = int(x_str)
-        except:
-            return []
-        files = os.listdir(x_path)
-        y_dict = {}
-        for fname in files:
-            if fname.endswith('.bin') or fname.endswith('.png'):
-                y_str = fname.split('.')[0]
-                if y_str.isdigit():
-                    y = int(y_str)
-                    if y not in y_dict or fname.endswith('.bin'):
-                        y_dict[y] = fname
-        return [(x, y) for y in y_dict]
-    results = []
-    with ThreadPoolExecutor(min(8, os.cpu_count() or 4)) as pool:
-        futures = {pool.submit(index_xdir, x_str): i_x for i_x, x_str in enumerate(x_dirs)}
-        for i, future in enumerate(as_completed(futures)):
-            tiles = future.result()
-            results.extend(tiles)
-            if progress_callback is not None:
-                percent = (i + 1) / max(total_x, 1)
-                progress_callback(percent, "Indexing tiles...")
-    available_tiles.update(results)
-    return available_tiles
-
-def get_tile_file(directory, x, y):
-    """Get tile file path with validation"""
-    bin_path = f"{directory}/{x}/{y}.bin"
-    png_path = f"{directory}/{x}/{y}.png"
-    if os.path.isfile(bin_path):
-        return bin_path
-    elif os.path.isfile(png_path):
-        return png_path
-    return None
-
-def is_tile_visible(x, y, viewport_x, viewport_y):
-    """Check if tile is visible in current viewport"""
-    tile_px = x * TILE_SIZE - viewport_x
-    tile_py = y * TILE_SIZE - viewport_y
-    
-    # Check if tile intersects with viewport
-    return not (tile_px + TILE_SIZE < 0 or tile_px > VIEWPORT_SIZE or 
-               tile_py + TILE_SIZE < 0 or tile_py > VIEWPORT_SIZE)
-
-def get_visible_tiles(available_tiles, viewport_x, viewport_y):
-    """Get list of tiles that are currently visible"""
-    min_tile_x = int(viewport_x // TILE_SIZE)
-    max_tile_x = int((viewport_x + VIEWPORT_SIZE) // TILE_SIZE)
-    min_tile_y = int(viewport_y // TILE_SIZE)
-    max_tile_y = int((viewport_y + VIEWPORT_SIZE) // TILE_SIZE)
-
-    visible_tiles = []
-    for x in range(min_tile_x, max_tile_x + 1):
-        for y in range(min_tile_y, max_tile_y + 1):
-            if (x, y) in available_tiles:
-                visible_tiles.append((x, y))
-    
-    return visible_tiles
-
-def read_varint(data, offset):
-    result = 0
-    shift = 0
-    while True:
-        if offset >= len(data):
-            return result, offset
-        b = data[offset]
-        offset += 1
-        result |= (b & 0x7F) << shift
-        if not (b & 0x80):
-            break
-        shift += 7
-    return result, offset
-
-def read_zigzag(data, offset):
-    v, offset = read_varint(data, offset)
-    return (v >> 1) ^ -(v & 1), offset
-
-def rgb332_to_rgb888(c):
-    r = (c & 0xE0)
-    g = (c & 0x1C) << 3
-    b = (c & 0x03) << 6
-    return (r, g, b)
-
-def is_tile_border_point(pt):
-    x, y = pt
-    return (x == 0 or x == TILE_SIZE-1) or (y == 0 or y == TILE_SIZE-1)
-
-def is_polygon_on_tile_border(pts):
-    """Check if a polygon has any points on the tile border"""
-    for pt in pts:
-        if is_tile_border_point(pt):
-            return True
-    return False
-
-def get_polygon_border_segments(pts):
-    """Get border segments of a polygon, distinguishing between tile border and interior segments"""
-    border_segments = []
-    interior_segments = []
-    
-    for i in range(len(pts)):
-        pt1 = pts[i]
-        pt2 = pts[(i + 1) % len(pts)]  # Next point (wrapping around)
-        
-        # Check if this segment is on the tile border
-        if is_tile_border_point(pt1) and is_tile_border_point(pt2):
-            border_segments.append((pt1, pt2))
-        else:
-            interior_segments.append((pt1, pt2))
-    
-    return border_segments, interior_segments
-
-def get_background_color(surface):
-    """Get the background color from the surface"""
-    # Get the color of the top-left pixel as background color
-    return surface.get_at((0, 0))[:3]  # RGB only, ignore alpha
-
-def create_error_tile(error_message="Error"):
-    """Create a tile surface indicating an error"""
-    surface = pygame.Surface((TILE_SIZE, TILE_SIZE))
-    surface.fill((255, 0, 0))  # Red background for errors
-    try:
-        font = pygame.font.SysFont(None, 24)
-        text = font.render(error_message, True, (255, 255, 255))
-        text_rect = text.get_rect(center=(TILE_SIZE//2, TILE_SIZE//2))
-        surface.blit(text, text_rect)
-    except Exception:
-        pass  # If even error rendering fails, just return red surface
-    return surface
-
-def load_png_tile(filepath):
-    """Load and render PNG tile with error recovery"""
-    try:
-        if not os.path.exists(filepath):
-            logger.warning(f"PNG file does not exist: {filepath}")
-            return create_error_tile("Missing")
-        
-        img = pygame.image.load(filepath)
-        if img is None:
-            logger.error(f"Failed to load PNG image: {filepath}")
-            return create_error_tile("Load Failed")
-            
-        img = pygame.transform.scale(img, (TILE_SIZE, TILE_SIZE))
-        surface = pygame.Surface((TILE_SIZE, TILE_SIZE))
-        surface.blit(img, (0, 0))
-        return surface
-    except pygame.error as e:
-        logger.error(f"Pygame error loading PNG {filepath}: {e}")
-        return create_error_tile("Pygame Error")
-    except Exception as e:
-        logger.error(f"Unexpected error loading PNG {filepath}: {e}")
-        return create_error_tile("Unknown Error")
-
-def parse_command_header(data, offset):
-    """Parse the command header and return number of commands"""
-    try:
-        num_cmds, offset = read_varint(data, offset)
-        return num_cmds, offset
-    except Exception as e:
-        logger.error(f"Error parsing command header: {e}")
-        return 0, offset
-
-def handle_color_command(cmd_type, data, offset, current_color):
-    """Handle color setting commands"""
-    if cmd_type == 0x80:  # SET_COLOR (direct RGB332)
-        if offset >= len(data):
-            return current_color, offset, True
-        current_color = data[offset]
-        offset += 1
-        return current_color, offset, True
-    elif cmd_type == 0x81:  # SET_COLOR_INDEX (palette index)
-        if offset >= len(data):
-            return current_color, offset, True
-        color_index, offset = read_varint(data, offset)
-        
-        # Convert index to RGB using global palette
-        if color_index in GLOBAL_PALETTE:
-            rgb = GLOBAL_PALETTE[color_index]
-            # Simulate RGB332 to maintain compatibility
-            current_color = ((rgb[0] & 0xE0) | ((rgb[1] & 0xE0) >> 3) | (rgb[2] >> 6))
-        else:
-            # Fallback if we don't have the palette
-            current_color = 255  # Default color
-            logger.warning(f"Unknown palette index {color_index}")
-        return current_color, offset, True
-    
-    return current_color, offset, False
-
-def draw_thick_line_rounded(surface, color, start_pos, end_pos, width):
-    """Draw a line with rounded ends"""
-    # Calculate direction vector
-    dx = end_pos[0] - start_pos[0]
-    dy = end_pos[1] - start_pos[1]
-    length = max(1, math.sqrt(dx*dx + dy*dy))  # Avoid division by zero
-    
-    # Normalize direction vector
-    dx /= length
-    dy /= length
-    
-    # Calculate perpendicular vector
-    px = -dy * width / 2
-    py = dx * width / 2
-    
-    # Create the rectangle points for the thick line
-    points = [
-        (start_pos[0] + px, start_pos[1] + py),
-        (start_pos[0] - px, start_pos[1] - py),
-        (end_pos[0] - px, end_pos[1] - py),
-        (end_pos[0] + px, end_pos[1] + py)
-    ]
-    
-    # Draw the rectangle (main line body)
-    pygame.draw.polygon(surface, color, points)
-    
-    # Draw rounded ends (circles at start and end)
-    pygame.draw.circle(surface, color, (int(start_pos[0]), int(start_pos[1])), width // 2)
-    pygame.draw.circle(surface, color, (int(end_pos[0]), int(end_pos[1])), width // 2)
-
-def draw_thick_polyline_rounded(surface, color, points, width):
-    """Draw a polyline with rounded joins and ends"""
-    if len(points) < 2:
-        return
-    
-    # Draw the line segments with rounded joins
-    for i in range(len(points) - 1):
-        draw_thick_line_rounded(surface, color, points[i], points[i + 1], width)
-    
-    # Draw rounded joints at intermediate points
-    for i in range(1, len(points) - 1):
-        pygame.draw.circle(surface, color, (int(points[i][0]), int(points[i][1])), width // 2)
-
-def render_polygon_command(data, offset, surface, rgb, fill_polygons, line_width):
-    """Render STROKE_POLYGON command con ancho de línea"""
-    n_pts, offset = read_varint(data, offset)
-    pts = []
-    x, y = 0, 0
-    for i in range(n_pts):
-        if i == 0:
-            x, offset = read_zigzag(data, offset)
-            y, offset = read_zigzag(data, offset)
-        else:
-            dx, offset = read_zigzag(data, offset)
-            dy, offset = read_zigzag(data, offset)
-            x += dx
-            y += dy
-        pts.append((uint16_to_tile_pixel(x), uint16_to_tile_pixel(y)))
-    
-    if fill_polygons and len(pts) >= 3:
-        pygame.draw.polygon(surface, rgb, pts, 0)
-        # Dibujar contorno con el ancho especificado
-        border_segments, interior_segments = get_polygon_border_segments(pts)
-        
-        # Dibujar segmentos de borde con color original
-        for pt1, pt2 in border_segments:
-            pygame.draw.line(surface, rgb, pt1, pt2, line_width)
-        
-        # Dibujar segmentos interiores con color oscurecido
-        for pt1, pt2 in interior_segments:
-            pygame.draw.line(surface, darken_color(rgb, 0.4), pt1, pt2, line_width)
-    elif not fill_polygons and len(pts) >= 2:
-        # Sin relleno: dibujar contorno con color original en interior, color de fondo en bordes
-        border_segments, interior_segments = get_polygon_border_segments(pts)
-        bg_color = get_background_color(surface)
-        
-        # Dibujar segmentos de borde con color de fondo
-        for pt1, pt2 in border_segments:
-            pygame.draw.line(surface, bg_color, pt1, pt2, line_width)
-        
-        # Dibujar segmentos interiores con color original
-        for pt1, pt2 in interior_segments:
-            pygame.draw.line(surface, rgb, pt1, pt2, line_width)
-    return offset
-
-def render_geometry_command(cmd_type, data, offset, surface, current_color, fill_mode, current_position, movement_vector, fill_polygons=False, show_tile_labels=False):
-    """Render geometry commands with rounded line caps and joins"""
-    rgb = rgb332_to_rgb888(current_color) if current_color is not None else (255, 255, 255)
-    
-    # Leer ancho de línea (por defecto 1)
-    line_width = 1
-    
-    # Si surface es None, solo saltar el renderizado pero procesar para obtener offset correcto
-    if surface is None:
-        if cmd_type == 1:  # LINE
-            line_width, offset = read_varint(data, offset)  # Leer ancho
-            _, offset = read_zigzag(data, offset)
-            _, offset = read_zigzag(data, offset)
-            _, offset = read_zigzag(data, offset)
-            _, offset = read_zigzag(data, offset)
-            return offset, current_position, movement_vector
-        elif cmd_type == 2:  # POLYLINE
-            line_width, offset = read_varint(data, offset)  # Leer ancho
-            n_pts, offset = read_varint(data, offset)
-            for _ in range(n_pts):
-                if _ == 0:
-                    _, offset = read_zigzag(data, offset)
-                    _, offset = read_zigzag(data, offset)
-                else:
-                    _, offset = read_zigzag(data, offset)
-                    _, offset = read_zigzag(data, offset)
-            return offset, current_position, movement_vector
-        elif cmd_type == 3:  # STROKE_POLYGON
-            line_width, offset = read_varint(data, offset)  # Leer ancho
-            n_pts, offset = read_varint(data, offset)
-            for _ in range(n_pts):
-                _, offset = read_zigzag(data, offset)
-                _, offset = read_zigzag(data, offset)
-            return offset, current_position, movement_vector
-        return offset, current_position, movement_vector
-    
-    if cmd_type == 1:  # LINE
-        line_width, offset = read_varint(data, offset)  # Leer ancho
-        x1, offset = read_zigzag(data, offset)
-        y1, offset = read_zigzag(data, offset)
-        dx, offset = read_zigzag(data, offset)
-        dy, offset = read_zigzag(data, offset)
-        x2 = x1 + dx
-        y2 = y1 + dy
-        p1 = (uint16_to_tile_pixel(x1), uint16_to_tile_pixel(y1))
-        p2 = (uint16_to_tile_pixel(x2), uint16_to_tile_pixel(y2))
-        
-        if line_width == 1:
-            pygame.draw.line(surface, rgb, p1, p2, line_width)
-        else:
-            draw_thick_line_rounded(surface, rgb, p1, p2, line_width)
-        current_position = (x2, y2)
-        movement_vector = (dx, dy)
-    elif cmd_type == 2:  # POLYLINE
-        line_width, offset = read_varint(data, offset)  # Leer ancho
-        n_pts, offset = read_varint(data, offset)
-        pts = []
-        x, y = 0, 0
-        for i in range(n_pts):
-            if i == 0:
-                x, offset = read_zigzag(data, offset)
-                y, offset = read_zigzag(data, offset)
-            else:
-                dx, offset = read_zigzag(data, offset)
-                dy, offset = read_zigzag(data, offset)
-                x += dx
-                y += dy
-            pts.append((uint16_to_tile_pixel(x), uint16_to_tile_pixel(y)))
-        if len(pts) >= 2:
-            if line_width == 1:
-                pygame.draw.lines(surface, rgb, False, pts, line_width)
-            else:
-                # Usar el método de líneas gruesas con joins redondos
-                draw_thick_polyline_rounded(surface, rgb, pts, line_width)
-            current_position = (x, y)
-    elif cmd_type == 3:  # STROKE_POLYGON
-        line_width, offset = read_varint(data, offset)  # Leer ancho
-        offset = render_polygon_command(data, offset, surface, rgb, fill_polygons, line_width)
-    else:
-        logger.warning(f"Unknown command type: {cmd_type} (0x{cmd_type:02x})")
-    
-    return offset, current_position, movement_vector
-
-def render_tile_surface(tile, bg_color, fill_mode, show_tile_labels=False):
-    """Main function to render tile surface from binary data with error recovery"""
-    try:
-        surface = pygame.Surface((TILE_SIZE, TILE_SIZE))
-        surface.fill(bg_color)
-        filepath = tile['file']
-        
-        if not filepath:
-            logger.error("No file path provided for tile")
-            return create_error_tile("No File")
-        
-        if filepath.endswith('.png'):
-            png_surface = load_png_tile(filepath)
-            if png_surface:
-                return png_surface
-            return surface
-
-        # Validate file exists and is readable
-        if not os.path.exists(filepath):
-            logger.warning(f"Tile file does not exist: {filepath}")
-            return create_error_tile("Missing")
-        
-        if not os.access(filepath, os.R_OK):
-            logger.error(f"Tile file is not readable: {filepath}")
-            return create_error_tile("No Access")
-
-        try:
-            with open(filepath, "rb") as f:
-                data = f.read()
-        except PermissionError as e:
-            logger.error(f"Permission denied reading {filepath}: {e}")
-            return create_error_tile("Permission")
-        except OSError as e:
-            logger.error(f"OS error reading {filepath}: {e}")
-            return create_error_tile("OS Error")
-        except Exception as e:
-            logger.error(f"Unexpected error reading {filepath}: {e}")
-            return create_error_tile("Read Error")
-
-        if len(data) < 1:
-            logger.warning(f"Empty tile file: {filepath}")
-            return surface
-
-        offset = 0
-        current_color = None
-        
-        # Initialize rendering state
-        current_position = (0, 0)
-        movement_vector = (0, 0)
-        
-        try:
-            num_cmds, offset = parse_command_header(data, offset)
-            
-            # Process commands in order
-            for cmd_idx in range(num_cmds):
-                if offset >= len(data):
-                    logger.warning(f"Command {cmd_idx} extends beyond data length in {filepath}")
-                    break
-                    
-                cmd_type, offset = read_varint(data, offset)
-                
-                # Handle color commands
-                current_color, offset, is_color_cmd = handle_color_command(cmd_type, data, offset, current_color)
-                if is_color_cmd:
-                    continue
-                
-                # Render geometry commands
-                fill_polygons = config.config.get('fill_polygons', False)
-                offset, current_position, movement_vector = render_geometry_command(
-                    cmd_type, data, offset, surface, current_color, fill_mode, current_position, movement_vector, fill_polygons, show_tile_labels
-                )
-                                     
-        except Exception as e:
-            logger.error(f"Error parsing commands in {filepath}: {e}")
-            logger.error(f"Error at offset: {offset}, data length: {len(data)}")
-            # Return partial surface instead of error tile for parsing errors
-            return surface
-
-        return surface
-        
-    except Exception as e:
-        logger.error(f"Critical error in render_tile_surface: {e}")
-        return create_error_tile("Critical")
-
-def center_viewport_on_central_tile(available_tiles):
-    if not available_tiles:
-        return 0, 0
-    xs = [x for x, y in available_tiles]
-    ys = [y for x, y in available_tiles]
-    min_x, max_x = min(xs), max(xs)
-    min_y, max_y = min(ys), max(ys)
-    center_x = (min_x + max_x) // 2
-    center_y = (min_y + max_y) // 2
-    viewport_x = center_x * TILE_SIZE - VIEWPORT_SIZE // 2
-    viewport_y = center_y * TILE_SIZE - VIEWPORT_SIZE // 2
-    return viewport_x, viewport_y
-
-def clamp_viewport(viewport_x, viewport_y, available_tiles):
-    if not available_tiles:
-        return viewport_x, viewport_y
-    xs = [x for x, y in available_tiles]
-    ys = [y for x, y in available_tiles]
-    min_x, max_x = min(xs), max(xs)
-    min_y, max_y = min(ys), max(ys)
-    viewport_x = max(min_x * TILE_SIZE, min(viewport_x, (max_x * TILE_SIZE + TILE_SIZE) - VIEWPORT_SIZE))
-    viewport_y = max(min_y * TILE_SIZE, min(viewport_y, (max_y * TILE_SIZE + TILE_SIZE) - VIEWPORT_SIZE))
-    return viewport_x, viewport_y
-
-def draw_button(surface, text, rect, bg_color, fg_color, border_color, font, icon=None, pressed=False):
-    """Draw a button with improved text handling and multi-line support"""
-    radius = 16
-    pygame.draw.rect(surface, bg_color, rect, border_radius=radius)
-    pygame.draw.rect(surface, border_color, rect, 2, border_radius=radius)
-    if pressed:
-        pygame.draw.rect(surface, border_color, rect, 4, border_radius=radius)
-    
-    # Calculate content area
-    content_x = rect.left + 12
-    content_y = rect.centery
-    icon_width = 0
-    
-    if icon is not None:
-        icon_rect = icon.get_rect()
-        icon_rect.centery = rect.centery
-        icon_rect.left = rect.left + 12
-        surface.blit(icon, icon_rect)
-        content_x = icon_rect.right + 8
-        icon_width = icon_rect.width + 8
-    
-    # Calculate available text width
-    max_text_width = rect.width - icon_width - 24  # 12px margin on each side
-    
-    # Split text into words for multi-line support
-    words = text.split()
-    if not words:
-        return
-    
-    # Use consistent font size (14px for better readability)
-    button_font = pygame.font.SysFont(None, 14)
-    line_height = button_font.get_height()
-    
-    # Calculate how many lines we need
-    lines = []
-    current_line = []
-    current_width = 0
-    
-    for word in words:
-        word_width = button_font.size(word + " ")[0]
-        if current_width + word_width <= max_text_width:
-            current_line.append(word)
-            current_width += word_width
-        else:
-            if current_line:
-                lines.append(" ".join(current_line))
-                current_line = [word]
-                current_width = word_width
-            else:
-                # Single word is too long, force it
-                lines.append(word)
-                current_line = []
-                current_width = 0
-    
-    if current_line:
-        lines.append(" ".join(current_line))
-    
-    # Limit to 2 lines maximum
-    if len(lines) > 2:
-        lines = lines[:2]
-        # If we have more than 2 lines, truncate the last line with "..."
-        if len(lines) == 2:
-            last_line = lines[1]
-            while button_font.size(last_line + "...")[0] > max_text_width and len(last_line) > 3:
-                last_line = last_line[:-1]
-            lines[1] = last_line + "..."
-    
-    # Calculate total text height
-    total_text_height = len(lines) * line_height
-    
-    # Center the text vertically
-    start_y = content_y - total_text_height // 2
-    
-    # Render each line
-    for i, line in enumerate(lines):
-        label = button_font.render(line, True, fg_color)
-        text_rect = label.get_rect(midleft=(content_x, start_y + i * line_height + line_height // 2))
-        surface.blit(label, text_rect)
-
-def show_status_progress_bar(surface, percent, text, font):
-    bar_max_width = WINDOW_WIDTH // 3
-    bar_height = 18
-    bar_margin_right = 24
-    bar_x = WINDOW_WIDTH - bar_max_width - bar_margin_right
-    bar_y = VIEWPORT_SIZE + STATUSBAR_HEIGHT // 2 - bar_height // 2
-    pygame.draw.rect(surface, (80, 80, 80), (bar_x, bar_y, bar_max_width, bar_height))
-    pygame.draw.rect(surface, (30, 160, 220), (bar_x, bar_y, int(bar_max_width * percent), bar_height))
-    pygame.draw.rect(surface, (120, 120, 120), (bar_x, bar_y, bar_max_width, bar_height), 2)
-    label = font.render(text, True, (255,255,255))
-    label_rect = label.get_rect(midleft=(bar_x + 8, bar_y + bar_height//2 - label.get_height()//2))
-    surface.blit(label, label_rect)
-
-def draw_tile_labels(
-    screen, font, available_tiles, viewport_x, viewport_y, zoom_level, background_color, show_tile_labels, directory, fill_polygons=False
-):
-    if not show_tile_labels:
-        return
-    fg = (0, 0, 0) if background_color == (255,255,255) else (255,255,255)
-    label_bg = (240,240,240) if background_color == (255,255,255) else (32,32,32)
-    border = (180,180,180) if background_color == (255,255,255) else (64,64,64)
-    outline = (120,120,120) if background_color == (255,255,255) else (220,220,220)
-    for x, y in available_tiles:
-        px = x * TILE_SIZE - viewport_x
-        py = y * TILE_SIZE - viewport_y
-        if px + TILE_SIZE < 0 or px > VIEWPORT_SIZE or py + TILE_SIZE < 0 or py > VIEWPORT_SIZE:
-            continue
-        filename = None
-        if os.path.isfile(f"{directory}/{x}/{y}.bin"):
-            filename = f"{y}.bin"
-        elif os.path.isfile(f"{directory}/{x}/{y}.png"):
-            filename = f"{y}.png"
-        else:
-            filename = f"{y}"
-        txt = f"x={x} y={y} z={zoom_level} {filename}"
-        label_surfs = [font.render(txt, True, fg)]
-        lw = max(s.get_width() for s in label_surfs)
-        lh = sum(s.get_height() for s in label_surfs)
-        margin = 2
-        label_rect = pygame.Rect(
-            px + margin, py + margin,
-            lw + margin * 2, lh + margin * 2
-        )
-        pygame.draw.rect(screen, label_bg, label_rect)
-        pygame.draw.rect(screen, border, label_rect, 1)
-        offset_y = label_rect.top + margin
-        for surf in label_surfs:
-            screen.blit(surf, (label_rect.left + margin, offset_y))
-            offset_y += surf.get_height()
-        # Draw tile borders when show_tile_labels is enabled
-        draw_dashed_rect(screen, pygame.Rect(px, py, TILE_SIZE, TILE_SIZE), outline, width=1)
-
-def draw_dashed_rect(surface, rect, color, dash_length=6, gap_length=4, width=1):
-    x = rect.left
-    while x < rect.right:
-        end_x = min(x + dash_length, rect.right)
-        pygame.draw.line(surface, color, (x, rect.top), (end_x, rect.top), width)
-        x += dash_length + gap_length
-    x = rect.left
-    while x < rect.right:
-        end_x = min(x + dash_length, rect.right)
-        pygame.draw.line(surface, color, (x, rect.bottom-1), (end_x, rect.bottom-1), width)
-        x += dash_length + gap_length
-    y = rect.top
-    while y < rect.bottom:
-        end_y = min(y + dash_length, rect.bottom)
-        pygame.draw.line(surface, color, (rect.left, y), (rect.left, end_y), width)
-        y += dash_length + gap_length
-    y = rect.top
-    while y < rect.bottom:
-        end_y = min(y + dash_length, rect.bottom)
-        pygame.draw.line(surface, color, (rect.right-1, y), (rect.right-1, end_y), width)
-        y += dash_length + gap_length
-
-def pixel_to_latlon(px, py, viewport_x, viewport_y, zoom):
-    """Convert pixel coordinates to lat/lon"""
-    map_px = viewport_x + px
-    map_py = viewport_y + py
-    tile_x = map_px / TILE_SIZE
-    tile_y = map_py / TILE_SIZE
+def deg2num(lat_deg: float, lon_deg: float, zoom: int) -> Tuple[float, float]:
+    """Convert lat/lon to tile numbers."""
+    lat_rad = math.radians(lat_deg)
     n = 2.0 ** zoom
-    lon_deg = tile_x / n * 360.0 - 180.0
-    lat_rad = math.atan(math.sinh(math.pi * (1 - 2 * tile_y / n)))
+    xtile = (lon_deg + 180.0) / 360.0 * n
+    ytile = (1.0 - math.log(math.tan(lat_rad) + 1.0 / math.cos(lat_rad)) / math.pi) / 2.0 * n
+    return xtile, ytile
+
+
+def num2deg(xtile: float, ytile: float, zoom: int) -> Tuple[float, float]:
+    """Convert tile numbers to lat/lon."""
+    n = 2.0 ** zoom
+    lon_deg = xtile / n * 360.0 - 180.0
+    lat_rad = math.atan(math.sinh(math.pi * (1 - 2 * ytile / n)))
     lat_deg = math.degrees(lat_rad)
     return lat_deg, lon_deg
 
-def latlon_to_pixel(lat, lon, zoom):
-    """Convert lat/lon to pixel coordinates"""
-    n = 2.0 ** zoom
-    x = (lon + 180.0) / 360.0 * n
-    y = (1 - math.asinh(math.tan(math.radians(lat))) / math.pi) / 2 * n
-    map_px = x * TILE_SIZE
-    map_py = y * TILE_SIZE
-    return map_px, map_py
 
-def decimal_to_gms(decimal, is_latitude=True):
-    sign = ""
-    if is_latitude:
-        sign = "N" if decimal >= 0 else "S"
-    else:
-        sign = "E" if decimal >= 0 else "W"
-    decimal = abs(decimal)
-    degrees = int(decimal)
-    minutes_full = (decimal - degrees) * 60
-    minutes = int(minutes_full)
-    seconds = (minutes_full - minutes) * 60
-    return f"{degrees}°{minutes}'{seconds:.2f}\" {sign}"
+def get_bbox_for_viewport(center_lat: float, center_lon: float, zoom: int) -> Tuple[float, float, float, float]:
+    """Calculate bounding box for 3x3 tile viewport."""
+    center_x, center_y = deg2num(center_lat, center_lon, zoom)
+    center_tile_x = int(center_x)
+    center_tile_y = int(center_y)
 
-def main(base_dir):
-    # Try to load palette from palette.bin first, then fallback to features.json
-    palette_file = "palette.bin"
-    config_file = "features.json"
-    
-    if os.path.exists(palette_file):
-        if load_global_palette_from_bin(palette_file):
-            logger.info("Loaded palette from palette.bin")
-        else:
-            logger.warning("Failed to load palette.bin, trying features.json")
-            if os.path.exists(config_file):
-                load_global_palette_from_config(config_file)
+    min_tile_x = center_tile_x - 1
+    max_tile_x = center_tile_x + 2
+    min_tile_y = center_tile_y - 1
+    max_tile_y = center_tile_y + 2
+
+    max_lat, min_lon = num2deg(min_tile_x, min_tile_y, zoom)
+    min_lat, max_lon = num2deg(max_tile_x, max_tile_y, zoom)
+    return (min_lon, min_lat, max_lon, max_lat)
+
+
+def latlon_to_pixel(lat: float, lon: float, bbox: Tuple[float, float, float, float]) -> Tuple[int, int]:
+    """Convert lat/lon to pixel coordinates."""
+    min_lon, min_lat, max_lon, max_lat = bbox
+    x_norm = (lon - min_lon) / (max_lon - min_lon)
+    y_norm = (max_lat - lat) / (max_lat - min_lat)
+    px = int(x_norm * VIEWPORT_SIZE)
+    py = int(y_norm * VIEWPORT_SIZE)
+    return px, py
+
+
+def rgb565_to_rgb888(c: int) -> Tuple[int, int, int]:
+    """Convert RGB565 to RGB888."""
+    r = ((c >> 11) & 0x1F) << 3
+    g = ((c >> 5) & 0x3F) << 2
+    b = (c & 0x1F) << 3
+    return (r, g, b)
+
+
+def darken_color(rgb: Tuple[int, int, int], amount: float = 0.3) -> Tuple[int, int, int]:
+    """Darken RGB color."""
+    return tuple(max(0, int(v * (1 - amount))) for v in rgb)
+
+
+class NavFeature:
+    """Parsed NAV feature."""
+    def __init__(self):
+        self.geom_type = 0
+        self.color_rgb565 = 0xFFFF
+        self.zoom_priority = 0
+        self.width = 1  # Line width in pixels (NAV v2)
+        self.coords = []  # List of (lon, lat) floats
+
+    @property
+    def min_zoom(self):
+        return self.zoom_priority >> 4
+
+    @property
+    def priority(self):
+        return (self.zoom_priority & 0x0F) * 7
+
+
+def read_nav_tile(path: str) -> List[NavFeature]:
+    """Read NAV tile file and return list of features."""
+    features = []
+
+    try:
+        with open(path, 'rb') as f:
+            # Read header (22 bytes)
+            magic = f.read(4)
+            if magic != NAV_MAGIC:
+                logger.warning(f"Invalid magic in {path}")
+                return features
+
+            feature_count = struct.unpack('<H', f.read(2))[0]
+            f.read(16)  # bbox (unused)
+
+            # Read features
+            for _ in range(feature_count):
+                feature = NavFeature()
+
+                # Feature header (7 bytes)
+                feature.geom_type = struct.unpack('<B', f.read(1))[0]
+                feature.color_rgb565 = struct.unpack('<H', f.read(2))[0]
+                feature.zoom_priority = struct.unpack('<B', f.read(1))[0]
+                feature.width = struct.unpack('<B', f.read(1))[0]
+                coord_count = struct.unpack('<H', f.read(2))[0]
+
+                # Read coordinates
+                for _ in range(coord_count):
+                    lon_int = struct.unpack('<i', f.read(4))[0]
+                    lat_int = struct.unpack('<i', f.read(4))[0]
+                    lon = lon_int / COORD_SCALE
+                    lat = lat_int / COORD_SCALE
+                    feature.coords.append((lon, lat))
+
+                # For polygons, skip ring info (unused)
+                if feature.geom_type == GEOM_POLYGON:
+                    ring_count = struct.unpack('<B', f.read(1))[0]
+                    f.read(ring_count * 2)  # skip ring ends
+
+                features.append(feature)
+
+    except (OSError, struct.error, ValueError) as e:
+        logger.warning(f"Error reading tile {path}: {e}")
+        return features  # Return empty list instead of continuing
+
+    return features
+
+
+class NAVViewer:
+    """NAV tile viewer."""
+
+    def __init__(self, nav_dir: str):
+        self.nav_dir = nav_dir
+        self.available_zooms: Set[int] = set()
+        self._index_tiles()
+
+        self.center_lat = 0.0
+        self.center_lon = 0.0
+        self.zoom = 14
+        self.bbox = None
+        self.background_color = (255, 255, 255)
+        self.fill_polygons = True
+        self.show_tile_grid = False
+        self.last_query_stats = {}
+        self.cached_features = None
+        self.selected_feature = None
+        self.last_viewport_key = None  # Key para detectar cambios en viewport
+        self.cached_query_features = []  # Cache de features query
+
+    def _index_tiles(self):
+        """Index available zoom levels."""
+        if not os.path.isdir(self.nav_dir):
+            logger.error(f"Directory not found: {self.nav_dir}")
+            return
+
+        for name in os.listdir(self.nav_dir):
+            zoom_path = os.path.join(self.nav_dir, name)
+            if os.path.isdir(zoom_path) and name.isdigit():
+                zoom = int(name)
+                for x_name in os.listdir(zoom_path):
+                    x_path = os.path.join(zoom_path, x_name)
+                    if os.path.isdir(x_path) and x_name.isdigit():
+                        self.available_zooms.add(zoom)
+                        break
+
+        if self.available_zooms:
+            zooms_str = ", ".join(map(str, sorted(self.available_zooms)))
+            logger.info(f"Available zoom levels: {zooms_str}")
+
+    def _get_tiles_for_viewport(self) -> List[Tuple[int, int]]:
+        """Get list of tiles for current viewport."""
+        center_x, center_y = deg2num(self.center_lat, self.center_lon, self.zoom)
+        center_tile_x = int(center_x)
+        center_tile_y = int(center_y)
+
+        tiles = []
+        for dy in range(-1, 2):
+            for dx in range(-1, 2):
+                tile_x = center_tile_x + dx
+                tile_y = center_tile_y + dy
+                max_tile = 2 ** self.zoom - 1
+                if 0 <= tile_x <= max_tile and 0 <= tile_y <= max_tile:
+                    tiles.append((tile_x, tile_y))
+
+        return tiles
+
+    def _get_tile_path(self, x: int, y: int) -> str:
+        """Get file path for a tile."""
+        return os.path.join(self.nav_dir, str(self.zoom), str(x), f"{y}.nav")
+
+    def set_center(self, lat: float, lon: float, zoom: int = None):
+        """Set viewport center."""
+        self.center_lat = lat
+        self.center_lon = lon
+        if zoom is not None:
+            self.zoom = zoom
+        self.bbox = get_bbox_for_viewport(self.center_lat, self.center_lon, self.zoom)
+        # Invalidate cache when viewport changes
+        self.last_viewport_key = None
+        self.cached_query_features = []
+
+    def query_features(self) -> List[NavFeature]:
+        """Query features from tiles."""
+        if self.bbox is None:
+            return []
+
+        # Check cache
+        current_key = (self.zoom, round(self.center_lat, 6), round(self.center_lon, 6))
+        if self.last_viewport_key == current_key and self.cached_query_features:
+            return self.cached_query_features
+
+        start = time.time()
+
+        tiles = self._get_tiles_for_viewport()
+        all_features = []
+        tiles_loaded = 0
+        tiles_missing = 0
+
+        for tile_x, tile_y in tiles:
+            tile_path = self._get_tile_path(tile_x, tile_y)
+            if os.path.exists(tile_path):
+                features = read_nav_tile(tile_path)
+                # Filter by zoom
+                features = [f for f in features if f.min_zoom <= self.zoom]
+                all_features.extend(features)
+                tiles_loaded += 1
             else:
-                logger.info(f"Features file {config_file} not found, using fallback colors")
-    elif os.path.exists(config_file):
-        load_global_palette_from_config(config_file)
-    else:
-        logger.info(f"Features file {config_file} not found, using fallback colors")
+                tiles_missing += 1
 
-    zoom_dirs = [d for d in os.listdir(base_dir) if os.path.isdir(os.path.join(base_dir, d)) and d.isdigit()]
-    zoom_levels_list = sorted([int(d) for d in zoom_dirs])
-    if not zoom_levels_list:
-        logger.error(f"No zoom level directories found in {base_dir}")
+        elapsed = (time.time() - start) * 1000
+
+        self.last_query_stats = {
+            'tiles_loaded': tiles_loaded,
+            'tiles_missing': tiles_missing,
+            'features': len(all_features),
+            'time_ms': elapsed
+        }
+
+        # Update cache
+        self.last_viewport_key = current_key
+        self.cached_query_features = all_features
+
+        return all_features
+
+    def render_to_surface(self, surface: pygame.Surface):
+        """Render features to pygame surface."""
+        if self.bbox is None:
+            return
+
+        surface.fill(self.background_color)
+
+        features = self.query_features()
+        if not features:
+            self.cached_features = None
+            return
+
+        # Sort by priority (needed when combining multiple tiles)
+        features.sort(key=lambda f: f.priority)
+        self.cached_features = features
+
+        for feature in features:
+            self._render_feature(surface, feature)
+
+        if self.show_tile_grid:
+            self._draw_tile_grid(surface)
+
+    def _render_feature(self, surface: pygame.Surface, feature: NavFeature):
+        """Render a single feature."""
+        if not feature.coords:
+            return
+
+        color = rgb565_to_rgb888(feature.color_rgb565)
+
+        if feature.geom_type == GEOM_POINT:
+            self._render_point(surface, feature, color)
+        elif feature.geom_type == GEOM_LINESTRING:
+            self._render_linestring(surface, feature, color)
+        elif feature.geom_type == GEOM_POLYGON:
+            self._render_polygon(surface, feature, color)
+
+    def _render_point(self, surface: pygame.Surface, feature: NavFeature, color: Tuple[int, int, int]):
+        """Render point."""
+        if feature.coords:
+            lon, lat = feature.coords[0]
+            px, py = latlon_to_pixel(lat, lon, self.bbox)
+            if 0 <= px < VIEWPORT_SIZE and 0 <= py < VIEWPORT_SIZE:
+                pygame.draw.circle(surface, color, (px, py), 3)
+
+    def _render_linestring(self, surface: pygame.Surface, feature: NavFeature, color: Tuple[int, int, int]):
+        """Render linestring with width and round joins."""
+        points = []
+        for lon, lat in feature.coords:
+            px, py = latlon_to_pixel(lat, lon, self.bbox)
+            points.append((px, py))
+
+        if len(points) >= 2:
+            width = max(1, feature.width)
+            pygame.draw.lines(surface, color, False, points, width)
+            # Add round joins for thick lines
+            if width > 2:
+                radius = width // 2
+                for px, py in points:
+                    pygame.draw.circle(surface, color, (px, py), radius)
+
+    def _render_polygon(self, surface: pygame.Surface, feature: NavFeature, color: Tuple[int, int, int]):
+        """Render polygon."""
+        points = []
+        for lon, lat in feature.coords:
+            px, py = latlon_to_pixel(lat, lon, self.bbox)
+            points.append((px, py))
+
+        if len(points) >= 3:
+            if self.fill_polygons:
+                pygame.draw.polygon(surface, color, points)
+                border_color = darken_color(color, 0.4)
+                pygame.draw.polygon(surface, border_color, points, 1)
+            else:
+                pygame.draw.polygon(surface, color, points, 1)
+
+    def _draw_tile_grid(self, surface: pygame.Surface):
+        """Draw tile grid overlay."""
+        grid_color = (100, 100, 100)
+        font = pygame.font.SysFont(None, 14)
+
+        for i in range(4):
+            x = i * TILE_SIZE
+            pygame.draw.line(surface, grid_color, (x, 0), (x, VIEWPORT_SIZE), 1)
+        for i in range(4):
+            y = i * TILE_SIZE
+            pygame.draw.line(surface, grid_color, (0, y), (VIEWPORT_SIZE, y), 1)
+
+        tiles = self._get_tiles_for_viewport()
+        center_x, center_y = deg2num(self.center_lat, self.center_lon, self.zoom)
+        center_tile_x = int(center_x)
+        center_tile_y = int(center_y)
+
+        for dy in range(-1, 2):
+            for dx in range(-1, 2):
+                tile_x = center_tile_x + dx
+                tile_y = center_tile_y + dy
+                screen_x = (dx + 1) * TILE_SIZE + 5
+                screen_y = (dy + 1) * TILE_SIZE + 5
+                tile_path = self._get_tile_path(tile_x, tile_y)
+                exists = os.path.exists(tile_path)
+                color = (0, 100, 0) if exists else (150, 50, 50)
+                label = font.render(f"{tile_x}/{tile_y}", True, color)
+                surface.blit(label, (screen_x, screen_y))
+
+    def identify_feature_at(self, pixel_x: int, pixel_y: int) -> Optional[dict]:
+        """Identify feature at pixel coordinates."""
+        if self.cached_features is None or self.bbox is None:
+            return None
+
+        min_lon, min_lat, max_lon, max_lat = self.bbox
+        lon = min_lon + (pixel_x / VIEWPORT_SIZE) * (max_lon - min_lon)
+        lat = max_lat - (pixel_y / VIEWPORT_SIZE) * (max_lat - min_lat)
+
+        # Search in reverse priority order
+        for feature in reversed(self.cached_features):
+            if self._point_in_feature(lon, lat, feature):
+                return {
+                    'color': f"#{rgb565_to_rgb888(feature.color_rgb565)[0]:02x}{rgb565_to_rgb888(feature.color_rgb565)[1]:02x}{rgb565_to_rgb888(feature.color_rgb565)[2]:02x}",
+                    'min_zoom': feature.min_zoom,
+                    'priority': feature.priority,
+                    'geom_type': ['?', 'Point', 'Line', 'Polygon'][feature.geom_type],
+                    'coords': len(feature.coords)
+                }
+
+        return None
+
+    def _point_in_feature(self, lon: float, lat: float, feature: NavFeature) -> bool:
+        """Check if point is in/near feature."""
+        if feature.geom_type == GEOM_POLYGON:
+            # Simple point-in-polygon test
+            n = len(feature.coords)
+            inside = False
+            j = n - 1
+            for i in range(n):
+                xi, yi = feature.coords[i]
+                xj, yj = feature.coords[j]
+                if ((yi > lat) != (yj > lat)) and (lon < (xj - xi) * (lat - yi) / (yj - yi) + xi):
+                    inside = not inside
+                j = i
+            return inside
+        elif feature.geom_type == GEOM_LINESTRING:
+            # Check distance to line segments
+            tolerance = (self.bbox[2] - self.bbox[0]) / VIEWPORT_SIZE * 5
+            for i in range(len(feature.coords) - 1):
+                x1, y1 = feature.coords[i]
+                x2, y2 = feature.coords[i + 1]
+                dist = self._point_to_segment_dist(lon, lat, x1, y1, x2, y2)
+                if dist < tolerance:
+                    return True
+        elif feature.geom_type == GEOM_POINT and feature.coords:
+            x, y = feature.coords[0]
+            tolerance = (self.bbox[2] - self.bbox[0]) / VIEWPORT_SIZE * 10
+            if abs(lon - x) < tolerance and abs(lat - y) < tolerance:
+                return True
+        return False
+
+    def _point_to_segment_dist(self, px, py, x1, y1, x2, y2):
+        """Calculate distance from point to line segment."""
+        dx = x2 - x1
+        dy = y2 - y1
+        if dx == 0 and dy == 0:
+            return math.sqrt((px - x1)**2 + (py - y1)**2)
+        t = max(0, min(1, ((px - x1) * dx + (py - y1) * dy) / (dx * dx + dy * dy)))
+        proj_x = x1 + t * dx
+        proj_y = y1 + t * dy
+        return math.sqrt((px - proj_x)**2 + (py - proj_y)**2)
+
+
+def draw_button(surface, text, rect, bg_color, fg_color, border_color, font):
+    """Draw a button."""
+    pygame.draw.rect(surface, bg_color, rect, border_radius=8)
+    pygame.draw.rect(surface, border_color, rect, 2, border_radius=8)
+    label = font.render(text, True, fg_color)
+    text_rect = label.get_rect(center=rect.center)
+    surface.blit(label, text_rect)
+
+
+def main():
+    parser = argparse.ArgumentParser(description='NAV Tile Viewer')
+    parser.add_argument('nav_dir', help='Directory with NAV tiles')
+    parser.add_argument('--lat', type=float, required=True, help='Center latitude')
+    parser.add_argument('--lon', type=float, required=True, help='Center longitude')
+    parser.add_argument('--zoom', type=int, default=14, help='Zoom level')
+
+    args = parser.parse_args()
+
+    if not PYGAME_AVAILABLE:
+        logger.error("pygame required")
         sys.exit(1)
-    min_zoom = zoom_levels_list[0]
-    max_zoom = zoom_levels_list[-1]
-    zoom_levels = list(range(min_zoom, max_zoom+1))
-    zoom_idx = 0
 
-    background_color = (0, 0, 0)
-    button_color = (0, 0, 0)
-    button_fg = (255, 255, 255)
-    button_border = (100,100,100)
-
-    toolbar_x = VIEWPORT_SIZE
-    toolbar_y = 0
-    button_height = 40
-    button_margin = 16
-    button_rect = pygame.Rect(toolbar_x + 30, toolbar_y + button_margin, 100, button_height)
-    tile_label_button_rect = pygame.Rect(toolbar_x + 30, toolbar_y + button_margin * 2 + button_height, 100, button_height)
-    gps_button_rect = pygame.Rect(toolbar_x + 30, toolbar_y + button_margin * 3 + button_height * 2, 100, button_height)
-    fill_button_rect = pygame.Rect(toolbar_x + 30, toolbar_y + button_margin * 4 + button_height * 3, 100, button_height)
-
-    button_text_black = "Black"
-    button_text_white = "White"
-    button_pressed = False
-
-    show_tile_labels = False
-    show_gps_tooltip = False
+    viewer = NAVViewer(args.nav_dir)
+    viewer.set_center(args.lat, args.lon, args.zoom)
 
     pygame.init()
     screen = pygame.display.set_mode((WINDOW_WIDTH, WINDOW_HEIGHT))
-    pygame.display.set_caption(f"Tile viewer - MAP {os.path.basename(base_dir)}")
-    font = pygame.font.SysFont(None, 16)
-    font_main = pygame.font.SysFont(None, 18)
-    font_b = pygame.font.SysFont(None, 16)
-    font_status = pygame.font.SysFont(None, 14)
+    pygame.display.set_caption(f"NAV Viewer - {os.path.basename(args.nav_dir)}")
+
+    font = pygame.font.SysFont(None, 18)
+    font_small = pygame.font.SysFont(None, 14)
     clock = pygame.time.Clock()
 
-    available_tiles = set()
+    viewport_surface = pygame.Surface((VIEWPORT_SIZE, VIEWPORT_SIZE))
 
-    icon_bg, icon_label, icon_gps, icon_fill = get_button_icons()
+    button_margin = 10
+    button_height = 35
+    button_width = TOOLBAR_WIDTH - 20
 
-    mouse_gps_coords = None
-    mouse_gps_rect = None
-
-    show_index_progress = False
-    index_progress_percent = 0.0
-    index_progress_text = ""
-    index_progress_done_drawn = False
-    show_render_progress = False
-    render_progress_percent = 0.0
-    render_progress_text = ""
-    render_progress_done_drawn = False
-
-    tiles_loading = False
-    tiles_loading_lock = threading.Lock()
-    need_redraw = True
-    zoom_change_pending = False
-    zoom_change_params = None
-
-    def status_index_progress_callback(percent, text):
-        nonlocal show_index_progress, index_progress_percent, index_progress_text, need_redraw
-        show_index_progress = True
-        index_progress_percent = percent
-        index_progress_text = text
-        need_redraw = True
-
-    def hide_index_progress():
-        nonlocal show_index_progress, index_progress_percent, index_progress_text, need_redraw, index_progress_done_drawn
-        if index_progress_done_drawn:
-            show_index_progress = False
-            index_progress_percent = 0.0
-            index_progress_text = ""
-            index_progress_done_drawn = False
-            need_redraw = True
-
-    def status_render_progress_callback(percent, text):
-        nonlocal show_render_progress, render_progress_percent, render_progress_text, need_redraw
-        show_render_progress = True
-        render_progress_percent = percent
-        render_progress_text = text
-        need_redraw = True
-
-    def hide_render_progress():
-        nonlocal show_render_progress, render_progress_percent, render_progress_text, need_redraw, render_progress_done_drawn
-        if render_progress_done_drawn:
-            show_render_progress = False
-            render_progress_percent = 0.0
-            render_progress_text = ""
-            render_progress_done_drawn = False
-            need_redraw = True
-
-    def load_available_tiles(level, progress_callback=None):
-        directory = os.path.join(base_dir, str(level))
-        available = index_available_tiles(directory, progress_callback)
-        return available, directory
-
-    def get_tile_surface(x, y, zoom_level, directory, bg_color, fill_mode, show_tile_labels=False):
-        """Get tile surface with lazy loading - only load if visible"""
-        key = (zoom_level, x, y, bg_color, fill_mode)
-        if (x, y) not in available_tiles:
-            return None
-        
-        # Try to get from cache first
-        cached_surface = tile_cache.get(key)
-        if cached_surface is not None:
-            return cached_surface
-        
-        # Only load if tile is visible (lazy loading)
-        if not is_tile_visible(x, y, viewport_x, viewport_y):
-            logger.debug(f"Skipping lazy load for non-visible tile ({x}, {y})")
-            return None
-        
-        # Load and cache the surface
-        tile_file = get_tile_file(directory, x, y)
-        if not tile_file:
-            return None
-        
-        surface = render_tile_surface({'x': x, 'y': y, 'file': tile_file}, bg_color, fill_mode, show_tile_labels)
-        tile_cache.put(key, surface)
-        return surface
-
-    def preload_tile_surfaces_threaded(tile_list, zoom_level, directory, bg_color, fill_mode, progress_callback=None, done_callback=None):
-        """Preload tiles using the persistent thread pool"""
-        total = len(tile_list)
-        completed_count = 0
-        
-        def progress_callback_wrapper(future):
-            nonlocal completed_count
-            completed_count += 1
-            if progress_callback is not None:
-                percent = completed_count / max(total, 1)
-                progress_callback(percent, "Loading visible tiles...")
-            
-            if completed_count >= total and done_callback:
-                done_callback()
-        
-        # Submit all tiles to the persistent thread pool
-        for x, y in tile_list:
-            tile_info = (x, y, zoom_level, directory, bg_color, fill_mode)
-            tile_loader.submit_tile_load(tile_info, progress_callback_wrapper)
-        
-        return None  # No thread to return since we use persistent pool
-
-    def set_tiles_loading(flag):
-        nonlocal tiles_loading, need_redraw
-        with tiles_loading_lock:
-            tiles_loading = flag
-            need_redraw = True
-
-    def start_zoom_change(idx, last_mouse_pos, viewport_x, viewport_y, old_zoom_idx):
-        nonlocal zoom_change_pending, zoom_change_params
-        zoom_change_pending = True
-        zoom_change_params = (idx, last_mouse_pos, viewport_x, viewport_y, old_zoom_idx)
-
-    show_index_progress = True
-    index_progress_percent = 0.0
-    index_progress_text = "Indexing initial tiles..."
-    available_tiles, directory = load_available_tiles(zoom_levels[zoom_idx], status_index_progress_callback)
-    hide_index_progress()
-    viewport_x, viewport_y = center_viewport_on_central_tile(available_tiles)
+    bg_button_rect = pygame.Rect(VIEWPORT_SIZE + 10, button_margin, button_width, button_height)
+    fill_button_rect = pygame.Rect(VIEWPORT_SIZE + 10, button_margin * 2 + button_height, button_width, button_height)
+    grid_button_rect = pygame.Rect(VIEWPORT_SIZE + 10, button_margin * 3 + button_height * 2, button_width, button_height)
 
     dragging = False
     drag_start = None
+    drag_center_start = None
+    need_redraw = True
     running = True
-    last_mouse_pos = (VIEWPORT_SIZE // 2, VIEWPORT_SIZE // 2)
+    pan_speed_base = 0.01
 
     while running:
-        if zoom_change_pending and not tiles_loading:
-            idx, last_mouse_pos_z, old_vx, old_vy, old_zoom_idx = zoom_change_params
-            show_index_progress = True
-            index_progress_percent = 0.0
-            index_progress_text = "Indexing tiles..."
-            index_progress_done_drawn = False
-            available_tiles, directory = load_available_tiles(zoom_levels[idx], status_index_progress_callback)
-            if idx > old_zoom_idx:
-                lat, lon = pixel_to_latlon(last_mouse_pos_z[0], last_mouse_pos_z[1], old_vx, old_vy, zoom_levels[idx-1])
-            else:
-                lat, lon = pixel_to_latlon(last_mouse_pos_z[0], last_mouse_pos_z[1], old_vx, old_vy, zoom_levels[idx+1])
-            map_px, map_py = latlon_to_pixel(lat, lon, zoom_levels[idx])
-            viewport_x, viewport_y = int(map_px - last_mouse_pos_z[0]), int(map_py - last_mouse_pos_z[1])
-            viewport_x, viewport_y = clamp_viewport(viewport_x, viewport_y, available_tiles)
-            zoom_idx = idx
-            zoom_change_pending = False
-            need_redraw = True
-            logger.info(f"Changed to zoom level {zoom_levels[zoom_idx]}")
-
-        mx, my = pygame.mouse.get_pos()
-        if show_gps_tooltip and 0 <= mx < VIEWPORT_SIZE and 0 <= my < VIEWPORT_SIZE:
-            lat, lon = pixel_to_latlon(mx, my, viewport_x, viewport_y, zoom_levels[zoom_idx])
-            mouse_gps_coords = (lat, lon)
-            mouse_gps_rect = (mx, my)
-        else:
-            mouse_gps_coords = None
-            mouse_gps_rect = None
-
-        screen.fill((70,70,70))
-        pygame.draw.rect(screen, background_color, (0,0,VIEWPORT_SIZE,VIEWPORT_SIZE))
-
-        if available_tiles:
-            xs = [x for x, y in available_tiles]
-            ys = [y for x, y in available_tiles]
-            min_x = max_x = min_y = max_y = 0
-            if xs and ys:
-                min_x, max_x = min(xs), max(xs)
-                min_y, max_y = min(ys), max(ys)
-        else:
-            min_x = max_x = min_y = max_y = 0
-
-        # Get visible tiles using the new function
-        visible_tiles = get_visible_tiles(available_tiles, viewport_x, viewport_y)
-
-        # Only check for uncached tiles among visible ones (lazy loading)
-        uncached_tiles = []
-        fill_polygons = config.config.get('fill_polygons', False)
-        for x, y in visible_tiles:
-            key = (zoom_levels[zoom_idx], x, y, background_color, fill_polygons)
-            if tile_cache.get(key) is None:
-                uncached_tiles.append((x, y))
-
-        if uncached_tiles and not tiles_loading:
-            set_tiles_loading(True)
-            show_render_progress = True
-            render_progress_percent = 0.0
-            render_progress_text = "Loading visible tiles..."
-            def done_callback():
-                set_tiles_loading(False)
-            preload_tile_surfaces_threaded(
-                uncached_tiles, zoom_levels[zoom_idx], directory, background_color, fill_polygons,
-                status_render_progress_callback, done_callback
-            )
-
-        for x, y in visible_tiles:
-            surf = get_tile_surface(x, y, zoom_levels[zoom_idx], directory, background_color, fill_polygons, show_tile_labels)
-            if surf:
-                px = x * TILE_SIZE - viewport_x
-                py = y * TILE_SIZE - viewport_y
-                screen.blit(surf, (px, py))
-
-        draw_tile_labels(
-            screen, font, available_tiles, viewport_x, viewport_y, zoom_levels[zoom_idx], background_color, show_tile_labels, directory, fill_polygons
-        )
-        pygame.draw.rect(screen, (0,0,0), (toolbar_x, toolbar_y, TOOLBAR_WIDTH, VIEWPORT_SIZE))
-        pygame.draw.line(screen, (160,160,160), (toolbar_x,0), (toolbar_x, VIEWPORT_SIZE))
-        draw_button(
-            screen,
-            button_text_black if background_color == (255, 255, 255) else button_text_white,
-            button_rect, button_color, button_fg, button_border, font_b,
-            icon=icon_bg, pressed=button_pressed
-        )
-        label_btn_text = "Tile labels ON" if show_tile_labels else "Tile labels OFF"
-        draw_button(
-            screen, label_btn_text, tile_label_button_rect, button_color, button_fg, button_border, font_b,
-            icon=icon_label, pressed=False
-        )
-        gps_btn_text = "GPS Cursor ON" if show_gps_tooltip else "GPS Cursor OFF"
-        draw_button(
-            screen, gps_btn_text, gps_button_rect, button_color, button_fg, button_border, font_b,
-            icon=icon_gps, pressed=False
-        )
-        
-        # Polygon fill button
-        fill_polygons = config.config.get('fill_polygons', False)
-        fill_btn_text = "Fill Polygons ON" if fill_polygons else "Fill Polygons OFF"
-        draw_button(
-            screen, fill_btn_text, fill_button_rect, button_color, button_fg, button_border, font_b,
-            icon=icon_fill, pressed=False
-        )
-        pygame.draw.rect(screen, (0,0,0), (0, VIEWPORT_SIZE, WINDOW_WIDTH, STATUSBAR_HEIGHT))
-        pygame.draw.line(screen, (160,160,160), (0, VIEWPORT_SIZE), (WINDOW_WIDTH, VIEWPORT_SIZE))
-        zoom_text = f"Zoom level: {zoom_levels[zoom_idx]}"
-        zoom_img = font_status.render(zoom_text, True, (255,255,255))
-        screen.blit(zoom_img, (16, VIEWPORT_SIZE + STATUSBAR_HEIGHT//2 - zoom_img.get_height()//2))
-
-        if show_gps_tooltip and mouse_gps_coords is not None:
-            lat, lon = mouse_gps_coords[0], mouse_gps_coords[1]
-            lat_gms = decimal_to_gms(lat, is_latitude=True)
-            lon_gms = decimal_to_gms(lon, is_latitude=False)
-            txt = f"lat: {lat:.6f} ({lat_gms})\nlon: {lon:.6f} ({lon_gms})"
-            tooltip_lines = txt.split('\n')
-            tooltip_surfs = [font.render(line, True, (255,255,255)) for line in tooltip_lines]
-            tw = max(s.get_width() for s in tooltip_surfs)
-            th = sum(s.get_height() for s in tooltip_surfs)
-            tm = 4
-            mx, my = mouse_gps_rect[:2]
-            tooltip_rect = pygame.Rect(mx+10, my+10, tw+tm*2, th+tm*2)
-            pygame.draw.rect(screen, (0,0,0), tooltip_rect)
-            pygame.draw.rect(screen, (200,200,200), tooltip_rect, 1)
-            yoff = tooltip_rect.top + tm
-            for surf in tooltip_surfs:
-                screen.blit(surf, (tooltip_rect.left + tm, yoff))
-                yoff += surf.get_height()
-
-        if show_index_progress:
-            show_status_progress_bar(screen, index_progress_percent, index_progress_text, font_main)
-            if index_progress_percent >= 1.0:
-                index_progress_done_drawn = True
-            else:
-                index_progress_done_drawn = False
-        if show_render_progress:
-            show_status_progress_bar(screen, render_progress_percent, render_progress_text, font_main)
-            if render_progress_percent >= 1.0 and not uncached_tiles and not tiles_loading:
-                render_progress_done_drawn = True
-            else:
-                render_progress_done_drawn = False
-
-        pygame.display.flip()
-        need_redraw = False
-
-        # Cleanup completed futures periodically
-        completed_futures = tile_loader.cleanup_completed_futures()
-        if completed_futures > 0:
-            logger.debug(f"Cleaned up {completed_futures} completed futures")
-
-        if index_progress_done_drawn:
-            hide_index_progress()
-        if render_progress_done_drawn:
-            hide_render_progress()
-
-        can_interact = not show_index_progress and not show_render_progress and not tiles_loading
-
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 running = False
-            if event.type == pygame.KEYDOWN:
-                base_step = VIEWPORT_SIZE // 4
-                zoom_factor = 1 + ((zoom_levels[zoom_idx] - min_zoom) * 0.23) if zoom_levels[zoom_idx] > min_zoom else 1
-                step = int(base_step * zoom_factor)
-                if event.key == pygame.K_LEFT and can_interact:
-                    viewport_x = max(min_x * TILE_SIZE, viewport_x - step)
+
+            elif event.type == pygame.KEYDOWN:
+                pan_speed = pan_speed_base / (2 ** (viewer.zoom - 10))
+
+                if event.key == pygame.K_LEFT:
+                    viewer.set_center(viewer.center_lat, viewer.center_lon - pan_speed)
                     need_redraw = True
-                elif event.key == pygame.K_RIGHT and can_interact:
-                    viewport_x = min(viewport_x + step, (max_x * TILE_SIZE + TILE_SIZE) - VIEWPORT_SIZE)
+                elif event.key == pygame.K_RIGHT:
+                    viewer.set_center(viewer.center_lat, viewer.center_lon + pan_speed)
                     need_redraw = True
-                elif event.key == pygame.K_UP and can_interact:
-                    viewport_y = max(min_y * TILE_SIZE, viewport_y - step)
+                elif event.key == pygame.K_UP:
+                    viewer.set_center(viewer.center_lat + pan_speed, viewer.center_lon)
                     need_redraw = True
-                elif event.key == pygame.K_DOWN and can_interact:
-                    viewport_y = min(viewport_y + step, (max_y * TILE_SIZE + TILE_SIZE) - VIEWPORT_SIZE)
+                elif event.key == pygame.K_DOWN:
+                    viewer.set_center(viewer.center_lat - pan_speed, viewer.center_lon)
                     need_redraw = True
-                elif event.key == pygame.K_LEFTBRACKET and can_interact and not zoom_change_pending:
-                    if zoom_idx > 0:
-                        start_zoom_change(zoom_idx-1, last_mouse_pos, viewport_x, viewport_y, zoom_idx)
-                elif event.key == pygame.K_RIGHTBRACKET and can_interact and not zoom_change_pending:
-                    if zoom_idx < len(zoom_levels) - 1:
-                        start_zoom_change(zoom_idx+1, last_mouse_pos, viewport_x, viewport_y, zoom_idx)
-                elif event.key == pygame.K_l and can_interact:
-                    show_tile_labels = not show_tile_labels
+                elif event.key == pygame.K_LEFTBRACKET:
+                    if viewer.zoom > 1:
+                        viewer.set_center(viewer.center_lat, viewer.center_lon, viewer.zoom - 1)
+                        need_redraw = True
+                elif event.key == pygame.K_RIGHTBRACKET:
+                    if viewer.zoom < 19:
+                        viewer.set_center(viewer.center_lat, viewer.center_lon, viewer.zoom + 1)
+                        need_redraw = True
+                elif event.key == pygame.K_b:
+                    viewer.background_color = (0, 0, 0) if viewer.background_color == (255, 255, 255) else (255, 255, 255)
                     need_redraw = True
-                elif event.key == pygame.K_f and can_interact:
-                    # Toggle polygon filling
-                    config.config['fill_polygons'] = not config.config.get('fill_polygons', False)
-                    config.save_config()
-                    tile_cache.clear()  # Clear cache to force redraw with new fill setting
+                elif event.key == pygame.K_f:
+                    viewer.fill_polygons = not viewer.fill_polygons
                     need_redraw = True
-                    logger.info(f"Polygon filling: {'ON' if config.config['fill_polygons'] else 'OFF'}")
+                elif event.key == pygame.K_g:
+                    viewer.show_tile_grid = not viewer.show_tile_grid
+                    need_redraw = True
+                elif event.key in (pygame.K_q, pygame.K_ESCAPE):
+                    running = False
+
             elif event.type == pygame.MOUSEBUTTONDOWN:
-                if event.button == 1 and can_interact:
-                    if tile_label_button_rect.collidepoint(event.pos):
-                        show_tile_labels = not show_tile_labels
+                mx, my = event.pos
+
+                if event.button == 1:
+                    if bg_button_rect.collidepoint(mx, my):
+                        viewer.background_color = (0, 0, 0) if viewer.background_color == (255, 255, 255) else (255, 255, 255)
                         need_redraw = True
-                    elif button_rect.collidepoint(event.pos):
-                        background_color = (255, 255, 255) if background_color == (0, 0, 0) else (0, 0, 0)
+                    elif fill_button_rect.collidepoint(mx, my):
+                        viewer.fill_polygons = not viewer.fill_polygons
                         need_redraw = True
-                        logger.info(f"Background color changed to {'white' if background_color == (255, 255, 255) else 'black'}")
-                    elif gps_button_rect.collidepoint(event.pos):
-                        show_gps_tooltip = not show_gps_tooltip
+                    elif grid_button_rect.collidepoint(mx, my):
+                        viewer.show_tile_grid = not viewer.show_tile_grid
                         need_redraw = True
-                    elif fill_button_rect.collidepoint(event.pos):
-                        # Toggle polygon filling
-                        config.config['fill_polygons'] = not config.config.get('fill_polygons', False)
-                        config.save_config()
-                        tile_cache.clear()  # Clear cache to force redraw with new fill setting
-                        need_redraw = True
-                        logger.info(f"Polygon filling: {'ON' if config.config['fill_polygons'] else 'OFF'}")
-                    else:
+                    elif mx < VIEWPORT_SIZE and my < VIEWPORT_SIZE:
                         dragging = True
-                        drag_start = event.pos
-                        drag_viewport_start = (viewport_x, viewport_y)
-                elif event.button == 4 and can_interact and not zoom_change_pending:
-                    if zoom_idx < len(zoom_levels) - 1:
-                        start_zoom_change(zoom_idx+1, last_mouse_pos, viewport_x, viewport_y, zoom_idx)
-                elif event.button == 5 and can_interact and not zoom_change_pending:
-                    if zoom_idx > 0:
-                        start_zoom_change(zoom_idx-1, last_mouse_pos, viewport_x, viewport_y, zoom_idx)
+                        drag_start = (mx, my)
+                        drag_center_start = (viewer.center_lat, viewer.center_lon)
+
+                elif event.button == 3:
+                    if mx < VIEWPORT_SIZE and my < VIEWPORT_SIZE:
+                        feature_info = viewer.identify_feature_at(mx, my)
+                        viewer.selected_feature = feature_info
+                        need_redraw = True
+
+                elif event.button == 4:
+                    if viewer.zoom < 19:
+                        viewer.set_center(viewer.center_lat, viewer.center_lon, viewer.zoom + 1)
+                        need_redraw = True
+                elif event.button == 5:
+                    if viewer.zoom > 1:
+                        viewer.set_center(viewer.center_lat, viewer.center_lon, viewer.zoom - 1)
+                        need_redraw = True
+
             elif event.type == pygame.MOUSEBUTTONUP:
                 if event.button == 1:
                     dragging = False
-                    drag_start = None
-            elif event.type == pygame.MOUSEMOTION:
-                mx, my = event.pos
-                last_mouse_pos = (mx, my)
-                if dragging:
-                    dx = drag_start[0] - event.pos[0]
-                    dy = drag_start[1] - event.pos[1]
-                    viewport_x = drag_viewport_start[0] + dx
-                    viewport_y = drag_viewport_start[1] + dy
-                    viewport_x, viewport_y = clamp_viewport(viewport_x, viewport_y, available_tiles)
-                    need_redraw = True
 
-        clock.tick(config.get('fps_limit', 30))
-    
-    # Shutdown thread pool before quitting
-    tile_loader.shutdown()
+            elif event.type == pygame.MOUSEMOTION:
+                if dragging and drag_start and drag_center_start:
+                    dx = event.pos[0] - drag_start[0]
+                    dy = event.pos[1] - drag_start[1]
+
+                    if viewer.bbox:
+                        min_lon, min_lat, max_lon, max_lat = viewer.bbox
+                        lon_per_pixel = (max_lon - min_lon) / VIEWPORT_SIZE
+                        lat_per_pixel = (max_lat - min_lat) / VIEWPORT_SIZE
+
+                        new_lon = drag_center_start[1] - dx * lon_per_pixel
+                        new_lat = drag_center_start[0] + dy * lat_per_pixel
+
+                        viewer.set_center(new_lat, new_lon)
+                        need_redraw = True
+
+        if need_redraw:
+            viewer.render_to_surface(viewport_surface)
+            screen.fill((50, 50, 50))
+            screen.blit(viewport_surface, (0, 0))
+
+            # Toolbar
+            pygame.draw.rect(screen, (30, 30, 30), (VIEWPORT_SIZE, 0, TOOLBAR_WIDTH, VIEWPORT_SIZE))
+
+            button_bg = (50, 50, 50)
+            button_fg = (255, 255, 255)
+            button_border = (100, 100, 100)
+
+            bg_text = "Background: White" if viewer.background_color == (255, 255, 255) else "Background: Black"
+            draw_button(screen, bg_text, bg_button_rect, button_bg, button_fg, button_border, font_small)
+
+            fill_text = "Fill: ON" if viewer.fill_polygons else "Fill: OFF"
+            draw_button(screen, fill_text, fill_button_rect, button_bg, button_fg, button_border, font_small)
+
+            grid_text = "Grid: ON" if viewer.show_tile_grid else "Grid: OFF"
+            draw_button(screen, grid_text, grid_button_rect, button_bg, button_fg, button_border, font_small)
+
+            info_y = button_margin * 4 + button_height * 3 + 20
+            info_color = (200, 200, 200)
+
+            screen.blit(font_small.render(f"Lat: {viewer.center_lat:.6f}", True, info_color), (VIEWPORT_SIZE + 10, info_y))
+            screen.blit(font_small.render(f"Lon: {viewer.center_lon:.6f}", True, info_color), (VIEWPORT_SIZE + 10, info_y + 18))
+            screen.blit(font_small.render(f"Zoom: {viewer.zoom}", True, info_color), (VIEWPORT_SIZE + 10, info_y + 36))
+
+            # Query stats
+            stats_y = info_y + 70
+            screen.blit(font_small.render("Query Stats:", True, info_color), (VIEWPORT_SIZE + 10, stats_y))
+            if viewer.last_query_stats:
+                s = viewer.last_query_stats
+                total_tiles = s.get('tiles_loaded', 0) + s.get('tiles_missing', 0)
+                screen.blit(font_small.render(f"  Tiles: {s.get('tiles_loaded', 0)}/{total_tiles}", True, (150, 150, 150)), (VIEWPORT_SIZE + 10, stats_y + 18))
+                screen.blit(font_small.render(f"  Features: {s.get('features', 0)}", True, (150, 150, 150)), (VIEWPORT_SIZE + 10, stats_y + 32))
+                screen.blit(font_small.render(f"  Time: {s.get('time_ms', 0):.0f}ms", True, (150, 150, 150)), (VIEWPORT_SIZE + 10, stats_y + 46))
+
+            # Selected feature
+            feature_y = stats_y + 80
+            screen.blit(font_small.render("Click Feature:", True, info_color), (VIEWPORT_SIZE + 10, feature_y))
+            if viewer.selected_feature:
+                line_y = feature_y + 18
+                for key, value in viewer.selected_feature.items():
+                    text = f"  {key}: {value}"
+                    screen.blit(font_small.render(text, True, (100, 200, 100)), (VIEWPORT_SIZE + 10, line_y))
+                    line_y += 14
+            else:
+                screen.blit(font_small.render("  (right-click)", True, (100, 100, 100)), (VIEWPORT_SIZE + 10, feature_y + 18))
+
+            # Status bar
+            pygame.draw.rect(screen, (30, 30, 30), (0, VIEWPORT_SIZE, WINDOW_WIDTH, STATUSBAR_HEIGHT))
+            screen.blit(font_small.render("NAV Format - IceNav Navigation Tiles", True, (200, 200, 200)), (10, VIEWPORT_SIZE + 10))
+
+            if viewer.available_zooms:
+                zooms_str = f"Available: {min(viewer.available_zooms)}-{max(viewer.available_zooms)}"
+                screen.blit(font_small.render(zooms_str, True, (150, 150, 150)), (10, VIEWPORT_SIZE + 30))
+
+            pygame.display.flip()
+            need_redraw = False
+
+        clock.tick(30)
+
     pygame.quit()
 
-if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        logger.info("Usage: python tile_viewer.py VECTORMAP")
-        logger.info("Keys: [arrows] move, [ ] [ ] zoom level, mouse scroll: zoom level")
-        logger.info("Mouse: drag to pan, buttons for background, tile labels, GPS cursor, fill polygons. [l] toggle labels")
-        logger.info("Example: python tile_viewer.py VECTORMAP")
-        logger.info("Note: Place features.json in current directory for dynamic palette support")
-        sys.exit(1)
-    main(sys.argv[1])
+
+if __name__ == '__main__':
+    main()

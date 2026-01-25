@@ -1,6 +1,6 @@
-# Tile Binary Format Specification
+# NAV Tile Format Specification
 
-This document describes the binary format produced by the tile generation script (`tile_generator.py`) for vector map tiles. The format is intended for efficient rendering and compact storage of map data at various zoom levels. Applications and libraries can use this specification to parse and render the resulting `.bin` files.
+This document describes the NAV binary format produced by the tile generation script (`tile_generator.py`) for vector map tiles. The format is optimized for ESP32 embedded systems with compact storage and efficient rendering of map data.
 
 ---
 
@@ -9,345 +9,317 @@ This document describes the binary format produced by the tile generation script
 Each file represents a single tile for a given zoom level (`z`), x coordinate (`x`), and y coordinate (`y`).  
 The filename and directory structure is:  
 ```
-{output_dir}/{z}/{x}/{y}.bin
+{output_dir}/{z}/{x}/{y}.nav
 ```
 
-The file contains a sequence of drawing commands encoded in a compact binary format.  
-All coordinates are encoded as `uint16` values (range 0–65535) relative to the tile.
+The file contains a collection of vector features with geometry data and rendering information.  
+All coordinates are encoded as `int32` values scaled by `COORD_SCALE` (10,000,000) for ~1cm precision.
 
-The format uses **state commands** (SET_COLOR, SET_COLOR_INDEX) to eliminate color redundancy and achieve maximum compression through a dynamic palette system.
+The format uses **self-contained feature records** with individual colors and coordinates for maximum compatibility with embedded rendering systems.
 
 ---
 
 ## File Structure
 
-The file is a single binary blob with the structure:
+The file is a single binary blob with the following structure:
 
-| Field          | Type      | Description                               |
-|----------------|-----------|-------------------------------------------|
-| num_commands   | varint    | Number of drawing commands in the tile    |
-| commands[]     | variable  | Sequence of drawing commands              |
+| Field          | Type      | Size  | Description                               |
+|----------------|-----------|--------|-------------------------------------------|
+| magic          | bytes[4]  | 4      | Format identifier ("NAV1")               |
+| feature_count  | uint16    | 2      | Number of features in the tile              |
+| min_lon        | int32     | 4      | Minimum longitude (scaled by COORD_SCALE) |
+| min_lat        | int32     | 4      | Minimum latitude (scaled by COORD_SCALE)  |
+| max_lon        | int32     | 4      | Maximum longitude (scaled by COORD_SCALE) |
+| max_lat        | int32     | 4      | Maximum latitude (scaled by COORD_SCALE)  |
+| features[]     | variable  | —      | Sequence of feature records               |
 
-- All variable-length integers use [protobuf varint encoding](https://developers.google.com/protocol-buffers/docs/encoding#varints).
-- All signed integers are encoded with [zigzag encoding](https://developers.google.com/protocol-buffers/docs/encoding#signed-integers).
+**Total Header Size**: 22 bytes
 
----
-
-## Drawing Command Structure
-
-Commands are separated into **state commands** and **geometry commands**:
-
-### State Commands (Set Current Color)
-| Field        | Type      | Description                                 |
-|--------------|-----------|---------------------------------------------|
-| type         | varint    | State command type (0x80 or 0x81)          |
-| color_data   | variable  | Color information (see below)              |
-
-### Geometry Commands (Use Current Color)
-| Field        | Type      | Description                                 |
-|--------------|-----------|---------------------------------------------|
-| type         | varint    | Drawing command type (see command types)   |
-| parameters   | variable  | Command-specific data (no color field)     |
+- All coordinates are scaled by `COORD_SCALE = 10,000,000` for ~1cm precision
+- Coordinates are absolute geographic coordinates, not tile-relative
+- All multi-byte values use little-endian byte order
 
 ---
 
-## Command Types
+## Feature Record Structure
 
-### Basic Geometry Commands
-| Name                | Value | Description                                           |
-|---------------------|-------|------------------------------------------------------|
-| LINE                | 0x01  | Single line (from x1,y1 to x2,y2)                    |
-| POLYLINE            | 0x02  | Polyline (sequence of points)                        |
-| STROKE_POLYGON      | 0x03  | Closed polygon outline (sequence of points)          |
+Each feature contains a header followed by coordinate data:
 
-### State Commands
-| Name                | Value | Description                                           |
-|---------------------|-------|------------------------------------------------------|
-| SET_COLOR           | 0x80  | Set current color using RGB332 direct value (fallback) |
-| SET_COLOR_INDEX     | 0x81  | Set current color using dynamic palette index        |
+| Field            | Type   | Size | Description                                  |
+|------------------|--------|-------|----------------------------------------------|
+| geom_type        | uint8  | 1     | Geometry type (Point/LineString/Polygon)   |
+| color_rgb565     | uint16  | 2     | RGB565 color value                          |
+| zoom_priority     | uint8  | 1     | Packed zoom and priority information        |
+| width_pixels      | uint8  | 1     | Line width in pixels (NAV v2)             |
+| coord_count      | uint16  | 2     | Number of coordinate pairs                    |
+| coordinates[]    | int32[] | 8×N   | Longitude/latitude pairs for each point      |
 
----
-
-## State Command Parameters
-
-### SET_COLOR (type 0x80)
-Sets the current color for subsequent geometry commands using direct RGB332 value. Used as fallback when color is not in the dynamic palette.
-
-| Field       | Type    | Description                    |
-|-------------|---------|--------------------------------|
-| color       | uint8   | RGB332 color value (0-255)    |
-
-### SET_COLOR_INDEX (type 0x81)
-Sets the current color using a dynamic palette index. This is the primary method for color assignment.
-
-| Field       | Type    | Description                              |
-|-------------|---------|------------------------------------------|
-| color_index | varint  | Index into dynamic color palette (0-N)  |
+**Feature Header Size**: 7 bytes + (8 × coord_count) bytes
 
 ---
 
-## Geometry Command Parameters
+## Geometry Types
 
-**Important**: Geometry commands do **NOT** include color fields. The current color is set by the most recent SET_COLOR or SET_COLOR_INDEX command.
-
-All geometry commands now include a **width parameter** before the coordinate data.
-
-### LINE (type 0x01)
-| Field       | Type    | Description             |
-|-------------|---------|-------------------------|
-| width       | varint  | Line width in pixels    |
-| x1, y1      | int32   | Starting coordinates    |
-| x2, y2      | int32   | Ending coordinates      |
-
-**Encoding**: varint(width), zigzag(x1), zigzag(y1), zigzag(x2 - x1), zigzag(y2 - y1)
-
-### POLYLINE (type 0x02)
-| Field       | Type    | Description                            |
-|-------------|---------|----------------------------------------|
-| width       | varint  | Line width in pixels                   |
-| num_points  | varint  | Number of points                       |
-| points[]    | int32   | Sequence of (x, y)                     |
-
-**Encoding**: 
-- varint(width)
-- varint(num_points)
-- zigzag(x0), zigzag(y0) – first point absolute
-- zigzag(x1 - x0), zigzag(y1 - y0) – delta encoding for subsequent points
-
-### STROKE_POLYGON (type 0x03)
-| Field       | Type    | Description                            |
-|-------------|---------|----------------------------------------|
-| width       | varint  | Line width in pixels                   |
-| num_points  | varint  | Number of points                       |
-| points[]    | int32   | Sequence of (x, y)                     |
-
-**Encoding**: 
-- varint(width)
-- varint(num_points)
-- zigzag(x0), zigzag(y0) – first point absolute
-- zigzag(x1 - x0), zigzag(y1 - y0) – delta encoding for subsequent points
-
----
-
-## Line Width Calculation
-
-The tile generator includes intelligent line width calculation based on OSM tags and zoom level:
-
-### Width from 'width' Tag (Highest Priority)
-If a feature has a `width` tag (in meters), it's converted to pixels using Mercator projection:
-- Considers the feature's latitude for accurate meter-to-pixel conversion
-- Applies zoom-based scaling factors
-- Clamps to minimum (0.5px) and maximum (20px) values
-
-### Default Widths by Feature Type
-When no `width` tag is present, default widths are calculated based on feature type and zoom level:
-
-**Highways:**
-- motorway, trunk: `max(2, int(4 * zoom/18.0))`
-- primary, motorway_link, trunk_link: `max(1, int(3 * zoom/18.0))`
-- secondary, primary_link: `max(1, int(2.5 * zoom/18.0))`
-- tertiary, secondary_link: `max(1, int(2 * zoom/18.0))`
-- residential, unclassified, road: `max(1, int(1.5 * zoom/18.0))`
-- service, track: `1`
-- Other (footway, path, etc.): `1`
-
-**Railways:**
-- All types: `max(1, int(2 * zoom/18.0))`
-
-**Waterways:**
-- river, canal: `max(1, int(3 * zoom/18.0))`
-- stream, drain, ditch: `max(1, int(1.5 * zoom/18.0))`
-- Other: `1`
-
-**Aeroways:**
-- runway, taxiway: `max(1, int(4 * zoom/18.0))`
-
-**Power lines:**
-- power=line: `max(1, int(1.5 * zoom/18.0))`
-
-**Barriers:**
-- fence, wall, retaining_wall: `max(1, int(1 * zoom/18.0))`
-
-**Man-made:**
-- pipeline, embankment: `max(1, int(2 * zoom/18.0))`
-
-**Natural:**
-- cliff, ridge, arete: `max(1, int(2 * zoom/18.0))`
+| Type  | Value | Description                              |
+|--------|-------|------------------------------------------|
+| POINT      | 1      | Single point feature                      |
+| LINESTRING | 2      | Polyline with multiple points             |
+| POLYGON    | 3      | Closed polygon with outline or fill       |
 
 ---
 
 ## Color Encoding
 
-### RGB332 Format
-- `color` is stored as a single byte (`uint8`) in [RGB332 format](https://en.wikipedia.org/wiki/List_of_monochrome_and_RGB_palettes#RGB332).
-- **Bit layout**: `RRRGGGBB` (3 bits red, 3 bits green, 2 bits blue)
+### RGB565 Format
+Colors are stored in 16-bit RGB565 format for efficient display on 16-bit systems:
 
-### Dynamic Palette
-- **Automatic generation**: Palette is built from unique colors in the configuration file
-- **Index mapping**: Each hex color (e.g., `#ff0000`) receives a unique index (0-N)
-- **Alphabetical ordering**: Colors are sorted alphabetically for consistency
-- **Efficient encoding**: Indices use varint encoding (smaller for low indices)
-- **Primary method**: Most colors use SET_COLOR_INDEX for optimal compression
+| Component | Bits | Range   | Description                          |
+|-----------|-------|--------|--------------------------------------|
+| Red       | 5     | 0-31   | Red intensity                         |
+| Green     | 6     | 0-63   | Green intensity (higher precision)      |
+| Blue      | 5     | 0-31   | Blue intensity                        |
 
-### Palette File
-The generator creates a `palette.bin` file in the output directory:
+**Bit Layout**: `RRRRRGGGGGGBBBBB`
 
-| Field          | Type      | Description                               |
-|----------------|-----------|-------------------------------------------|
-| num_colors     | uint32    | Number of colors in palette               |
-| colors[]       | RGB888    | Array of 24-bit RGB colors (R, G, B)     |
+**Conversion to RGB888:**
+```python
+r = (rgb565 >> 11) & 0x1F
+g = (rgb565 >> 5) & 0x3F  
+b = rgb565 & 0x1F
+r8 = (r << 3) | (r >> 2)
+g8 = (g << 2) | (g >> 4)
+b8 = (b << 3) | (b >> 2)
+rgb888 = (r8 << 16) | (g8 << 8) | b8
+```
 
-Each color is stored as 3 bytes (R, G, B) in the range 0-255, expanded from RGB332 format.
+---
+
+## Zoom Priority Encoding
+
+The `zoom_priority` byte combines minimum zoom level and rendering priority:
+
+| Bits    | Range  | Description                           |
+|----------|--------|---------------------------------------|
+| 7-4      | 0-15   | Minimum zoom level (inclusive)         |
+| 3-0      | 0-15   | Rendering priority (scaled by 7)     |
+
+**Priority Calculation:**
+```python
+min_zoom = (zoom_priority >> 4) & 0x0F      # High 4 bits
+priority = (zoom_priority & 0x0F) * 7        # Low 4 bits, scaled
+```
+
+---
+
+## Width Calculation
+
+### From OSM Width Tags
+If a feature has a `width` tag (in meters), it's converted to pixels using Mercator projection:
+
+```python
+def meters_to_pixels(width_meters: float, zoom: int, lat: float = 45.0) -> int:
+    """Convert width in meters to pixels at given zoom level.
+    
+    Uses approximation for given latitude (default 45° for Europe).
+    Formula: meters_per_pixel ≈ 156543 * cos(lat) / 2^zoom
+    """
+    meters_per_pixel = 156543.0 * math.cos(math.radians(lat)) / (2 ** zoom)
+    pixels = int(width_meters / meters_per_pixel + 0.5)
+    return max(1, min(15, pixels))  # Clamp to 1-15
+```
+
+### Default Widths
+When no width tag is present, defaults are applied:
+- **Motorway/Trunk**: 3-15 pixels (zoom-dependent)
+- **Primary**: 2-12 pixels
+- **Secondary**: 2-10 pixels  
+- **Residential**: 1-7 pixels
+- **Other roads**: 1-5 pixels
+- **Default**: 1 pixel
 
 ---
 
 ## Coordinate System
 
-- All coordinates are relative to the tile, with the top-left of the tile as (0,0) and bottom-right as (65535,65535).
-- This allows for sub-pixel precision and scalable rendering at different resolutions.
-- **Delta encoding**: Most commands use coordinate differences for better compression.
-- **Zigzag encoding**: Signed coordinate differences are encoded efficiently.
+### Absolute Geographic Coordinates
+All coordinates are stored as absolute geographic coordinates:
+
+- **Scale Factor**: `COORD_SCALE = 10,000,000`
+- **Precision**: ~1cm per unit
+- **Range**: ±180° longitude, ±90° latitude
+- **Format**: int32 (4 bytes per coordinate)
+
+**Coordinate Conversion:**
+```python
+# Storing coordinates
+lon_int = int(lon * COORD_SCALE)
+lat_int = int(lat * COORD_SCALE)
+
+# Reading coordinates  
+lon = lon_int / COORD_SCALE
+lat = lat_int / COORD_SCALE
+```
+
+### Tile Bounding Box
+The header contains the minimum and maximum coordinates of all features in the tile:
+
+```
+min_lon, min_lat ------------ max_lon
+       |                     |
+       |   Tile Extent      |
+       |                     |
+max_lon, max_lat ------------ max_lon
+```
 
 ---
 
-## Layer Priority System
+## Polygon Ring Information
 
-Features are rendered in priority order determined by the `get_layer_priority()` function:
+For polygon features, additional ring data follows the coordinates:
 
-| Priority | Feature Type                                          |
-|----------|------------------------------------------------------|
-| 100      | Water features (natural=water/coastline/bay, waterway=riverbank/dock/boatyard) |
-| 200      | Land use and natural areas (landuse, natural=wood/forest/scrub/heath/grassland/beach/sand/wetland, leisure=park/nature_reserve/garden) |
-| 300      | Waterways (waterway=river/stream/canal)              |
-| 400      | Natural terrain features (natural=peak/ridge/volcano/cliff) |
-| 500      | Tunnels (tunnel=yes)                                 |
-| 600      | Railways                                             |
-| 700      | Pedestrian ways (highway=path/footway/cycleway/steps/pedestrian/track) |
-| 800      | Tertiary roads (highway=tertiary/tertiary_link)      |
-| 900      | Secondary roads (highway=secondary/secondary_link)   |
-| 1000     | Primary roads (highway=primary/primary_link)         |
-| 1100     | Trunk roads (highway=trunk/trunk_link)               |
-| 1200     | Motorways (highway=motorway/motorway_link)           |
-| 1300     | Bridges and aeroways (bridge=yes, aeroway)           |
-| 1400     | Buildings                                            |
-| 1500     | Amenities                                            |
+| Field          | Type   | Size | Description                    |
+|----------------|--------|-------|--------------------------------|
+| ring_count     | uint8  | 1     | Number of rings (always 1)    |
+| ring_ends[]    | uint16 | 2×N   | End index of each ring          |
 
-The OSM `layer` tag can add ±1000 * layer_value to the base priority.
+**Note**: Current implementation uses a single ring per polygon. Ring information is included but not used by most parsers.
 
 ---
 
 ## Geometry Simplification
 
-The generator includes Douglas-Peucker simplification for zoom levels ≥ 16:
+The tile generator includes Douglas-Peucker simplification for zoom levels ≥ 16:
 
-### Simplification Tolerance by Zoom Level
-- Zoom 16: 0.000015
-- Zoom 17: 0.000012
-- Zoom 18: 0.00001
-- Zoom 19: 0.000008
-- Zoom ≥20: 0.000005
+### Tolerance by Zoom Level
+- **Zoom 16**: 0.000015 degrees (~1.7m)
+- **Zoom 17**: 0.000012 degrees (~1.3m) 
+- **Zoom 18**: 0.000010 degrees (~1.1m)
+- **Zoom 19**: 0.000008 degrees (~0.9m)
 
 ### Simplification Rules
-- Only applied to features with ≥50 vertices
+- Applied only to features with ≥50 vertices
 - LineStrings with <10 points are not simplified
 - Polygons maintain their closed ring structure
-- Can be disabled with `--no-simplify` flag
+- Preserves topology and feature accuracy
 
 ---
 
-## Optimization Benefits
+## File Size Optimization
 
-### Dynamic Palette System
-- **Primary optimization**: Replaces RGB332 values with compact indices
-- **Automatic generation**: Palette built from configuration file
-- **Maximum compression**: Frequently used colors get low indices (smaller varint)
-- **Benefit**: 25-40% file size reduction compared to embedded colors
+### Header Compression
+- **Fixed 22-byte header** vs variable-length command headers
+- **Bounding box** enables early tile rejection
+- **Feature count** allows memory pre-allocation
 
-### State Command Architecture
-- Eliminates redundant color fields in geometry commands
-- One color command can apply to multiple geometry commands
-- **Benefit**: Additional 15-25% file size reduction in dense tiles
+### Data Compression
+- **RGB565 format**: 50% reduction vs RGB888
+- **Scaled coordinates**: 4 bytes per coordinate vs 8 bytes for double precision
+- **No redundant data**: Each feature is self-contained
 
-### Width-Based Rendering
-- Intelligent width calculation based on OSM tags
-- Zoom-level adaptive scaling
-- Meter-to-pixel conversion with Mercator projection
-- **Benefit**: Realistic and consistent feature rendering across zoom levels
-
-### File Size Reduction
-- **Dynamic palette**: 25-40% reduction compared to embedded colors
-- **State commands**: Additional 15-25% reduction in dense tiles
-- **Delta encoding**: Efficient coordinate compression
-- **Geometry simplification**: 30-50% reduction for high-zoom complex features
-- **Total improvement**: Up to 60% smaller than unoptimized format
+### Typical File Sizes
+- **Urban tiles**: 2-15 KB (high feature density)
+- **Rural tiles**: 0.5-3 KB (low feature density)  
+- **Water tiles**: 0.1-0.5 KB (minimal features)
 
 ---
 
-## Performance Considerations
+## ESP32 Optimization
+
+### Memory Efficiency
+- **Small tiles**: Typically <16KB fits easily in RAM
+- **Streaming capability**: Features can be processed sequentially
+- **Fixed record size**: Predictable memory allocation
+- **No dynamic parsing**: Simple binary structure
 
 ### Rendering Performance
-- **Fewer state changes**: Grouped commands reduce GPU state changes
-- **Efficient primitives**: Basic line and polygon rendering
-- **Width-aware rendering**: Single pass with variable line widths
-- **Cache efficiency**: Sequential commands improve cache hits
-
-### Memory Usage
-- **Palette storage**: Minimal overhead (typically <200 bytes for palette.bin)
-- **Parser state**: Single color variable
-- **Coordinate buffers**: Small buffers for delta decoding
+- **Priority-based**: Features pre-sorted by rendering order
+- **Width pre-calculated**: No runtime calculations needed
+- **RGB565 native**: Direct display without conversion
+- **Coordinate scaling**: Pre-scaled for pixel-perfect rendering
 
 ---
 
-## Compatibility and Forward Compatibility
+## Implementation Guidelines
 
-### Version Compatibility
-- **Basic parsers**: Must implement commands 0x01-0x03, 0x80-0x81
-- **Width parameter**: All geometry commands now include width (as of current version)
-- **Fallback rendering**: Unknown commands can be skipped
-- **State preservation**: Color state persists across unknown commands
-
-### Implementation Guidelines
-- Always implement basic commands (0x01-0x03, 0x80-0x81)
-- Load and use the palette.bin file for color interpretation
-- Support width parameters for all geometry commands
-- Unknown command types should be skipped gracefully
-- Maintain color state across all commands
-
----
-
-## Usage
-
-### Basic Implementation Requirements
-1. Read the file and parse the initial varint (`num_commands`)
-2. Initialize `current_color = 0xFF`
-3. Load dynamic palette from `palette.bin`
-4. Implement state command handlers (SET_COLOR, SET_COLOR_INDEX)
-5. Implement basic geometry commands (LINE, POLYLINE, STROKE_POLYGON)
-6. Support width parameter in all geometry commands
-
-### Command-Line Usage
-```bash
-python tile_generator.py input.gol output_dir config.json --zoom 6-17 [options]
-
-Options:
-  --max-file-size KB    Maximum tile file size (default: 128KB)
-  --batch-size N        Base batch size, auto-adjusted per zoom (default: 10000)
-  --no-simplify         Disable Douglas-Peucker simplification
-```
+### Basic Parser Implementation
+1. **Read header**: 22 bytes to get magic, feature count, and bbox
+2. **Validate magic**: Check for "NAV1" identifier
+3. **Allocate memory**: Pre-allocate based on feature count and bbox
+4. **Process features**: Read each feature record sequentially
+5. **Parse coordinates**: Apply COORD_SCALE to convert to geographic coordinates
 
 ### Error Handling
-- Invalid command types should be skipped gracefully
-- Out-of-bounds palette indices should use default color (0xFF)
-- Missing palette should fall back to direct RGB332 interpretation
-- Corrupted files should fail safely without crashing
-- Coordinate overflow should clamp to tile boundaries (0-65535)
+- **Invalid magic**: File is not NAV format
+- **Corrupted data**: Handle gracefully with bounds checking
+- **Coordinate overflow**: Clamp to valid geographic ranges
+- **Feature count mismatch**: Validate against actual file size
+
+### Rendering Integration
+- **Sort by priority**: Use packed zoom_priority field
+- **Convert colors**: RGB565 to display format
+- **Scale coordinates**: Apply display scaling and projection
+- **Width handling**: Use width_pixels for line thickness
+
+---
+
+## Compatibility
+
+### Version Information
+- **Current Version**: NAV v1 with width support (NAV v2 compatibility)
+- **Backward Compatibility**: Readers can ignore width field
+- **Forward Compatibility**: Additional fields can be added after existing structure
+
+### File Extensions
+- **Standard**: `.nav` for NAV binary tiles
+- **Identifier**: "NAV1" magic bytes for format recognition
+
+---
+
+## Usage Examples
+
+### Command Line Generation
+```bash
+python tile_generator.py input.osm.pbf output_directory features.json --zoom 6-17
+```
+
+### Expected Output Structure
+```
+output_directory/
+├── 6/
+│   ├── 0/
+│   │   ├── 0.nav
+│   │   ├── 1.nav
+│   │   └── ...
+│   ├── 1/
+│   │   └── 0.nav
+│   └── ...
+├── 7/
+│   └── ...
+└── ...
+```
+
+### Integration with ESP32
+The format is specifically designed for embedded navigation systems:
+- **Direct memory mapping**: Can be loaded directly into ESP32 RAM
+- **Efficient parsing**: Simple binary structure with minimal computation
+- **Display-ready**: Colors and coordinates in native formats
+- **Tile-based**: Supports incremental loading for large maps
 
 ---
 
 ## References
 
-- [Protocol Buffers Varint Encoding](https://developers.google.com/protocol-buffers/docs/encoding#varints)
-- [Zigzag Encoding](https://developers.google.com/protocol-buffers/docs/encoding#signed-integers)
-- [RGB332 Color Format](https://en.wikipedia.org/wiki/List_of_monochrome_and_RGB_palettes#RGB332)
+- **RGB565 Color Format**: 16-bit color encoding
+- **Mercator Projection**: Geographic coordinate system
+- **Douglas-Peucker Algorithm**: Line simplification technique
+- **ESP32 Technical Specifications**: Memory and display constraints
 
 ---
+
+## Notes
+
+- This format is optimized for **embedded systems** with limited memory
+- Coordinates use **absolute geographic positions**, not tile-relative coordinates
+- Each feature is **self-contained** with its own color and geometry
+- No compression beyond **data type optimization** (RGB565, scaled coordinates)
+- The format prioritizes **simplicity and speed** over maximum compression
