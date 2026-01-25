@@ -14,6 +14,7 @@ import math
 import struct
 import argparse
 import logging
+import time
 from typing import Dict, List, Tuple, Optional, Set
 
 try:
@@ -160,8 +161,9 @@ def read_nav_tile(path: str) -> List[NavFeature]:
 
                 features.append(feature)
 
-    except Exception as e:
-        logger.warning(f"Error reading {path}: {e}")
+    except (OSError, struct.error, ValueError) as e:
+        logger.warning(f"Error reading tile {path}: {e}")
+        return features  # Return empty list instead of continuing
 
     return features
 
@@ -184,6 +186,8 @@ class NAVViewer:
         self.last_query_stats = {}
         self.cached_features = None
         self.selected_feature = None
+        self.last_viewport_key = None  # Key para detectar cambios en viewport
+        self.cached_query_features = []  # Cache de features query
 
     def _index_tiles(self):
         """Index available zoom levels."""
@@ -233,13 +237,20 @@ class NAVViewer:
         if zoom is not None:
             self.zoom = zoom
         self.bbox = get_bbox_for_viewport(self.center_lat, self.center_lon, self.zoom)
+        # Invalidate cache when viewport changes
+        self.last_viewport_key = None
+        self.cached_query_features = []
 
     def query_features(self) -> List[NavFeature]:
         """Query features from tiles."""
         if self.bbox is None:
             return []
 
-        import time
+        # Check cache
+        current_key = (self.zoom, round(self.center_lat, 6), round(self.center_lon, 6))
+        if self.last_viewport_key == current_key and self.cached_query_features:
+            return self.cached_query_features
+
         start = time.time()
 
         tiles = self._get_tiles_for_viewport()
@@ -266,6 +277,10 @@ class NAVViewer:
             'features': len(all_features),
             'time_ms': elapsed
         }
+
+        # Update cache
+        self.last_viewport_key = current_key
+        self.cached_query_features = all_features
 
         return all_features
 
@@ -613,7 +628,8 @@ def main():
             screen.blit(font_small.render("Query Stats:", True, info_color), (VIEWPORT_SIZE + 10, stats_y))
             if viewer.last_query_stats:
                 s = viewer.last_query_stats
-                screen.blit(font_small.render(f"  Tiles: {s.get('tiles_loaded', 0)}/{s.get('tiles_loaded', 0) + s.get('tiles_missing', 0)}", True, (150, 150, 150)), (VIEWPORT_SIZE + 10, stats_y + 18))
+                total_tiles = s.get('tiles_loaded', 0) + s.get('tiles_missing', 0)
+                screen.blit(font_small.render(f"  Tiles: {s.get('tiles_loaded', 0)}/{total_tiles}", True, (150, 150, 150)), (VIEWPORT_SIZE + 10, stats_y + 18))
                 screen.blit(font_small.render(f"  Features: {s.get('features', 0)}", True, (150, 150, 150)), (VIEWPORT_SIZE + 10, stats_y + 32))
                 screen.blit(font_small.render(f"  Time: {s.get('time_ms', 0):.0f}ms", True, (150, 150, 150)), (VIEWPORT_SIZE + 10, stats_y + 46))
 

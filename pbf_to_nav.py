@@ -26,7 +26,7 @@ import argparse
 import logging
 import math
 import struct
-from typing import Dict, List, Tuple, Set
+from typing import Dict, List, Tuple, Set, Any, Optional
 from collections import defaultdict
 import time
 
@@ -54,12 +54,26 @@ NAV_MAGIC = b'NAV1'
 COORD_SCALE = 10000000  # 1e7 for ~1cm precision
 
 # Geometry types
-GEOM_POINT = 1
 GEOM_LINESTRING = 2
 GEOM_POLYGON = 3
 
 # Tags that support width (LineStrings only)
 WIDTH_TAGS = {'highway', 'railway', 'waterway'}
+
+# Cache for zoom level parameters
+_ZOOM_PARAMS_CACHE = {}
+
+
+def _get_zoom_params(zoom: int) -> Dict:
+    """Get cached zoom parameters or compute them."""
+    if zoom not in _ZOOM_PARAMS_CACHE:
+        n = 2.0 ** zoom
+        _ZOOM_PARAMS_CACHE[zoom] = {
+            'n': n,
+            'lon_scale': n / 360.0,
+            'lon_offset': 180.0
+        }
+    return _ZOOM_PARAMS_CACHE[zoom]
 
 
 def meters_to_pixels(width_meters: float, zoom: int, lat: float = 45.0) -> int:
@@ -68,7 +82,6 @@ def meters_to_pixels(width_meters: float, zoom: int, lat: float = 45.0) -> int:
     Uses approximation for given latitude (default 45° for Europe).
     Formula: meters_per_pixel ≈ 156543 * cos(lat) / 2^zoom
     """
-    import math
     meters_per_pixel = 156543.0 * math.cos(math.radians(lat)) / (2 ** zoom)
     pixels = int(width_meters / meters_per_pixel + 0.5)
     return max(1, min(15, pixels))  # Clamp to 1-15
@@ -152,15 +165,15 @@ LAYER_MAPPING = {
 
 def lon_to_tile_x(lon: float, zoom: int) -> int:
     """Convert longitude to tile X coordinate."""
-    n = 2.0 ** zoom
-    return int((lon + 180.0) / 360.0 * n)
+    params = _get_zoom_params(zoom)
+    return int((lon + params['lon_offset']) * params['lon_scale'])
 
 
 def lat_to_tile_y(lat: float, zoom: int) -> int:
     """Convert latitude to tile Y coordinate."""
-    n = 2.0 ** zoom
+    params = _get_zoom_params(zoom)
     lat_rad = math.radians(lat)
-    return int((1.0 - math.asinh(math.tan(lat_rad)) / math.pi) / 2.0 * n)
+    return int((1.0 - math.asinh(math.tan(lat_rad)) / math.pi) / 2.0 * params['n'])
 
 
 def get_feature_tiles(coords: List[Tuple[float, float]], zoom: int, is_polygon: bool = False) -> Set[Tuple[int, int]]:
@@ -168,10 +181,15 @@ def get_feature_tiles(coords: List[Tuple[float, float]], zoom: int, is_polygon: 
     tiles = set()
 
     if is_polygon and len(coords) >= 3:
-        lons = [c[0] for c in coords]
-        lats = [c[1] for c in coords]
-        min_lon, max_lon = min(lons), max(lons)
-        min_lat, max_lat = min(lats), max(lats)
+        # Calculate min/max without creating intermediate lists
+        min_lon = max_lon = coords[0][0]
+        min_lat = max_lat = coords[0][1]
+        
+        for lon, lat in coords[1:]:
+            if lon < min_lon: min_lon = lon
+            elif lon > max_lon: max_lon = lon
+            if lat < min_lat: min_lat = lat
+            elif lat > max_lat: max_lat = lat
 
         min_x = lon_to_tile_x(min_lon, zoom)
         max_x = lon_to_tile_x(max_lon, zoom)
@@ -190,7 +208,7 @@ def get_feature_tiles(coords: List[Tuple[float, float]], zoom: int, is_polygon: 
     return tiles
 
 
-def get_layer_for_tags(tags: Dict[str, str]) -> str:
+def get_layer_for_tags(tags: Dict[str, str]) -> Optional[str]:
     """Determine which layer a feature belongs to based on its tags."""
     for layer_name, feature_keys in LAYER_MAPPING.items():
         for feature_key in feature_keys:
@@ -204,37 +222,50 @@ def get_layer_for_tags(tags: Dict[str, str]) -> str:
     return None
 
 
-def get_zoom_for_tags(tags: Dict[str, str], config: Dict) -> int:
-    """Get minimum zoom level for feature based on config."""
+def get_config_value_for_tags(
+    tags: Dict[str, str], 
+    config: Dict, 
+    attribute: str, 
+    default: Any
+) -> Any:
+    """
+    Generic helper to get configuration values for feature tags.
+    
+    Args:
+        tags: Dictionary of OSM tags (key: value pairs)
+        config: Configuration dictionary with feature settings
+        attribute: The attribute to retrieve from config (e.g., 'zoom', 'color', 'priority')
+        default: Default value if nothing found
+        
+    Returns:
+        The configured value for attribute, or default if not found
+    """
     for key, value in tags.items():
+        # Try exact match first (key=value)
         feature_key = f"{key}={value}"
         if feature_key in config and isinstance(config[feature_key], dict):
-            return config[feature_key].get('zoom', 6)
+            return config[feature_key].get(attribute, default)
+        
+        # Then try key-only match
         if key in config and isinstance(config[key], dict):
-            return config[key].get('zoom', 6)
-    return 6
+            return config[key].get(attribute, default)
+    
+    return default
+
+
+def get_zoom_for_tags(tags: Dict[str, str], config: Dict) -> int:
+    """Get minimum zoom level for feature based on config."""
+    return get_config_value_for_tags(tags, config, 'zoom', 6)
 
 
 def get_color_for_tags(tags: Dict[str, str], config: Dict) -> str:
     """Get color for feature based on config."""
-    for key, value in tags.items():
-        feature_key = f"{key}={value}"
-        if feature_key in config and isinstance(config[feature_key], dict):
-            return config[feature_key].get('color', '#FFFFFF')
-        if key in config and isinstance(config[key], dict):
-            return config[key].get('color', '#FFFFFF')
-    return '#FFFFFF'
+    return get_config_value_for_tags(tags, config, 'color', '#FFFFFF')
 
 
 def get_priority_for_tags(tags: Dict[str, str], config: Dict) -> int:
     """Get rendering priority for feature based on config."""
-    for key, value in tags.items():
-        feature_key = f"{key}={value}"
-        if feature_key in config and isinstance(config[feature_key], dict):
-            return config[feature_key].get('priority', 50)
-        if key in config and isinstance(config[key], dict):
-            return config[key].get('priority', 50)
-    return 50
+    return get_config_value_for_tags(tags, config, 'priority', 50)
 
 
 def hex_to_rgb565(hex_color: str) -> int:
@@ -246,7 +277,8 @@ def hex_to_rgb565(hex_color: str) -> int:
         g = int(hex_color[3:5], 16)
         b = int(hex_color[5:7], 16)
         return ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3)
-    except:
+    except (ValueError, IndexError):
+        logger.warning(f"Invalid hex color format: {hex_color}, using default")
         return 0xFFFF
 
 
