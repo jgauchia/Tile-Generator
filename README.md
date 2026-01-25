@@ -37,7 +37,7 @@ pip install geopandas pyogrio shapely pygame osmium
 
 ```bash
 source venv/bin/activate
-python pbf_to_nav.py <input.pbf> <output_dir> features.json [--zoom 6-17]
+python tile_generator.py <input.pbf> <output_dir> features.json [--zoom 6-17]
 ```
 
 **Arguments:**
@@ -52,7 +52,7 @@ python pbf_to_nav.py <input.pbf> <output_dir> features.json [--zoom 6-17]
 **Example:**
 
 ```bash
-python pbf_to_nav.py andorra.osm.pbf ./nav_output features.json --zoom 6-17
+python tile_generator.py andorra.osm.pbf ./nav_output features.json --zoom 6-17
 ```
 
 ---
