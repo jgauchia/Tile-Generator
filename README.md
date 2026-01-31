@@ -5,11 +5,14 @@ Converts OpenStreetMap PBF files to NAV tiles for [IceNav](https://github.com/jg
 ## Features
 
 - **Direct PBF processing** - No intermediate formats (GOL, Docker, etc.)
-- **Tile-based structure** - Standard z/x/y tile layout (like PNG/OSM tiles)
-- **No clipping artifacts** - Features stored complete (no visible seams at tile edges)
+- **Tile-based structure** - Standard z/x/y tile layout
+- **Pre-calculated projection** - Mercator projection done on PC for zero-CPU rendering on ESP32
+- **Optimized Storage** - int16 relative coordinates with 12-byte aligned headers
+- **Multi-Ring Polygons** - Correctly handles islands and holes in water/land features
+- **Area Filtering** - Automatically discards polygons smaller than 4px² to reduce noise
+- **BBox-based Culling** - 4-byte object bounding box for ultra-fast visibility checks
+- **Seamless borders** - Features stored with 10% safety margin to avoid edge artifacts
 - **Feature filtering** - Configurable via `features.json`
-- **ESP32 optimized** - Small tiles, efficient for SD card access
-- **Progress bar** - Visual progress per zoom level during generation
 
 ## Requirements
 
@@ -28,7 +31,7 @@ python3 -m venv venv
 source venv/bin/activate
 
 # Install dependencies
-pip install geopandas pyogrio shapely pygame osmium
+pip install shapely pygame osmium
 ```
 
 ---
@@ -36,7 +39,6 @@ pip install geopandas pyogrio shapely pygame osmium
 ## Generate NAV Tiles
 
 ```bash
-source venv/bin/activate
 python tile_generator.py <input.pbf> <output_dir> features.json [--zoom 6-17]
 ```
 
@@ -49,24 +51,12 @@ python tile_generator.py <input.pbf> <output_dir> features.json [--zoom 6-17]
 | `features.json` | Feature configuration | Required |
 | `--zoom` | Zoom range (e.g., `6-17`, `10-14`, `12`) | `6-17` |
 
-**Example:**
-
-```bash
-python tile_generator.py andorra.osm.pbf ./nav_output features.json --zoom 6-17
-```
-
 ---
 
 ## View NAV Tiles
 
 ```bash
-python nav_viewer.py <nav_dir> --lat <latitude> --lon <longitude> [--zoom <level>]
-```
-
-**Example:**
-
-```bash
-python nav_viewer.py ./nav_output --lat 42.5063 --lon 1.5218 --zoom 14
+python tile_viewer.py <nav_dir> --lat <latitude> --lon <longitude> [--zoom <level>]
 ```
 
 **Viewer Controls:**
@@ -79,19 +69,19 @@ python nav_viewer.py ./nav_output --lat 42.5063 --lon 1.5218 --zoom 14
 | `B` | Toggle background (white/black) |
 | `F` | Toggle polygon fill |
 | `G` | Toggle tile grid |
+| `Right Click` | Identify feature info |
 | `Q` / `ESC` | Quit |
 
 ---
 
 ## NAV Binary Format Specification
 
-NAV is a proprietary binary format designed as a lightweight alternative to FlatGeobuf for embedded devices with limited resources. Unlike FlatGeobuf (which uses FlatBuffers serialization and R-Tree spatial indexing), NAV uses a minimal sequential structure optimized for ESP32's SD card access patterns.
+NAV is a proprietary binary format designed as a lightweight alternative to FlatGeobuf for embedded devices with limited resources. Optimized for ESP32's SD card access and low memory usage.
 
-**Key differences from FlatGeobuf:**
-- No FlatBuffers dependency - pure binary format
-- No R-Tree index - tiles are small enough for sequential reading
-- int32 scaled coordinates instead of float64 (~50% smaller)
-- Minimal header overhead
+**Key Features:**
+- Pre-projected Mercator coordinates relative to tile (0-4096 range).
+- int16 coordinates for minimal memory footprint.
+- Sequential structure for streaming reads.
 
 **File Header (22 bytes):**
 
@@ -99,10 +89,7 @@ NAV is a proprietary binary format designed as a lightweight alternative to Flat
 |--------|------|-------|-------------|
 | 0 | 4 | Magic | `NAV1` (0x4E, 0x41, 0x56, 0x31) |
 | 4 | 2 | Feature count | Number of features (little-endian) |
-| 6 | 4 | Min Lon | Bounding box min longitude (int32 scaled) |
-| 10 | 4 | Min Lat | Bounding box min latitude (int32 scaled) |
-| 14 | 4 | Max Lon | Bounding box max longitude (int32 scaled) |
-| 18 | 4 | Max Lat | Bounding box max latitude (int32 scaled) |
+| 6 | 16 | Tile BBox | lon_min, lat_min, lon_max, lat_max (4 x int32 scaled 1e7) |
 
 **Feature Record:**
 
@@ -110,110 +97,34 @@ NAV is a proprietary binary format designed as a lightweight alternative to Flat
 |------|-------|-------------|
 | 1 | Geometry type | 1=Point, 2=LineString, 3=Polygon |
 | 2 | Color | RGB565 color (little-endian) |
-| 1 | Zoom/Priority | High nibble = min_zoom, low nibble = priority/7 |
-| 1 | Width | Line width in pixels (1-15, from OSM `width`/`lanes` tags) |
+| 1 | Zoom/Priority | High nibble = min_zoom, low nibble = priority |
+| 1 | Width | Line width in pixels (1-15) |
+| 4 | Object BBox | Normalized relative BBox [x1, y1, x2, y2] (4 x uint8) |
 | 2 | Coord count | Number of coordinates (little-endian) |
-| 8×N | Coordinates | lon(int32) + lat(int32) pairs |
-| 1 | Ring count | (Polygons only) Number of rings |
+| 4×N | Coordinates | x(int16) + y(int16) relative to tile origin |
+| 1 | Ring count | (Polygons only) Number of rings (default 1) |
 | 2×R | Ring ends | (Polygons only) End index of each ring |
 
-**Width Calculation:**
+**Coordinate Mapping:**
 
-Width is derived from OSM tags and converted to pixels at the tile's zoom level:
-- `width=*` tag: meters converted to pixels
-- `lanes=*` tag: lanes × 3.5m converted to pixels
-- Default: 1 pixel if no width tag present
-
-Formula: `pixels = width_meters / (156543 × cos(lat) / 2^zoom)`
-
-**Coordinate Scaling:**
-
-Coordinates are stored as int32 scaled by 10,000,000 (1e7):
-- `int32_value = (int32_t)(float_coord * 10000000)`
-- `float_coord = (double)int32_value / 10000000.0`
-
-This provides ~1cm precision while using half the space of float64.
+Coordinates are pre-projected to a 12-bit tile space (0-4096).
+The ESP32 renderer converts these to screen pixels using a simple bit-shift:
+`pixel = (coord * tile_size) >> 12`
 
 ---
 
 ## Output Structure
 
-```
-output/
-├── 6/
-│   ├── 32/
-│   │   ├── 23.nav
-│   │   └── 24.nav
-│   └── 33/
-│       └── ...
-├── 13/
-│   └── ...
-└── 17/
-    └── ...
-```
-
-Standard z/x/y tile structure:
-- First level: zoom level
-- Second level: tile X coordinate
-- Third level: tile Y coordinate (`.nav` file)
-
-**Note:** Features are NOT clipped to tile boundaries. Each feature is stored complete in every tile it intersects.
+Standard z/x/y tile structure used by both IceNav and the viewer:
+`output_dir/<zoom>/<x>/<y>.nav`
 
 ---
 
 ## SD Card Structure
 
-Copy the output directory to your SD card:
-
-```
-/sdcard/NAVMAP/
-├── 6/
-│   └── 32/
-│       └── 23.nav
-├── 13/
-│   └── 4123/
-│       └── 2456.nav
-└── 17/
-    └── ...
-```
+Copy the output directory to your SD card: `/sdcard/NAVMAP/`
 
 ---
-
-## Feature Configuration
-
-The `features.json` file defines which OSM features to include:
-
-```json
-{
-  "highway=motorway": {
-    "zoom": 6,
-    "color": "#ff9999",
-    "priority": 60
-  },
-  "highway=primary": {
-    "zoom": 6,
-    "color": "#ffcc99",
-    "priority": 62
-  },
-  "building": {
-    "zoom": 15,
-    "color": "#dddddd",
-    "priority": 80
-  }
-}
-```
-
-| Field | Description |
-|-------|-------------|
-| `zoom` | Minimum zoom level for feature visibility |
-| `color` | Hex color (converted to RGB565 internally) |
-| `priority` | Render order (lower = background, higher = foreground) |
-
----
-
-## Download PBF Files
-
-Get OSM extracts from [Geofabrik](https://download.geofabrik.de/)
 
 ## License
 
@@ -221,4 +132,4 @@ MIT License
 
 ## Related Projects
 
-- [IceNav](https://github.com/jgauchia/IceNav-v3) - ESP32-based GPS navigator
+- [IceNav-v3](https://github.com/jgauchia/IceNav-v3) - ESP32-based GPS navigator

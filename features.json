@@ -1,6 +1,6 @@
 {
   "_comment": "OSM-style colors in RGB565 format. Priority: layer_base + (priority % 10).",
-  "_layers": "water:10, landuse:20, terrain:30, railways:40, roads:50, infrastructure:60, buildings:70, amenities:80, places:90",
+  "_layers": "landuse:10, terrain:20, water:30, amenities:35, railways:40, roads:50, infrastructure:60, buildings:70, places:90",
 
   "natural=coastline": {
     "zoom": 6,
@@ -8,6 +8,21 @@
     "priority": 10
   },
   "natural=water": {
+    "zoom": 12,
+    "color": "#aad3df",
+    "priority": 11
+  },
+  "water=river": {
+    "zoom": 12,
+    "color": "#aad3df",
+    "priority": 11
+  },
+  "water=canal": {
+    "zoom": 12,
+    "color": "#aad3df",
+    "priority": 11
+  },
+  "water=reservoir": {
     "zoom": 12,
     "color": "#aad3df",
     "priority": 11
@@ -89,21 +104,10 @@
     "color": "#eef0d5",
     "priority": 23
   },
-  "landuse=meadow": {
-    "zoom": 14,
-    "color": "#cdebb0",
-    "priority": 23
-  },
-  "landuse=grass": {
-    "zoom": 14,
-    "color": "#cdebb0",
-    "priority": 23
-  },
-
   "landuse=residential": {
     "zoom": 12,
     "color": "#e0dfdf",
-    "priority": 24
+    "priority": 20
   },
   "landuse=commercial": {
     "zoom": 14,
@@ -130,11 +134,15 @@
     "color": "#aacbaf",
     "priority": 24
   },
-
-  "landuse=park": {
-    "zoom": 12,
-    "color": "#c8facc",
-    "priority": 26
+  "landuse=grass": {
+    "zoom": 14,
+    "color": "#cdebb0",
+    "priority": 28
+  },
+  "landuse=meadow": {
+    "zoom": 14,
+    "color": "#cdebb0",
+    "priority": 28
   },
   "leisure=park": {
     "zoom": 12,
@@ -362,7 +370,17 @@
   "building": {
     "zoom": 15,
     "color": "#d9d0c9",
-    "priority": 80
+    "priority": 85
+  },
+  "building=college": {
+    "zoom": 15,
+    "color": "#d9d0c9",
+    "priority": 86
+  },
+  "building=university": {
+    "zoom": 15,
+    "color": "#d9d0c9",
+    "priority": 86
   },
   "leisure=stadium": {
     "zoom": 14,
@@ -383,17 +401,17 @@
   "amenity=hospital": {
     "zoom": 14,
     "color": "#f0c0c0",
-    "priority": 85
+    "priority": 80
   },
   "amenity=school": {
     "zoom": 15,
     "color": "#f0f0d8",
-    "priority": 85
+    "priority": 80
   },
   "amenity=university": {
     "zoom": 14,
     "color": "#f0f0d8",
-    "priority": 85
+    "priority": 80
   },
 
   "place=state": {
