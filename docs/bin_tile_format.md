@@ -1,6 +1,6 @@
 # NAV Tile Format Specification
 
-This document describes the NAV binary format produced by the tile generation script (`tile_generator.py`) for vector map tiles. The format is optimized for ESP32 embedded systems with compact storage and efficient rendering of map data.
+This document describes the optimized NAV binary format produced by `tile_generator.py`. The format is specifically designed for ultra-fast vector map rendering on ESP32 embedded systems by pre-calculating projections and using compact relative coordinates.
 
 ---
 
@@ -12,10 +12,7 @@ The filename and directory structure is:
 {output_dir}/{z}/{x}/{y}.nav
 ```
 
-The file contains a collection of vector features with geometry data and rendering information.  
-All coordinates are encoded as `int32` values scaled by `COORD_SCALE` (10,000,000) for ~1cm precision.
-
-The format uses **self-contained feature records** with individual colors and coordinates for maximum compatibility with embedded rendering systems.
+The format uses **tile-relative coordinates** (0-4096 range) with a pre-applied Mercator projection, allowing the ESP32 to draw features using simple bit-shifts and additions.
 
 ---
 
@@ -23,38 +20,93 @@ The format uses **self-contained feature records** with individual colors and co
 
 The file is a single binary blob with the following structure:
 
-| Field          | Type      | Size  | Description                               |
-|----------------|-----------|--------|-------------------------------------------|
-| magic          | bytes[4]  | 4      | Format identifier ("NAV1")               |
-| feature_count  | uint16    | 2      | Number of features in the tile              |
-| min_lon        | int32     | 4      | Minimum longitude (scaled by COORD_SCALE) |
-| min_lat        | int32     | 4      | Minimum latitude (scaled by COORD_SCALE)  |
-| max_lon        | int32     | 4      | Maximum longitude (scaled by COORD_SCALE) |
-| max_lat        | int32     | 4      | Maximum latitude (scaled by COORD_SCALE)  |
-| features[]     | variable  | —      | Sequence of feature records               |
+### 1. Tile Header (22 bytes)
 
-**Total Header Size**: 22 bytes
+| Offset | Field          | Type      | Size  | Description                               |
+|--------|----------------|-----------|--------|-------------------------------------------|
+| 0      | magic          | bytes[4]  | 4      | Format identifier ("NAV1")               |
+| 4      | feature_count  | uint16    | 2      | Number of features in the tile (Little-Endian) |
+| 6      | min_lon        | int32     | 4      | Tile min longitude (scaled 1e7)           |
+| 10     | min_lat        | int32     | 4      | Tile min latitude (scaled 1e7)            |
+| 14     | max_lon        | int32     | 4      | Tile max longitude (scaled 1e7)           |
+| 18     | max_lat        | int32     | 4      | Tile max latitude (scaled 1e7)            |
 
-- All coordinates are scaled by `COORD_SCALE = 10,000,000` for ~1cm precision
-- Coordinates are absolute geographic coordinates, not tile-relative
-- All multi-byte values use little-endian byte order
+### 2. Feature Records (Sequential)
 
----
-
-## Feature Record Structure
-
-Each feature contains a header followed by coordinate data:
+Each feature contains an 11-byte header followed by coordinate data:
 
 | Field            | Type   | Size | Description                                  |
 |------------------|--------|-------|----------------------------------------------|
-| geom_type        | uint8  | 1     | Geometry type (Point/LineString/Polygon)   |
-| color_rgb565     | uint16  | 2     | RGB565 color value                          |
-| zoom_priority     | uint8  | 1     | Packed zoom and priority information        |
-| width_pixels      | uint8  | 1     | Line width in pixels (NAV v2)             |
-| coord_count      | uint16  | 2     | Number of coordinate pairs                    |
-| coordinates[]    | int32[] | 8×N   | Longitude/latitude pairs for each point      |
+| geom_type        | uint8  | 1     | 1=Point, 2=LineString, 3=Polygon             |
+| color_rgb565     | uint16 | 2     | RGB565 color (Little-Endian)                 |
+| zoom_priority    | uint8  | 1     | High nibble: min_zoom, Low nibble: priority  |
+| width_pixels     | uint8  | 1     | Line width in pixels (1-15)                  |
+| bbox             | uint8[4]| 4     | Object BBox [x1, y1, x2, y2] normalized 0-255|
+| coord_count      | uint16 | 2     | Number of coordinate pairs                   |
+| coordinates[]    | int16[]| 4×N   | x, y pairs relative to tile origin (0-4096)  |
 
-**Feature Header Size**: 7 bytes + (8 × coord_count) bytes
+**Feature Header Size**: 11 bytes + (4 × coord_count) bytes
+
+---
+
+## Coordinate System
+
+### Pre-Calculated Projection
+Unlike standard formats, NAV stores coordinates **already projected** using the Web Mercator projection. The values are mapped to a 12-bit space (0-4096) relative to the tile's top-left corner.
+
+- **Range**: Coordinates usually fall between 0-4096, but values outside this range (e.g., -128 to 4224) are allowed to ensure seamless rendering across tile borders.
+- **Format**: Signed `int16` (2 bytes per component).
+
+### ESP32 Rendering Math
+To convert a NAV coordinate to a screen pixel, the ESP32 only needs to perform:
+```cpp
+pixel_x = (nav_x * screen_tile_size) >> 12;
+pixel_y = (nav_y * screen_tile_size) >> 12;
+```
+This eliminates all floating-point math and trigonometric functions during rendering.
+
+---
+
+## Object BBox Culling
+
+The 4-byte `bbox` field in the feature header allows for ultra-fast visibility checks before processing any points:
+- The coordinates `x1, y1, x2, y2` are the object's extent normalized to 0-255 (by shifting the 12-bit tile coordinates right by 4).
+- Reconstruction: `extent_px = bbox_val << 4`.
+- This allows the renderer to skip entire objects that are outside the current viewport with a single comparison.
+
+---
+
+## Geometry Types
+
+| Type  | Value | Description                              |
+|--------|-------|------------------------------------------|
+| POINT      | 1      | Single point feature                      |
+| LINESTRING | 2      | Polyline with multiple points             |
+| POLYGON    | 3      | Closed polygon. Followed by Ring info.    |
+
+### Polygon Ring Information
+For polygons, the following data follows the coordinate array:
+| Field          | Type   | Size | Description                    |
+|----------------|--------|-------|--------------------------------|
+| ring_count     | uint8  | 1     | Number of rings (default 1)    |
+| ring_ends[]    | uint16 | 2×R   | End index of each ring          |
+
+---
+
+## ESP32 Optimization Summary
+
+1.  **Memory**: `int16` coordinates reduce the memory footprint by 50% compared to `int32`.
+2.  **CPU**: No projection math required. All features are display-ready.
+3.  **IO**: Sequential structure and small tile headers are optimized for SD card streaming.
+4.  **Culling**: Header-based BBox allows discarding hidden features without reading their points.
+
+---
+
+## Versioning & Compatibility
+
+- **Identifier**: `NAV1` magic bytes.
+- **Current Version**: Optimized relative format (Jan 2026 update).
+- **Note**: This version is NOT backward compatible with readers expecting absolute `int32` coordinates.
 
 ---
 

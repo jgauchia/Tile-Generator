@@ -2,10 +2,11 @@
 """
 NAV Tile Viewer - ESP32 Map Simulator
 
-Displays NAV binary tiles in a 768x768 viewport (3x3 tiles of 256px).
+Displays NAV binary tiles using the optimized int16 relative coordinate format.
+Simulates the ESP32 rendering pipeline in a 768x768 viewport.
 
 Usage:
-    python nav_viewer.py nav_dir --lat 42.5063 --lon 1.5218 [--zoom 14]
+    python tile_viewer.py nav_dir --lat 42.5063 --lon 1.5218 [--zoom 14]
 """
 
 import os
@@ -27,7 +28,7 @@ except ImportError:
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Constants
+# UI Constants
 TILE_SIZE = 256
 VIEWPORT_SIZE = 768
 TOOLBAR_WIDTH = 200
@@ -37,16 +38,13 @@ WINDOW_HEIGHT = VIEWPORT_SIZE + STATUSBAR_HEIGHT
 
 # NAV format constants
 NAV_MAGIC = b'NAV1'
-COORD_SCALE = 10000000  # 1e7
-
-# Geometry types
 GEOM_POINT = 1
 GEOM_LINESTRING = 2
 GEOM_POLYGON = 3
 
 
 def deg2num(lat_deg: float, lon_deg: float, zoom: int) -> Tuple[float, float]:
-    """Convert lat/lon to tile numbers."""
+    """Convert lat/lon to fractional tile numbers (Web Mercator)."""
     lat_rad = math.radians(lat_deg)
     n = 2.0 ** zoom
     xtile = (lon_deg + 180.0) / 360.0 * n
@@ -55,7 +53,7 @@ def deg2num(lat_deg: float, lon_deg: float, zoom: int) -> Tuple[float, float]:
 
 
 def num2deg(xtile: float, ytile: float, zoom: int) -> Tuple[float, float]:
-    """Convert tile numbers to lat/lon."""
+    """Convert fractional tile numbers to lat/lon."""
     n = 2.0 ** zoom
     lon_deg = xtile / n * 360.0 - 180.0
     lat_rad = math.atan(math.sinh(math.pi * (1 - 2 * ytile / n)))
@@ -63,34 +61,8 @@ def num2deg(xtile: float, ytile: float, zoom: int) -> Tuple[float, float]:
     return lat_deg, lon_deg
 
 
-def get_bbox_for_viewport(center_lat: float, center_lon: float, zoom: int) -> Tuple[float, float, float, float]:
-    """Calculate bounding box for 3x3 tile viewport."""
-    center_x, center_y = deg2num(center_lat, center_lon, zoom)
-    center_tile_x = int(center_x)
-    center_tile_y = int(center_y)
-
-    min_tile_x = center_tile_x - 1
-    max_tile_x = center_tile_x + 2
-    min_tile_y = center_tile_y - 1
-    max_tile_y = center_tile_y + 2
-
-    max_lat, min_lon = num2deg(min_tile_x, min_tile_y, zoom)
-    min_lat, max_lon = num2deg(max_tile_x, max_tile_y, zoom)
-    return (min_lon, min_lat, max_lon, max_lat)
-
-
-def latlon_to_pixel(lat: float, lon: float, bbox: Tuple[float, float, float, float]) -> Tuple[int, int]:
-    """Convert lat/lon to pixel coordinates."""
-    min_lon, min_lat, max_lon, max_lat = bbox
-    x_norm = (lon - min_lon) / (max_lon - min_lon)
-    y_norm = (max_lat - lat) / (max_lat - min_lat)
-    px = int(x_norm * VIEWPORT_SIZE)
-    py = int(y_norm * VIEWPORT_SIZE)
-    return px, py
-
-
 def rgb565_to_rgb888(c: int) -> Tuple[int, int, int]:
-    """Convert RGB565 to RGB888."""
+    """Convert 16-bit RGB565 to 24-bit RGB888."""
     r = ((c >> 11) & 0x1F) << 3
     g = ((c >> 5) & 0x3F) << 2
     b = (c & 0x1F) << 3
@@ -98,79 +70,73 @@ def rgb565_to_rgb888(c: int) -> Tuple[int, int, int]:
 
 
 def darken_color(rgb: Tuple[int, int, int], amount: float = 0.3) -> Tuple[int, int, int]:
-    """Darken RGB color."""
+    """Apply darkening to an RGB color."""
     return tuple(max(0, int(v * (1 - amount))) for v in rgb)
 
 
 class NavFeature:
-    """Parsed NAV feature."""
+    """Parsed NAV feature with relative coordinates."""
     def __init__(self):
         self.geom_type = 0
         self.color_rgb565 = 0xFFFF
         self.zoom_priority = 0
-        self.width = 1  # Line width in pixels (NAV v2)
-        self.coords = []  # List of (lon, lat) floats
+        self.width = 1
+        self.bbox = (0, 0, 0, 0)  # [minX, minY, maxX, maxY] normalized 0-255
+        self.coords: List[Tuple[int, int]] = []  # Relative to tile (0-4096 range)
+        self.tile_x = 0
+        self.tile_y = 0
 
     @property
-    def min_zoom(self):
+    def min_zoom(self) -> int:
         return self.zoom_priority >> 4
 
     @property
-    def priority(self):
-        return (self.zoom_priority & 0x0F) * 7
+    def priority(self) -> int:
+        return self.zoom_priority & 0x0F
 
 
-def read_nav_tile(path: str) -> List[NavFeature]:
-    """Read NAV tile file and return list of features."""
+def read_nav_tile(path: str, tile_x: int, tile_y: int) -> List[NavFeature]:
+    """Read optimized NAV tile file and return list of features."""
     features = []
-
     try:
         with open(path, 'rb') as f:
-            # Read header (22 bytes)
             magic = f.read(4)
             if magic != NAV_MAGIC:
-                logger.warning(f"Invalid magic in {path}")
                 return features
 
             feature_count = struct.unpack('<H', f.read(2))[0]
-            f.read(16)  # bbox (unused)
+            f.read(16)  # Skip global tile BBox (16 bytes)
 
-            # Read features
             for _ in range(feature_count):
                 feature = NavFeature()
+                feature.tile_x = tile_x
+                feature.tile_y = tile_y
 
-                # Feature header (7 bytes)
+                # Feature header (11 bytes)
                 feature.geom_type = struct.unpack('<B', f.read(1))[0]
                 feature.color_rgb565 = struct.unpack('<H', f.read(2))[0]
                 feature.zoom_priority = struct.unpack('<B', f.read(1))[0]
                 feature.width = struct.unpack('<B', f.read(1))[0]
+                feature.bbox = struct.unpack('<BBBB', f.read(4))
                 coord_count = struct.unpack('<H', f.read(2))[0]
 
-                # Read coordinates
+                # Points are stored as signed int16 (4 bytes per point)
                 for _ in range(coord_count):
-                    lon_int = struct.unpack('<i', f.read(4))[0]
-                    lat_int = struct.unpack('<i', f.read(4))[0]
-                    lon = lon_int / COORD_SCALE
-                    lat = lat_int / COORD_SCALE
-                    feature.coords.append((lon, lat))
+                    px, py = struct.unpack('<hh', f.read(4))
+                    feature.coords.append((px, py))
 
-                # For polygons, skip ring info (unused)
                 if feature.geom_type == GEOM_POLYGON:
                     ring_count = struct.unpack('<B', f.read(1))[0]
-                    f.read(ring_count * 2)  # skip ring ends
+                    f.read(ring_count * 2)  # Skip ring ends
 
                 features.append(feature)
-
-    except (OSError, struct.error, ValueError) as e:
-        logger.warning(f"Error reading tile {path}: {e}")
-        return features  # Return empty list instead of continuing
-
+    except Exception as e:
+        logger.debug(f"Error reading tile {path}: {e}")
     return features
 
 
 class NAVViewer:
-    """NAV tile viewer."""
-
+    """Main viewer application logic."""
     def __init__(self, nav_dir: str):
         self.nav_dir = nav_dir
         self.available_zooms: Set[int] = set()
@@ -179,124 +145,84 @@ class NAVViewer:
         self.center_lat = 0.0
         self.center_lon = 0.0
         self.zoom = 14
-        self.bbox = None
         self.background_color = (255, 255, 255)
         self.fill_polygons = True
         self.show_tile_grid = False
+        
         self.last_query_stats = {}
-        self.cached_features = None
+        self.cached_features: Optional[List[NavFeature]] = None
         self.selected_feature = None
-        self.last_viewport_key = None  # Key para detectar cambios en viewport
-        self.cached_query_features = []  # Cache de features query
+        self.last_viewport_key = None
+        self.cached_query_features: List[NavFeature] = []
 
     def _index_tiles(self):
-        """Index available zoom levels."""
+        """Build an index of available zoom levels on disk."""
         if not os.path.isdir(self.nav_dir):
-            logger.error(f"Directory not found: {self.nav_dir}")
             return
-
         for name in os.listdir(self.nav_dir):
-            zoom_path = os.path.join(self.nav_dir, name)
-            if os.path.isdir(zoom_path) and name.isdigit():
-                zoom = int(name)
-                for x_name in os.listdir(zoom_path):
-                    x_path = os.path.join(zoom_path, x_name)
-                    if os.path.isdir(x_path) and x_name.isdigit():
-                        self.available_zooms.add(zoom)
-                        break
-
-        if self.available_zooms:
-            zooms_str = ", ".join(map(str, sorted(self.available_zooms)))
-            logger.info(f"Available zoom levels: {zooms_str}")
+            if name.isdigit() and os.path.isdir(os.path.join(self.nav_dir, name)):
+                self.available_zooms.add(int(name))
 
     def _get_tiles_for_viewport(self) -> List[Tuple[int, int]]:
-        """Get list of tiles for current viewport."""
+        """Identify which tiles are needed to cover the 768x768 viewport."""
         center_x, center_y = deg2num(self.center_lat, self.center_lon, self.zoom)
-        center_tile_x = int(center_x)
-        center_tile_y = int(center_y)
+        # Viewport is 3x3 tiles, but needs 4x4 for coverage when not aligned
+        min_tx = int(math.floor(center_x - 1.5))
+        max_tx = int(math.floor(center_x + 1.5))
+        min_ty = int(math.floor(center_y - 1.5))
+        max_ty = int(math.floor(center_y + 1.5))
 
         tiles = []
-        for dy in range(-1, 2):
-            for dx in range(-1, 2):
-                tile_x = center_tile_x + dx
-                tile_y = center_tile_y + dy
-                max_tile = 2 ** self.zoom - 1
-                if 0 <= tile_x <= max_tile and 0 <= tile_y <= max_tile:
-                    tiles.append((tile_x, tile_y))
-
+        max_tile = (2 ** self.zoom) - 1
+        for ty in range(min_ty, max_ty + 1):
+            for tx in range(min_tx, max_tx + 1):
+                if 0 <= tx <= max_tile and 0 <= ty <= max_tile:
+                    tiles.append((tx, ty))
         return tiles
 
     def _get_tile_path(self, x: int, y: int) -> str:
-        """Get file path for a tile."""
         return os.path.join(self.nav_dir, str(self.zoom), str(x), f"{y}.nav")
 
     def set_center(self, lat: float, lon: float, zoom: int = None):
-        """Set viewport center."""
         self.center_lat = lat
         self.center_lon = lon
         if zoom is not None:
             self.zoom = zoom
-        self.bbox = get_bbox_for_viewport(self.center_lat, self.center_lon, self.zoom)
-        # Invalidate cache when viewport changes
-        self.last_viewport_key = None
-        self.cached_query_features = []
+        self.last_viewport_key = None # Invalidate cache
 
     def query_features(self) -> List[NavFeature]:
-        """Query features from tiles."""
-        if self.bbox is None:
-            return []
-
-        # Check cache
+        """Load features from required tiles for current viewport."""
         current_key = (self.zoom, round(self.center_lat, 6), round(self.center_lon, 6))
-        if self.last_viewport_key == current_key and self.cached_query_features:
+        if self.last_viewport_key == current_key:
             return self.cached_query_features
 
         start = time.time()
-
         tiles = self._get_tiles_for_viewport()
         all_features = []
-        tiles_loaded = 0
-        tiles_missing = 0
+        loaded = 0
 
-        for tile_x, tile_y in tiles:
-            tile_path = self._get_tile_path(tile_x, tile_y)
-            if os.path.exists(tile_path):
-                features = read_nav_tile(tile_path)
-                # Filter by zoom
-                features = [f for f in features if f.min_zoom <= self.zoom]
-                all_features.extend(features)
-                tiles_loaded += 1
-            else:
-                tiles_missing += 1
-
-        elapsed = (time.time() - start) * 1000
+        for tx, ty in tiles:
+            path = self._get_tile_path(tx, ty)
+            if os.path.exists(path):
+                features = read_nav_tile(path, tx, ty)
+                all_features.extend([f for f in features if f.min_zoom <= self.zoom])
+                loaded += 1
 
         self.last_query_stats = {
-            'tiles_loaded': tiles_loaded,
-            'tiles_missing': tiles_missing,
+            'tiles': f"{loaded}/{len(tiles)}",
             'features': len(all_features),
-            'time_ms': elapsed
+            'time_ms': (time.time() - start) * 1000
         }
-
-        # Update cache
         self.last_viewport_key = current_key
         self.cached_query_features = all_features
-
         return all_features
 
     def render_to_surface(self, surface: pygame.Surface):
-        """Render features to pygame surface."""
-        if self.bbox is None:
-            return
-
         surface.fill(self.background_color)
-
         features = self.query_features()
         if not features:
-            self.cached_features = None
             return
 
-        # Sort by priority (needed when combining multiple tiles)
         features.sort(key=lambda f: f.priority)
         self.cached_features = features
 
@@ -306,150 +232,99 @@ class NAVViewer:
         if self.show_tile_grid:
             self._draw_tile_grid(surface)
 
-    def _render_feature(self, surface: pygame.Surface, feature: NavFeature):
-        """Render a single feature."""
-        if not feature.coords:
-            return
+    def _tile_coord_to_screen(self, tx: int, ty: int, px: int, py: int) -> Tuple[int, int]:
+        """Convert relative tile coordinate (0-4096) to viewport pixels."""
+        center_x, center_y = deg2num(self.center_lat, self.center_lon, self.zoom)
+        tl_x, tl_y = center_x - 1.5, center_y - 1.5
+        
+        # Unit position (in tiles) relative to viewport top-left
+        fx = (tx - tl_x) + (px / 4096.0)
+        fy = (ty - tl_y) + (py / 4096.0)
+        
+        return int(fx * TILE_SIZE), int(fy * TILE_SIZE)
 
+    def _render_feature(self, surface: pygame.Surface, feature: NavFeature):
+        if not feature.coords: return
         color = rgb565_to_rgb888(feature.color_rgb565)
 
         if feature.geom_type == GEOM_POINT:
-            self._render_point(surface, feature, color)
+            px, py = feature.coords[0]
+            sx, sy = self._tile_coord_to_screen(feature.tile_x, feature.tile_y, px, py)
+            if 0 <= sx < VIEWPORT_SIZE and 0 <= sy < VIEWPORT_SIZE:
+                pygame.draw.circle(surface, color, (sx, sy), 3)
+
         elif feature.geom_type == GEOM_LINESTRING:
-            self._render_linestring(surface, feature, color)
+            pts = [self._tile_coord_to_screen(feature.tile_x, feature.tile_y, x, y) for x, y in feature.coords]
+            if len(pts) >= 2:
+                pygame.draw.lines(surface, color, False, pts, max(1, feature.width))
+                if feature.width > 2:
+                    for p in pts: pygame.draw.circle(surface, color, p, feature.width // 2)
+
         elif feature.geom_type == GEOM_POLYGON:
-            self._render_polygon(surface, feature, color)
-
-    def _render_point(self, surface: pygame.Surface, feature: NavFeature, color: Tuple[int, int, int]):
-        """Render point."""
-        if feature.coords:
-            lon, lat = feature.coords[0]
-            px, py = latlon_to_pixel(lat, lon, self.bbox)
-            if 0 <= px < VIEWPORT_SIZE and 0 <= py < VIEWPORT_SIZE:
-                pygame.draw.circle(surface, color, (px, py), 3)
-
-    def _render_linestring(self, surface: pygame.Surface, feature: NavFeature, color: Tuple[int, int, int]):
-        """Render linestring with width and round joins."""
-        points = []
-        for lon, lat in feature.coords:
-            px, py = latlon_to_pixel(lat, lon, self.bbox)
-            points.append((px, py))
-
-        if len(points) >= 2:
-            width = max(1, feature.width)
-            pygame.draw.lines(surface, color, False, points, width)
-            # Add round joins for thick lines
-            if width > 2:
-                radius = width // 2
-                for px, py in points:
-                    pygame.draw.circle(surface, color, (px, py), radius)
-
-    def _render_polygon(self, surface: pygame.Surface, feature: NavFeature, color: Tuple[int, int, int]):
-        """Render polygon."""
-        points = []
-        for lon, lat in feature.coords:
-            px, py = latlon_to_pixel(lat, lon, self.bbox)
-            points.append((px, py))
-
-        if len(points) >= 3:
-            if self.fill_polygons:
-                pygame.draw.polygon(surface, color, points)
-                border_color = darken_color(color, 0.4)
-                pygame.draw.polygon(surface, border_color, points, 1)
-            else:
-                pygame.draw.polygon(surface, color, points, 1)
+            pts = [self._tile_coord_to_screen(feature.tile_x, feature.tile_y, x, y) for x, y in feature.coords]
+            if len(pts) >= 3:
+                if self.fill_polygons:
+                    pygame.draw.polygon(surface, color, pts)
+                    pygame.draw.polygon(surface, darken_color(color), pts, 1)
+                else:
+                    pygame.draw.polygon(surface, color, pts, 1)
 
     def _draw_tile_grid(self, surface: pygame.Surface):
-        """Draw tile grid overlay."""
         grid_color = (100, 100, 100)
         font = pygame.font.SysFont(None, 14)
-
-        for i in range(4):
-            x = i * TILE_SIZE
-            pygame.draw.line(surface, grid_color, (x, 0), (x, VIEWPORT_SIZE), 1)
-        for i in range(4):
-            y = i * TILE_SIZE
-            pygame.draw.line(surface, grid_color, (0, y), (VIEWPORT_SIZE, y), 1)
-
-        tiles = self._get_tiles_for_viewport()
         center_x, center_y = deg2num(self.center_lat, self.center_lon, self.zoom)
-        center_tile_x = int(center_x)
-        center_tile_y = int(center_y)
+        tl_x, tl_y = center_x - 1.5, center_y - 1.5
 
-        for dy in range(-1, 2):
-            for dx in range(-1, 2):
-                tile_x = center_tile_x + dx
-                tile_y = center_tile_y + dy
-                screen_x = (dx + 1) * TILE_SIZE + 5
-                screen_y = (dy + 1) * TILE_SIZE + 5
-                tile_path = self._get_tile_path(tile_x, tile_y)
-                exists = os.path.exists(tile_path)
-                color = (0, 100, 0) if exists else (150, 50, 50)
-                label = font.render(f"{tile_x}/{tile_y}", True, color)
-                surface.blit(label, (screen_x, screen_y))
+        for ty in range(int(math.floor(tl_y)), int(math.floor(tl_y + 4))):
+            for tx in range(int(math.floor(tl_x)), int(math.floor(tl_x + 4))):
+                sx, sy = int((tx - tl_x) * TILE_SIZE), int((ty - tl_y) * TILE_SIZE)
+                pygame.draw.rect(surface, grid_color, (sx, sy, TILE_SIZE, TILE_SIZE), 1)
+                
+                path = self._get_tile_path(tx, ty)
+                exists = os.path.exists(path)
+                color = (0, 0, 0) if exists else (150, 50, 50)
+                label = font.render(f"{tx}/{ty}", True, color, (255, 255, 255))
+                surface.blit(label, (sx + 5, sy + 5))
 
     def identify_feature_at(self, pixel_x: int, pixel_y: int) -> Optional[dict]:
-        """Identify feature at pixel coordinates."""
-        if self.cached_features is None or self.bbox is None:
-            return None
+        if not self.cached_features: return None
+        center_x, center_y = deg2num(self.center_lat, self.center_lon, self.zoom)
+        tl_x, tl_y = center_x - 1.5, center_y - 1.5
+        fx, fy = tl_x + (pixel_x / TILE_SIZE), tl_y + (pixel_y / TILE_SIZE)
 
-        min_lon, min_lat, max_lon, max_lat = self.bbox
-        lon = min_lon + (pixel_x / VIEWPORT_SIZE) * (max_lon - min_lon)
-        lat = max_lat - (pixel_y / VIEWPORT_SIZE) * (max_lat - min_lat)
-
-        # Search in reverse priority order
         for feature in reversed(self.cached_features):
-            if self._point_in_feature(lon, lat, feature):
+            if self._point_in_feature(fx, fy, feature):
+                bx1, by1, bx2, by2 = feature.bbox
                 return {
+                    'type': ['?', 'Point', 'Line', 'Polygon'][feature.geom_type],
                     'color': f"#{rgb565_to_rgb888(feature.color_rgb565)[0]:02x}{rgb565_to_rgb888(feature.color_rgb565)[1]:02x}{rgb565_to_rgb888(feature.color_rgb565)[2]:02x}",
-                    'min_zoom': feature.min_zoom,
-                    'priority': feature.priority,
-                    'geom_type': ['?', 'Point', 'Line', 'Polygon'][feature.geom_type],
-                    'coords': len(feature.coords)
+                    'zoom': feature.min_zoom,
+                    'pts': len(feature.coords),
+                    'bbox': f"({bx1},{by1})-({bx2},{by2})"
                 }
-
         return None
 
-    def _point_in_feature(self, lon: float, lat: float, feature: NavFeature) -> bool:
-        """Check if point is in/near feature."""
+    def _point_in_feature(self, fx: float, fy: float, feature: NavFeature) -> bool:
+        # Convert feature to global tile units for intersection test
+        f_pts = [(feature.tile_x + px/4096.0, feature.tile_y + py/4096.0) for px, py in feature.coords]
         if feature.geom_type == GEOM_POLYGON:
-            # Simple point-in-polygon test
-            n = len(feature.coords)
             inside = False
-            j = n - 1
-            for i in range(n):
-                xi, yi = feature.coords[i]
-                xj, yj = feature.coords[j]
-                if ((yi > lat) != (yj > lat)) and (lon < (xj - xi) * (lat - yi) / (yj - yi) + xi):
+            for i in range(len(f_pts)):
+                p1, p2 = f_pts[i], f_pts[i - 1]
+                if ((p1[1] > fy) != (p2[1] > fy)) and (fx < (p2[0] - p1[0]) * (fy - p1[1]) / (p2[1] - p1[1]) + p1[0]):
                     inside = not inside
-                j = i
             return inside
         elif feature.geom_type == GEOM_LINESTRING:
-            # Check distance to line segments
-            tolerance = (self.bbox[2] - self.bbox[0]) / VIEWPORT_SIZE * 5
-            for i in range(len(feature.coords) - 1):
-                x1, y1 = feature.coords[i]
-                x2, y2 = feature.coords[i + 1]
-                dist = self._point_to_segment_dist(lon, lat, x1, y1, x2, y2)
-                if dist < tolerance:
-                    return True
-        elif feature.geom_type == GEOM_POINT and feature.coords:
-            x, y = feature.coords[0]
-            tolerance = (self.bbox[2] - self.bbox[0]) / VIEWPORT_SIZE * 10
-            if abs(lon - x) < tolerance and abs(lat - y) < tolerance:
-                return True
+            tol = 5.0 / TILE_SIZE
+            for i in range(len(f_pts) - 1):
+                p1, p2 = f_pts[i], f_pts[i + 1]
+                dx, dy = p2[0] - p1[0], p2[1] - p1[1]
+                if dx == 0 and dy == 0: d = math.sqrt((fx-p1[0])**2 + (fy-p1[1])**2)
+                else:
+                    t = max(0, min(1, ((fx - p1[0]) * dx + (fy - p1[1]) * dy) / (dx*dx + dy*dy)))
+                    d = math.sqrt((fx - (p1[0] + t*dx))**2 + (fy - (p1[1] + t*dy))**2)
+                if d < tol: return True
         return False
-
-    def _point_to_segment_dist(self, px, py, x1, y1, x2, y2):
-        """Calculate distance from point to line segment."""
-        dx = x2 - x1
-        dy = y2 - y1
-        if dx == 0 and dy == 0:
-            return math.sqrt((px - x1)**2 + (py - y1)**2)
-        t = max(0, min(1, ((px - x1) * dx + (py - y1) * dy) / (dx * dx + dy * dy)))
-        proj_x = x1 + t * dx
-        proj_y = y1 + t * dy
-        return math.sqrt((px - proj_x)**2 + (py - proj_y)**2)
 
 
 def draw_button(surface, text, rect, bg_color, fg_color, border_color, font):

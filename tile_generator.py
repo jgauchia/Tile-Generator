@@ -3,20 +3,14 @@
 PBF to NAV Tile Converter
 
 Converts OpenStreetMap .pbf files to NAV binary format (.nav) with tile structure.
-NAV format uses int32 coordinates (scaled by 1e7) for ~50% size reduction vs FlatGeobuf.
+NAV format optimized for ESP32:
+- 22-byte tile header (Magic, Count, Bbox)
+- 11-byte feature header (Type, Color, Zoom/Priority, Width, BBox, Count)
+- int16 relative coordinates (0-4096 range with safety margin)
+- ~50% size reduction vs previous version
 
 Usage:
-    python pbf_to_nav.py input.pbf output_dir features.json [--zoom 6-17]
-
-Output structure:
-    output_dir/
-    ├── 13/
-    │   ├── 4123/
-    │   │   ├── 2456.nav
-    │   │   └── ...
-    │   └── ...
-    └── 14/
-        └── ...
+    python tile_generator.py input.pbf output_dir features.json [--zoom 6-17]
 """
 
 import os
@@ -551,78 +545,128 @@ def simplify_coords(coords: List[Tuple[float, float]], tolerance: float) -> List
     return coords
 
 
-def write_nav_tile(features: List[Dict], output_path: str, zoom: int) -> bool:
-    """Write features to NAV binary tile format."""
+def write_nav_tile(features: List[Dict], output_path: str, zoom: int, tile_x: int, tile_y: int) -> bool:
+    """
+    Write features to NAV binary tile format using relative coordinates.
+    Format:
+    - Tile Header (22 bytes):
+        - Magic: 'NAV1' (4)
+        - Count: uint16 (2)
+        - BBox: 4 x int32 (16) [lon_min, lat_min, lon_max, lat_max] * 1e7
+    - Features:
+        - Header (11 bytes):
+            - Type: uint8 (1)
+            - Color: uint16 RGB565 (2)
+            - Zoom/Priority: uint8 (1)
+            - Width: uint8 (1)
+            - BBox: 4 x uint8 (4) [x1, y1, x2, y2] / 16
+            - Point Count: uint16 (2)
+        - Points: n x (int16 x, int16 y) relative to tile (0-4096)
+        - Polygon rings (optional):
+            - Ring count: uint8 (1)
+            - Ring ends: n x uint16 (2)
+    """
     if not features:
         return False
 
-    tolerance = get_simplify_tolerance(zoom)
+    # Calculate tile bounds for projection
+    n = 2.0 ** zoom
+    lon_deg_per_tile = 360.0 / n
+    tile_min_lon = -180.0 + tile_x * lon_deg_per_tile
+    tile_max_lon = tile_min_lon + lon_deg_per_tile
+    
+    def lat_to_merc(l):
+        r = math.radians(l)
+        r = max(-0.999 * math.pi / 2, min(0.999 * math.pi / 2, r))
+        return math.log(math.tan(r) + (1.0 / math.cos(r)))
 
-    # Calculate bounding box
-    all_lons = []
-    all_lats = []
-    for f in features:
-        for lon, lat in f['coords']:
-            all_lons.append(lon)
-            all_lats.append(lat)
+    def lat_from_tile_y(y, z):
+        n = 2.0 ** z
+        lat_rad = math.atan(math.sinh(math.pi * (1 - 2 * y / n)))
+        return math.degrees(lat_rad)
 
-    if not all_lons:
-        return False
+    tile_max_lat = lat_from_tile_y(tile_y, zoom)
+    tile_min_lat = lat_from_tile_y(tile_y + 1, zoom)
+    
+    t_max_merc = lat_to_merc(tile_max_lat)
+    t_min_merc = lat_to_merc(tile_min_lat)
+    merc_range = t_max_merc - t_min_merc
 
-    min_lon = min(all_lons)
-    min_lat = min(all_lats)
-    max_lon = max(all_lons)
-    max_lat = max(all_lats)
-
-    # Create output directory
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
+    written_features = 0
     with open(output_path, 'wb') as f:
-        # Write header (22 bytes)
-        f.write(NAV_MAGIC)  # 4 bytes
-        f.write(struct.pack('<H', len(features)))  # 2 bytes
-        f.write(struct.pack('<i', int(min_lon * COORD_SCALE)))  # 4 bytes
-        f.write(struct.pack('<i', int(min_lat * COORD_SCALE)))  # 4 bytes
-        f.write(struct.pack('<i', int(max_lon * COORD_SCALE)))  # 4 bytes
-        f.write(struct.pack('<i', int(max_lat * COORD_SCALE)))  # 4 bytes
+        # Tile Header (22 bytes)
+        f.write(struct.pack('<4sHiiii', NAV_MAGIC, 0, 
+                           int(tile_min_lon * COORD_SCALE), 
+                           int(tile_min_lat * COORD_SCALE), 
+                           int(tile_max_lon * COORD_SCALE), 
+                           int(tile_max_lat * COORD_SCALE)))
 
-        # Write features
         for feature in features:
             coords = feature['coords']
-
-            # Simplify coordinates
-            if len(coords) > 2:
-                coords = simplify_coords(coords, tolerance)
-
-            # Skip if too few coordinates after simplification
-            if feature['geom_type'] == GEOM_LINESTRING and len(coords) < 2:
-                continue
-            if feature['geom_type'] == GEOM_POLYGON and len(coords) < 4:
+            if not coords: 
                 continue
 
-            # Calculate width in pixels (convert meters to pixels at this zoom)
-            width_meters = feature.get('width_meters', 0.0)
-            if width_meters > 0:
-                width_pixels = meters_to_pixels(width_meters, zoom)
-            else:
-                width_pixels = 1  # Default width
+            projected = []
+            f_min_x, f_min_y = 4096, 4096
+            f_max_x, f_max_y = 0, 0
+            
+            # Visibility check with 1-tile safety margin
+            is_visible = False
 
-            # Write feature header
-            f.write(struct.pack('<B', feature['geom_type']))  # 1 byte
-            f.write(struct.pack('<H', feature['color_rgb565']))  # 2 bytes
-            f.write(struct.pack('<B', feature['zoom_priority']))  # 1 byte
-            f.write(struct.pack('<B', width_pixels))  # 1 byte (NAV v2)
-            f.write(struct.pack('<H', len(coords)))  # 2 bytes
-
-            # Write coordinates as int32
             for lon, lat in coords:
-                f.write(struct.pack('<i', int(lon * COORD_SCALE)))
-                f.write(struct.pack('<i', int(lat * COORD_SCALE)))
+                # Project Lon -> X (0-4096)
+                px = int((lon - tile_min_lon) / (tile_max_lon - tile_min_lon) * 4096)
+                
+                # Project Lat -> Y (0-4096) using Mercator
+                m_y = lat_to_merc(lat)
+                py = int((t_max_merc - m_y) / merc_range * 4096)
+                
+                if -4096 < px < 8192 and -4096 < py < 8192:
+                    is_visible = True
+                
+                # Clamp to signed short range for safety
+                px = max(-32768, min(32767, px))
+                py = max(-32768, min(32767, py))
+                
+                projected.append((px, py))
+                
+                # Internal BBox for culling (clamped to tile 0-4096)
+                c_px, c_py = max(0, min(4096, px)), max(0, min(4096, py))
+                f_min_x, f_min_y = min(f_min_x, c_px), min(f_min_y, c_py)
+                f_max_x, f_max_y = max(f_max_x, c_px), max(f_max_y, c_py)
 
-            # For polygons, write ring info (single ring for now)
+            if not is_visible: 
+                continue
+
+            # Feature Header (11 bytes)
+            width_meters = feature.get('width_meters', 0.0)
+            width_pixels = meters_to_pixels(width_meters, zoom) if width_meters > 0 else 1
+            
+            bx1, by1 = max(0, min(255, f_min_x >> 4)), max(0, min(255, f_min_y >> 4))
+            bx2, by2 = max(0, min(255, f_max_x >> 4)), max(0, min(255, f_max_y >> 4))
+
+            f.write(struct.pack('<B', feature['geom_type']))
+            f.write(struct.pack('<H', feature['color_rgb565']))
+            f.write(struct.pack('<B', feature['zoom_priority']))
+            f.write(struct.pack('<B', width_pixels))
+            f.write(struct.pack('<BBBB', bx1, by1, bx2, by2))
+            f.write(struct.pack('<H', len(projected)))
+
+            # Points (int16 pairs)
+            for px, py in projected:
+                f.write(struct.pack('<hh', px, py))
+
             if feature['geom_type'] == GEOM_POLYGON:
-                f.write(struct.pack('<B', 1))  # 1 ring
-                f.write(struct.pack('<H', len(coords)))  # ring end
+                f.write(struct.pack('<B', 1)) # Single ring supported for now
+                f.write(struct.pack('<H', len(projected)))
+
+            written_features += 1
+
+        # Final update of feature count in header
+        f.seek(4)
+        f.write(struct.pack('<H', written_features))
 
     return True
 
@@ -664,17 +708,27 @@ def convert_pbf_to_nav(input_pbf: str, output_dir: str, config_file: str,
 
     for zoom in range(zoom_range[0], zoom_range[1] + 1):
         tile_features: Dict[Tuple[int, int], List[Dict]] = defaultdict(list)
+        tolerance = get_simplify_tolerance(zoom)
 
         for feature in handler.features:
             min_zoom = feature['zoom_priority'] >> 4
             if min_zoom > zoom:
                 continue
 
-            is_polygon = feature['geom_type'] == GEOM_POLYGON
-            tiles = get_feature_tiles(feature['coords'], zoom, is_polygon)
+            # Simplify once per zoom level
+            coords = feature['coords']
+            if len(coords) > 2:
+                coords = simplify_coords(coords, tolerance)
+            
+            # Create a shallow copy with simplified coords for this zoom
+            zoom_feature = feature.copy()
+            zoom_feature['coords'] = coords
+
+            is_polygon = zoom_feature['geom_type'] == GEOM_POLYGON
+            tiles = get_feature_tiles(zoom_feature['coords'], zoom, is_polygon)
 
             for tile in tiles:
-                tile_features[tile].append(feature)
+                tile_features[tile].append(zoom_feature)
 
         if not tile_features:
             continue
@@ -696,7 +750,7 @@ def convert_pbf_to_nav(input_pbf: str, output_dir: str, config_file: str,
             # Pre-sort by priority (low nibble) for streaming render on ESP32
             features.sort(key=lambda f: f['zoom_priority'] & 0x0F)
 
-            if write_nav_tile(features, tile_path, zoom):
+            if write_nav_tile(features, tile_path, zoom, x, y):
                 tiles_written += 1
                 total_size += os.path.getsize(tile_path)
 
@@ -733,13 +787,10 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 NAV Format - IceNav Navigation Tiles:
-  - int32 coordinates (scaled by 1e7) for ~50% size reduction
-  - Simple binary format optimized for ESP32
-  - Same z/x/y tile structure as standard map tiles
-
-Examples:
-    python pbf_to_nav.py andorra.pbf ./output features.json
-    python pbf_to_nav.py spain.pbf ./output features.json --zoom 10-17
+  - int16 relative coordinates (0-4096) for ~50% size reduction
+  - Pre-calculated projection for ultra-fast rendering on ESP32
+  - BBox-based culling for improved performance
+  - Simple binary format optimized for streaming
         """
     )
 
