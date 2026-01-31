@@ -112,13 +112,14 @@ def read_nav_tile(path: str, tile_x: int, tile_y: int) -> List[NavFeature]:
                 feature.tile_x = tile_x
                 feature.tile_y = tile_y
 
-                # Feature header (11 bytes)
+                # Feature header (12 bytes aligned)
                 feature.geom_type = struct.unpack('<B', f.read(1))[0]
                 feature.color_rgb565 = struct.unpack('<H', f.read(2))[0]
                 feature.zoom_priority = struct.unpack('<B', f.read(1))[0]
                 feature.width = struct.unpack('<B', f.read(1))[0]
                 feature.bbox = struct.unpack('<BBBB', f.read(4))
                 coord_count = struct.unpack('<H', f.read(2))[0]
+                f.read(1) # Skip padding byte (alignment)
 
                 # Points are stored as signed int16 (4 bytes per point)
                 for _ in range(coord_count):

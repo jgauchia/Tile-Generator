@@ -653,6 +653,7 @@ def write_nav_tile(features: List[Dict], output_path: str, zoom: int, tile_x: in
             f.write(struct.pack('<B', width_pixels))
             f.write(struct.pack('<BBBB', bx1, by1, bx2, by2))
             f.write(struct.pack('<H', len(projected)))
+            f.write(b'\x00') # 1 byte padding for 12-byte header (alignment)
 
             # Points (int16 pairs)
             for px, py in projected:
