@@ -7,9 +7,11 @@ Converts OpenStreetMap PBF files to NAV tiles for [IceNav](https://github.com/jg
 - **Direct PBF processing** - No intermediate formats (GOL, Docker, etc.)
 - **Tile-based structure** - Standard z/x/y tile layout
 - **Pre-calculated projection** - Mercator projection done on PC for zero-CPU rendering on ESP32
-- **Optimized Storage** - int16 relative coordinates (~50% smaller than previous versions)
+- **Optimized Storage** - int16 relative coordinates with 12-byte aligned headers
+- **Multi-Ring Polygons** - Correctly handles islands and holes in water/land features
+- **Area Filtering** - Automatically discards polygons smaller than 4px² to reduce noise
 - **BBox-based Culling** - 4-byte object bounding box for ultra-fast visibility checks
-- **Seamless borders** - Features stored with safety margin to avoid edge artifacts
+- **Seamless borders** - Features stored with 10% safety margin to avoid edge artifacts
 - **Feature filtering** - Configurable via `features.json`
 
 ## Requirements

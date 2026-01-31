@@ -29,8 +29,9 @@
 
 The viewer expects the optimized binary structure:
 - **Header**: 22-byte tile header (Magic, Count, Lat/Lon BBox).
-- **Features**: 11-byte feature header including a 4-byte object-level BBox for culling.
-- **Coordinates**: Signed `int16` pairs relative to the tile origin (0-4096 range with safety margin).
+- **Features**: 12-byte aligned feature header including a 4-byte object-level BBox for culling.
+- **Coordinates**: Signed `int16` pairs relative to the tile origin (0-4096 range with 10% safety margin).
+- **Multi-Ring Support**: Correctly renders complex polygons with holes (islands).
 
 ---
 
@@ -39,15 +40,15 @@ The viewer expects the optimized binary structure:
 ### Mouse Controls
 
 - **Left Click + Drag**: Pan the map.
-- **Mouse Wheel**: Zoom in/out.
+- **Mouse Wheel**: Zoom in/out (limited to available zoom levels).
 - **Right Click**: Identify the feature under the cursor (shows details in the sidebar).
 
 ### Keyboard Controls
 
 - **Arrow Keys**: Pan map (speed scales with zoom).
-- **`[` / `]`**: Zoom out / zoom in.
+- **`[` / `]`**: Zoom out / zoom in (limited to available zoom levels).
 - **`B`**: Toggle background color (White/Black).
-- **`F`**: Toggle polygon fill.
+- **`F`**: Toggle polygon fill (renders holes with background color).
 - **`G`**: Toggle tile grid and coordinate labels.
 - **`Q` / `ESC`**: Quit application.
 

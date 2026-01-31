@@ -69,20 +69,21 @@ def rgb565_to_rgb888(c: int) -> Tuple[int, int, int]:
     return (r, g, b)
 
 
-def darken_color(rgb: Tuple[int, int, int], amount: float = 0.3) -> Tuple[int, int, int]:
-    """Apply darkening to an RGB color."""
+def darken_color(rgb: Tuple[int, int, int], amount: float = 0.15) -> Tuple[int, int, int]:
+    """Apply subtle darkening to an RGB color (closer to OSM style)."""
     return tuple(max(0, int(v * (1 - amount))) for v in rgb)
 
 
 class NavFeature:
-    """Parsed NAV feature with relative coordinates."""
+    """Parsed NAV feature with relative coordinates and multiple rings."""
     def __init__(self):
         self.geom_type = 0
         self.color_rgb565 = 0xFFFF
         self.zoom_priority = 0
         self.width = 1
-        self.bbox = (0, 0, 0, 0)  # [minX, minY, maxX, maxY] normalized 0-255
-        self.coords: List[Tuple[int, int]] = []  # Relative to tile (0-4096 range)
+        self.bbox = (0, 0, 0, 0)
+        self.coords: List[Tuple[int, int]] = []  # All points for all rings
+        self.ring_ends: List[int] = []  # Indices where each ring ends
         self.tile_x = 0
         self.tile_y = 0
 
@@ -94,9 +95,20 @@ class NavFeature:
     def priority(self) -> int:
         return self.zoom_priority & 0x0F
 
+    def get_rings(self) -> List[List[Tuple[int, int]]]:
+        """Split the single coords list into multiple rings."""
+        if not self.ring_ends:
+            return [self.coords]
+        rings = []
+        start = 0
+        for end in self.ring_ends:
+            rings.append(self.coords[start:end])
+            start = end
+        return rings
+
 
 def read_nav_tile(path: str, tile_x: int, tile_y: int) -> List[NavFeature]:
-    """Read optimized NAV tile file and return list of features."""
+    """Read optimized NAV tile file and return list of features with rings."""
     features = []
     try:
         with open(path, 'rb') as f:
@@ -105,30 +117,29 @@ def read_nav_tile(path: str, tile_x: int, tile_y: int) -> List[NavFeature]:
                 return features
 
             feature_count = struct.unpack('<H', f.read(2))[0]
-            f.read(16)  # Skip global tile BBox (16 bytes)
+            f.read(16)  # Skip global tile BBox
 
             for _ in range(feature_count):
                 feature = NavFeature()
                 feature.tile_x = tile_x
                 feature.tile_y = tile_y
 
-                # Feature header (12 bytes aligned)
                 feature.geom_type = struct.unpack('<B', f.read(1))[0]
                 feature.color_rgb565 = struct.unpack('<H', f.read(2))[0]
                 feature.zoom_priority = struct.unpack('<B', f.read(1))[0]
                 feature.width = struct.unpack('<B', f.read(1))[0]
                 feature.bbox = struct.unpack('<BBBB', f.read(4))
                 coord_count = struct.unpack('<H', f.read(2))[0]
-                f.read(1) # Skip padding byte (alignment)
+                f.read(1)
 
-                # Points are stored as signed int16 (4 bytes per point)
                 for _ in range(coord_count):
                     px, py = struct.unpack('<hh', f.read(4))
                     feature.coords.append((px, py))
 
                 if feature.geom_type == GEOM_POLYGON:
                     ring_count = struct.unpack('<B', f.read(1))[0]
-                    f.read(ring_count * 2)  # Skip ring ends
+                    for _ in range(ring_count):
+                        feature.ring_ends.append(struct.unpack('<H', f.read(2))[0])
 
                 features.append(feature)
     except Exception as e:
@@ -184,6 +195,16 @@ class NAVViewer:
     def _get_tile_path(self, x: int, y: int) -> str:
         return os.path.join(self.nav_dir, str(self.zoom), str(x), f"{y}.nav")
 
+    @property
+    def bbox(self) -> Tuple[float, float, float, float]:
+        """Return the (min_lon, min_lat, max_lon, max_lat) of the current viewport."""
+        center_x, center_y = deg2num(self.center_lat, self.center_lon, self.zoom)
+        tl_x, tl_y = center_x - 1.5, center_y - 1.5
+        br_x, br_y = center_x + 1.5, center_y + 1.5
+        lat1, lon1 = num2deg(tl_x, tl_y, self.zoom)
+        lat2, lon2 = num2deg(br_x, br_y, self.zoom)
+        return min(lon1, lon2), min(lat1, lat2), max(lon1, lon2), max(lat1, lat2)
+
     def set_center(self, lat: float, lon: float, zoom: int = None):
         self.center_lat = lat
         self.center_lon = lon
@@ -210,7 +231,8 @@ class NAVViewer:
                 loaded += 1
 
         self.last_query_stats = {
-            'tiles': f"{loaded}/{len(tiles)}",
+            'tiles_loaded': loaded,
+            'tiles_total': len(tiles),
             'features': len(all_features),
             'time_ms': (time.time() - start) * 1000
         }
@@ -222,13 +244,36 @@ class NAVViewer:
         surface.fill(self.background_color)
         features = self.query_features()
         if not features:
+            self.cached_features = []
             return
 
-        features.sort(key=lambda f: f.priority)
-        self.cached_features = features
+        self.cached_features = features # Update for identify_feature_at
 
-        for feature in features:
-            self._render_feature(surface, feature)
+        # Group features by tile for clipped rendering
+        features_by_tile = {}
+        for f in features:
+            tile_key = (f.tile_x, f.tile_y)
+            if tile_key not in features_by_tile:
+                features_by_tile[tile_key] = []
+            features_by_tile[tile_key].append(f)
+
+        center_x, center_y = deg2num(self.center_lat, self.center_lon, self.zoom)
+        tl_x, tl_y = center_x - 1.5, center_y - 1.5
+
+        # Render each tile with its own clipping rect
+        for (tx, ty), tile_features in features_by_tile.items():
+            # Calculate tile viewport position
+            sx = int((tx - tl_x) * TILE_SIZE)
+            sy = int((ty - tl_y) * TILE_SIZE)
+            
+            # Set clip to this tile's 256x256 area
+            surface.set_clip(pygame.Rect(sx, sy, TILE_SIZE, TILE_SIZE))
+            
+            tile_features.sort(key=lambda f: f.priority)
+            for feature in tile_features:
+                self._render_feature(surface, feature)
+            
+            surface.set_clip(None)
 
         if self.show_tile_grid:
             self._draw_tile_grid(surface)
@@ -258,17 +303,24 @@ class NAVViewer:
             pts = [self._tile_coord_to_screen(feature.tile_x, feature.tile_y, x, y) for x, y in feature.coords]
             if len(pts) >= 2:
                 pygame.draw.lines(surface, color, False, pts, max(1, feature.width))
-                if feature.width > 2:
-                    for p in pts: pygame.draw.circle(surface, color, p, feature.width // 2)
 
         elif feature.geom_type == GEOM_POLYGON:
-            pts = [self._tile_coord_to_screen(feature.tile_x, feature.tile_y, x, y) for x, y in feature.coords]
-            if len(pts) >= 3:
-                if self.fill_polygons:
-                    pygame.draw.polygon(surface, color, pts)
-                    pygame.draw.polygon(surface, darken_color(color), pts, 1)
-                else:
-                    pygame.draw.polygon(surface, color, pts, 1)
+            rings = feature.get_rings()
+            if not rings: return
+            
+            # First ring is exterior, others are holes
+            for i, ring in enumerate(rings):
+                pts = [self._tile_coord_to_screen(feature.tile_x, feature.tile_y, x, y) for x, y in ring]
+                if len(pts) >= 3:
+                    if self.fill_polygons:
+                        # Draw exterior with feature color, holes with background color
+                        ring_color = color if i == 0 else self.background_color
+                        pygame.draw.polygon(surface, ring_color, pts)
+                        # Only outline the exterior ring, and only if it's not a hole
+                        if i == 0:
+                            pygame.draw.polygon(surface, darken_color(color), pts, 1)
+                    else:
+                        pygame.draw.polygon(surface, color, pts, 1)
 
     def _draw_tile_grid(self, surface: pygame.Surface):
         grid_color = (100, 100, 100)
@@ -399,12 +451,14 @@ def main():
                     viewer.set_center(viewer.center_lat - pan_speed, viewer.center_lon)
                     need_redraw = True
                 elif event.key == pygame.K_LEFTBRACKET:
-                    if viewer.zoom > 1:
-                        viewer.set_center(viewer.center_lat, viewer.center_lon, viewer.zoom - 1)
+                    new_zoom = viewer.zoom - 1
+                    if new_zoom in viewer.available_zooms:
+                        viewer.set_center(viewer.center_lat, viewer.center_lon, new_zoom)
                         need_redraw = True
                 elif event.key == pygame.K_RIGHTBRACKET:
-                    if viewer.zoom < 19:
-                        viewer.set_center(viewer.center_lat, viewer.center_lon, viewer.zoom + 1)
+                    new_zoom = viewer.zoom + 1
+                    if new_zoom in viewer.available_zooms:
+                        viewer.set_center(viewer.center_lat, viewer.center_lon, new_zoom)
                         need_redraw = True
                 elif event.key == pygame.K_b:
                     viewer.background_color = (0, 0, 0) if viewer.background_color == (255, 255, 255) else (255, 255, 255)
@@ -443,12 +497,14 @@ def main():
                         need_redraw = True
 
                 elif event.button == 4:
-                    if viewer.zoom < 19:
-                        viewer.set_center(viewer.center_lat, viewer.center_lon, viewer.zoom + 1)
+                    new_zoom = viewer.zoom + 1
+                    if new_zoom in viewer.available_zooms:
+                        viewer.set_center(viewer.center_lat, viewer.center_lon, new_zoom)
                         need_redraw = True
                 elif event.button == 5:
-                    if viewer.zoom > 1:
-                        viewer.set_center(viewer.center_lat, viewer.center_lon, viewer.zoom - 1)
+                    new_zoom = viewer.zoom - 1
+                    if new_zoom in viewer.available_zooms:
+                        viewer.set_center(viewer.center_lat, viewer.center_lon, new_zoom)
                         need_redraw = True
 
             elif event.type == pygame.MOUSEBUTTONUP:
@@ -476,20 +532,20 @@ def main():
             screen.fill((50, 50, 50))
             screen.blit(viewport_surface, (0, 0))
 
-            # Toolbar
+            # Toolbar and Info Panel
             pygame.draw.rect(screen, (30, 30, 30), (VIEWPORT_SIZE, 0, TOOLBAR_WIDTH, VIEWPORT_SIZE))
 
             button_bg = (50, 50, 50)
             button_fg = (255, 255, 255)
             button_border = (100, 100, 100)
 
-            bg_text = "Background: White" if viewer.background_color == (255, 255, 255) else "Background: Black"
+            bg_text = "BG: White" if viewer.background_color == (255, 255, 255) else "BG: Black"
             draw_button(screen, bg_text, bg_button_rect, button_bg, button_fg, button_border, font_small)
 
-            fill_text = "Fill: ON" if viewer.fill_polygons else "Fill: OFF"
+            fill_text = f"Fill: {'ON' if viewer.fill_polygons else 'OFF'}"
             draw_button(screen, fill_text, fill_button_rect, button_bg, button_fg, button_border, font_small)
 
-            grid_text = "Grid: ON" if viewer.show_tile_grid else "Grid: OFF"
+            grid_text = f"Grid: {'ON' if viewer.show_tile_grid else 'OFF'}"
             draw_button(screen, grid_text, grid_button_rect, button_bg, button_fg, button_border, font_small)
 
             info_y = button_margin * 4 + button_height * 3 + 20
@@ -499,19 +555,18 @@ def main():
             screen.blit(font_small.render(f"Lon: {viewer.center_lon:.6f}", True, info_color), (VIEWPORT_SIZE + 10, info_y + 18))
             screen.blit(font_small.render(f"Zoom: {viewer.zoom}", True, info_color), (VIEWPORT_SIZE + 10, info_y + 36))
 
-            # Query stats
+            # Query statistics
             stats_y = info_y + 70
             screen.blit(font_small.render("Query Stats:", True, info_color), (VIEWPORT_SIZE + 10, stats_y))
             if viewer.last_query_stats:
                 s = viewer.last_query_stats
-                total_tiles = s.get('tiles_loaded', 0) + s.get('tiles_missing', 0)
-                screen.blit(font_small.render(f"  Tiles: {s.get('tiles_loaded', 0)}/{total_tiles}", True, (150, 150, 150)), (VIEWPORT_SIZE + 10, stats_y + 18))
+                screen.blit(font_small.render(f"  Tiles: {s.get('tiles_loaded', 0)}/{s.get('tiles_total', 0)}", True, (150, 150, 150)), (VIEWPORT_SIZE + 10, stats_y + 18))
                 screen.blit(font_small.render(f"  Features: {s.get('features', 0)}", True, (150, 150, 150)), (VIEWPORT_SIZE + 10, stats_y + 32))
                 screen.blit(font_small.render(f"  Time: {s.get('time_ms', 0):.0f}ms", True, (150, 150, 150)), (VIEWPORT_SIZE + 10, stats_y + 46))
 
-            # Selected feature
+            # Feature Identification (Right-click)
             feature_y = stats_y + 80
-            screen.blit(font_small.render("Click Feature:", True, info_color), (VIEWPORT_SIZE + 10, feature_y))
+            screen.blit(font_small.render("Selected Feature:", True, info_color), (VIEWPORT_SIZE + 10, feature_y))
             if viewer.selected_feature:
                 line_y = feature_y + 18
                 for key, value in viewer.selected_feature.items():
@@ -519,14 +574,14 @@ def main():
                     screen.blit(font_small.render(text, True, (100, 200, 100)), (VIEWPORT_SIZE + 10, line_y))
                     line_y += 14
             else:
-                screen.blit(font_small.render("  (right-click)", True, (100, 100, 100)), (VIEWPORT_SIZE + 10, feature_y + 18))
+                screen.blit(font_small.render("  (Right-click to select)", True, (100, 100, 100)), (VIEWPORT_SIZE + 10, feature_y + 18))
 
-            # Status bar
+            # Status Bar
             pygame.draw.rect(screen, (30, 30, 30), (0, VIEWPORT_SIZE, WINDOW_WIDTH, STATUSBAR_HEIGHT))
-            screen.blit(font_small.render("NAV Format - IceNav Navigation Tiles", True, (200, 200, 200)), (10, VIEWPORT_SIZE + 10))
+            screen.blit(font_small.render("NAV Format - Optimized ESP32 Maps", True, (200, 200, 200)), (10, VIEWPORT_SIZE + 10))
 
             if viewer.available_zooms:
-                zooms_str = f"Available: {min(viewer.available_zooms)}-{max(viewer.available_zooms)}"
+                zooms_str = f"Available Zooms: {min(viewer.available_zooms)}-{max(viewer.available_zooms)}"
                 screen.blit(font_small.render(zooms_str, True, (150, 150, 150)), (10, VIEWPORT_SIZE + 30))
 
             pygame.display.flip()

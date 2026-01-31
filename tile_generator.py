@@ -83,14 +83,14 @@ def meters_to_pixels(width_meters: float, zoom: int, lat: float = 45.0) -> int:
 
 # Layer rendering priority (lower = rendered first = behind)
 LAYER_PRIORITY = {
-    'water': 10,
-    'landuse': 20,
-    'terrain': 30,
+    'landuse': 10,
+    'terrain': 20,
+    'water': 30,
+    'amenities': 35,
     'railways': 40,
     'roads': 50,
     'infrastructure': 60,
     'buildings': 70,
-    'amenities': 80,
     'places': 90
 }
 
@@ -100,7 +100,8 @@ LAYER_MAPPING = {
         'natural=water', 'natural=coastline', 'natural=bay',
         'waterway=riverbank', 'waterway=dock', 'waterway=boatyard',
         'waterway=river', 'waterway=stream', 'waterway=canal',
-        'natural=spring', 'natural=wetland'
+        'natural=spring', 'natural=wetland',
+        'water=river', 'water=canal', 'water=reservoir'
     ],
     'landuse': [
         'natural=beach', 'natural=sand', 'natural=wood',
@@ -114,7 +115,8 @@ LAYER_MAPPING = {
         'landuse=commercial', 'landuse=retail', 'landuse=industrial',
         'landuse=construction', 'landuse=cemetery', 'landuse=allotments',
         'leisure=stadium', 'leisure=sports_centre', 'leisure=playground',
-        'amenity=parking'
+        'amenity=parking', 'leisure=common', 'landuse=village_green',
+        'landuse=grass'
     ],
     'roads': [
         'highway=motorway', 'highway=motorway_link',
@@ -390,24 +392,30 @@ class OSMHandler(osmium.SimpleHandler):
             return
 
         is_closed = len(coords) >= 4 and coords[0] == coords[-1]
-        is_area_tags = (
-            'building' in tags or
-            'landuse' in tags or
-            ('natural' in tags and tags.get('natural') in ['water', 'wood', 'forest', 'beach', 'sand', 'wetland', 'grassland', 'scrub', 'heath']) or
-            ('leisure' in tags and tags.get('leisure') in ['park', 'garden', 'pitch', 'golf_course', 'nature_reserve', 'playground', 'sports_centre', 'stadium', 'common']) or
-            ('amenity' in tags and tags.get('amenity') in ['parking', 'school', 'university', 'hospital', 'marketplace']) or
-            ('waterway' in tags and tags.get('waterway') in ['riverbank', 'dock', 'boatyard']) or
-            tags.get('area') == 'yes'
-        )
+        
+        # Tags that automatically qualify a closed way as an area/polygon
+        area_qualifiers = {
+            'building', 'landuse', 'water', 'amenity', 'leisure', 'natural',
+            'waterway', 'man_made', 'aeroway', 'historic', 'military'
+        }
+        
+        has_area_tag = any(k in tags for k in area_qualifiers)
+        is_area_tags = is_closed and (has_area_tag or tags.get('area') == 'yes')
 
         color = get_color_for_tags(tags, self.config)
         priority = get_priority_for_tags(tags, self.config)
         color_rgb565 = hex_to_rgb565(color)
         layer_base_priority = LAYER_PRIORITY.get(layer, 50)
-        combined_priority = layer_base_priority + (priority % 10)
+        
+        # Ensure linestrings for waterways are behind areas (polygons)
+        if layer == 'water' and not (is_closed and is_area_tags):
+            combined_priority = layer_base_priority + (priority % 5) # Lower priority for centerlines
+        else:
+            combined_priority = layer_base_priority + (priority % 10)
 
         if is_closed and is_area_tags and 'highway' not in tags:
             feature = {
+                'id': w.id,
                 'geom_type': GEOM_POLYGON,
                 'coords': coords,
                 'color_rgb565': color_rgb565,
@@ -425,6 +433,7 @@ class OSMHandler(osmium.SimpleHandler):
             width_meters = self._get_width_meters(tags)
 
         feature = {
+            'id': w.id,
             'geom_type': GEOM_LINESTRING,
             'coords': coords,
             'color_rgb565': color_rgb565,
@@ -548,28 +557,11 @@ def simplify_coords(coords: List[Tuple[float, float]], tolerance: float) -> List
 def write_nav_tile(features: List[Dict], output_path: str, zoom: int, tile_x: int, tile_y: int) -> bool:
     """
     Write features to NAV binary tile format using relative coordinates.
-    Format:
-    - Tile Header (22 bytes):
-        - Magic: 'NAV1' (4)
-        - Count: uint16 (2)
-        - BBox: 4 x int32 (16) [lon_min, lat_min, lon_max, lat_max] * 1e7
-    - Features:
-        - Header (11 bytes):
-            - Type: uint8 (1)
-            - Color: uint16 RGB565 (2)
-            - Zoom/Priority: uint8 (1)
-            - Width: uint8 (1)
-            - BBox: 4 x uint8 (4) [x1, y1, x2, y2] / 16
-            - Point Count: uint16 (2)
-        - Points: n x (int16 x, int16 y) relative to tile (0-4096)
-        - Polygon rings (optional):
-            - Ring count: uint8 (1)
-            - Ring ends: n x uint16 (2)
     """
     if not features:
         return False
 
-    # Calculate tile bounds for projection
+    # Calculate tile bounds
     n = 2.0 ** zoom
     lon_deg_per_tile = 360.0 / n
     tile_min_lon = -180.0 + tile_x * lon_deg_per_tile
@@ -592,11 +584,21 @@ def write_nav_tile(features: List[Dict], output_path: str, zoom: int, tile_x: in
     t_min_merc = lat_to_merc(tile_min_lat)
     merc_range = t_max_merc - t_min_merc
 
+    # Clipping box with 10% margin to avoid artifacts and ensure overlap
+    margin = 0.10
+    lon_margin = (tile_max_lon - tile_min_lon) * margin
+    lat_margin = (tile_max_lat - tile_min_lat) * margin
+    
+    clip_box = None
+    if SHAPELY_AVAILABLE:
+        from shapely.geometry import box, Polygon, MultiPolygon, LineString, MultiLineString, GeometryCollection
+        clip_box = box(tile_min_lon - lon_margin, tile_min_lat - lat_margin, 
+                       tile_max_lon + lon_margin, tile_max_lat + lat_margin)
+
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
     written_features = 0
     with open(output_path, 'wb') as f:
-        # Tile Header (22 bytes)
         f.write(struct.pack('<4sHiiii', NAV_MAGIC, 0, 
                            int(tile_min_lon * COORD_SCALE), 
                            int(tile_min_lat * COORD_SCALE), 
@@ -604,68 +606,129 @@ def write_nav_tile(features: List[Dict], output_path: str, zoom: int, tile_x: in
                            int(tile_max_lat * COORD_SCALE)))
 
         for feature in features:
-            coords = feature['coords']
-            if not coords: 
-                continue
-
-            projected = []
-            f_min_x, f_min_y = 4096, 4096
-            f_max_x, f_max_y = 0, 0
+            orig_coords = feature['coords']
+            is_polygon = feature['geom_type'] == GEOM_POLYGON
             
-            # Visibility check with 1-tile safety margin
-            is_visible = False
-
-            for lon, lat in coords:
-                # Project Lon -> X (0-4096)
-                px = int((lon - tile_min_lon) / (tile_max_lon - tile_min_lon) * 4096)
-                
-                # Project Lat -> Y (0-4096) using Mercator
-                m_y = lat_to_merc(lat)
-                py = int((t_max_merc - m_y) / merc_range * 4096)
-                
-                if -4096 < px < 8192 and -4096 < py < 8192:
-                    is_visible = True
-                
-                # Clamp to signed short range for safety
-                px = max(-32768, min(32767, px))
-                py = max(-32768, min(32767, py))
-                
-                projected.append((px, py))
-                
-                # Internal BBox for culling (clamped to tile 0-4096)
-                c_px, c_py = max(0, min(4096, px)), max(0, min(4096, py))
-                f_min_x, f_min_y = min(f_min_x, c_px), min(f_min_y, c_py)
-                f_max_x, f_max_y = max(f_max_x, c_px), max(f_max_y, c_py)
-
-            if not is_visible: 
-                continue
-
-            # Feature Header (11 bytes)
-            width_meters = feature.get('width_meters', 0.0)
-            width_pixels = meters_to_pixels(width_meters, zoom) if width_meters > 0 else 1
+            # Each entry will be a list of rings: [ [ext_pts], [hole1_pts], ... ]
+            final_features_data = []
             
-            bx1, by1 = max(0, min(255, f_min_x >> 4)), max(0, min(255, f_min_y >> 4))
-            bx2, by2 = max(0, min(255, f_max_x >> 4)), max(0, min(255, f_max_y >> 4))
+            # Clip geometry if shapely is available
+            if clip_box:
+                try:
+                    # Simplify slightly to avoid tiny artifacts before clipping
+                    geom = Polygon(orig_coords) if is_polygon else LineString(orig_coords)
+                    if not geom.is_valid:
+                        geom = geom.buffer(0)
+                    
+                    clipped = geom.intersection(clip_box)
+                    if clipped.is_empty:
+                        continue
+                        
+                    # Extract parts of the correct type
+                    parts = []
+                    if isinstance(clipped, GeometryCollection):
+                        parts = list(clipped.geoms)
+                    else:
+                        parts = [clipped]
+                        
+                    for part in parts:
+                        if is_polygon:
+                            if isinstance(part, (Polygon, MultiPolygon)):
+                                polys = [part] if isinstance(part, Polygon) else list(part.geoms)
+                                for p in polys:
+                                    if not p.is_empty and p.exterior and len(p.exterior.coords) >= 4:
+                                        rings = [list(p.exterior.coords)]
+                                        for interior in p.interiors:
+                                            if len(interior.coords) >= 4:
+                                                rings.append(list(interior.coords))
+                                        final_features_data.append(rings)
+                        else:
+                            if isinstance(part, LineString) and len(part.coords) >= 2:
+                                final_features_data.append([list(part.coords)])
+                            elif isinstance(part, MultiLineString):
+                                for l in part.geoms:
+                                    if len(l.coords) >= 2:
+                                        final_features_data.append([list(l.coords)])
+                except:
+                    continue
+            else:
+                final_features_data = [[orig_coords]]
 
-            f.write(struct.pack('<B', feature['geom_type']))
-            f.write(struct.pack('<H', feature['color_rgb565']))
-            f.write(struct.pack('<B', feature['zoom_priority']))
-            f.write(struct.pack('<B', width_pixels))
-            f.write(struct.pack('<BBBB', bx1, by1, bx2, by2))
-            f.write(struct.pack('<H', len(projected)))
-            f.write(b'\x00') # 1 byte padding for 12-byte header (alignment)
+            for feature_rings in final_features_data:
+                # Project all rings for this feature part
+                projected_rings = []
+                total_points = 0
+                f_min_x, f_min_y = 4096, 4096
+                f_max_x, f_max_y = 0, 0
+                is_visible = False
 
-            # Points (int16 pairs)
-            for px, py in projected:
-                f.write(struct.pack('<hh', px, py))
+                for ring in feature_rings:
+                    projected_ring = []
+                    for lon, lat in ring:
+                        px = int((lon - tile_min_lon) / (tile_max_lon - tile_min_lon) * 4096)
+                        m_y = lat_to_merc(lat)
+                        py = int((t_max_merc - m_y) / merc_range * 4096)
+                        
+                        if -8192 < px < 12288 and -8192 < py < 12288:
+                            is_visible = True
+                        
+                        projected_ring.append((px, py))
+                        
+                        c_px, c_py = max(0, min(4096, px)), max(0, min(4096, py))
+                        f_min_x, f_min_y = min(f_min_x, c_px), min(f_min_y, c_py)
+                        f_max_x, f_max_y = max(f_max_x, c_px), max(f_max_y, c_py)
+                    
+                    if len(projected_ring) >= (3 if is_polygon else 2):
+                        projected_rings.append(projected_ring)
+                        total_points += len(projected_ring)
 
-            if feature['geom_type'] == GEOM_POLYGON:
-                f.write(struct.pack('<B', 1)) # Single ring supported for now
-                f.write(struct.pack('<H', len(projected)))
+                if is_polygon:
+                    # Minimum area filter: discard polygons smaller than 4 pixels squared
+                    if len(projected_rings[0]) >= 3:
+                        area = 0.0
+                        pts = projected_rings[0]
+                        for i in range(len(pts)):
+                            x1, y1 = pts[i]
+                            x2, y2 = pts[(i + 1) % len(pts)]
+                            area += (x1 * y2 - x2 * y1)
+                        if abs(area) < 32: # Area in coordinate units (4096 scale), 4px^2 * (4096/256)^2 = 1024. Wait, let's use a simpler pixel-based check.
+                            pass # We'll check actual pixel area below
 
-            written_features += 1
+                # Simple bounding box area check in pixels (more efficient)
+                pixel_area = (f_max_x - f_min_x) * (f_max_y - f_min_y) / (16 * 16)
+                if is_polygon and pixel_area < 4:
+                    continue
 
-        # Final update of feature count in header
+                width_meters = feature.get('width_meters', 0.0)
+                width_pixels = meters_to_pixels(width_meters, zoom) if width_meters > 0 else 1
+                
+                bx1, by1 = max(0, min(255, f_min_x >> 4)), max(0, min(255, f_min_y >> 4))
+                bx2, by2 = max(0, min(255, f_max_x >> 4)), max(0, min(255, f_max_y >> 4))
+
+                # Feature Header
+                f.write(struct.pack('<B', feature['geom_type']))
+                f.write(struct.pack('<H', feature['color_rgb565']))
+                f.write(struct.pack('<B', feature['zoom_priority']))
+                f.write(struct.pack('<B', width_pixels))
+                f.write(struct.pack('<BBBB', bx1, by1, bx2, by2))
+                f.write(struct.pack('<H', total_points))
+                f.write(b'\x00')
+
+                # Points for all rings
+                for ring in projected_rings:
+                    for px, py in ring:
+                        f.write(struct.pack('<hh', px, py))
+
+                if is_polygon:
+                    # Write ring ends
+                    f.write(struct.pack('<B', len(projected_rings)))
+                    current_end = 0
+                    for ring in projected_rings:
+                        current_end += len(ring)
+                        f.write(struct.pack('<H', current_end))
+
+                written_features += 1
+
         f.seek(4)
         f.write(struct.pack('<H', written_features))
 
