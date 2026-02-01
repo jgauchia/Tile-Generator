@@ -61,7 +61,7 @@ Only present if `geom_type == 3`. Follows the coordinate data.
 
 | Field          | Type   | Size | Description                    |
 |----------------|--------|-------|--------------------------------|
-| ring_count     | uint8  | 1     | Total number of rings (exterior + holes) |
+| ring_count     | uint16 | 2     | Total number of rings (exterior + holes) |
 | ring_ends[]    | uint16 | 2×R   | Cumulative end index for each ring |
 
 ---
@@ -162,7 +162,8 @@ for (int i = 0; i < tile.feature_count; i++) {
     if (!viewport.intersects(object_rect)) {
         file.seek(feat.coord_count * 4, SEEK_CUR); // Skip points
         if (feat.geom_type == 3) {
-            uint8_t rings = file.readUint8();
+            uint16_t rings;
+            file.read(&rings, 2); // Read ring count (uint16)
             file.seek(rings * 2, SEEK_CUR); // Skip ring ends
         }
         continue;
@@ -183,7 +184,8 @@ for (int i = 0; i < tile.feature_count; i++) {
         drawLines(pts, feat.coord_count, feat.width_pixels, feat.color_rgb565);
     } 
     else if (feat.geom_type == 3) {
-        uint8_t ring_count = file.readUint8();
+        uint16_t ring_count;
+        file.read(&ring_count, 2);
         uint16_t ring_ends[ring_count];
         file.read(ring_ends, ring_count * 2);
         fillPolygon(pts, ring_count, ring_ends, feat.color_rgb565);

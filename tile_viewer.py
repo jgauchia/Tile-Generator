@@ -137,7 +137,7 @@ def read_nav_tile(path: str, tile_x: int, tile_y: int) -> List[NavFeature]:
                     feature.coords.append((px, py))
 
                 if feature.geom_type == GEOM_POLYGON:
-                    ring_count = struct.unpack('<B', f.read(1))[0]
+                    ring_count = struct.unpack('<H', f.read(2))[0]
                     for _ in range(ring_count):
                         feature.ring_ends.append(struct.unpack('<H', f.read(2))[0])
 

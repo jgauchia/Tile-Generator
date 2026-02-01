@@ -34,6 +34,7 @@ except ImportError:
 
 try:
     from shapely.geometry import Polygon
+    from shapely.ops import unary_union
     import shapely.wkb
     SHAPELY_AVAILABLE = True
 except ImportError:
@@ -554,12 +555,13 @@ def simplify_coords(coords: List[Tuple[float, float]], tolerance: float) -> List
     return coords
 
 
-def write_nav_tile(features: List[Dict], output_path: str, zoom: int, tile_x: int, tile_y: int) -> bool:
+def write_nav_tile(features: List[Dict], output_path: str, zoom: int, tile_x: int, tile_y: int) -> Tuple[bool, int]:
     """
     Write features to NAV binary tile format using relative coordinates.
+    Returns (success, merged_count).
     """
     if not features:
-        return False
+        return False, 0
 
     # Calculate tile bounds
     n = 2.0 ** zoom
@@ -605,18 +607,89 @@ def write_nav_tile(features: List[Dict], output_path: str, zoom: int, tile_x: in
                            int(tile_max_lon * COORD_SCALE), 
                            int(tile_max_lat * COORD_SCALE)))
 
-        for feature in features:
+        processed_features = []
+        
+        if SHAPELY_AVAILABLE:
+            from shapely.geometry import box, Polygon, MultiPolygon, LineString, MultiLineString, GeometryCollection
+            
+            # Separate polygons for merging
+            polygons_by_style = defaultdict(list)
+            other_features = []
+            
+            for feat in features:
+                if feat['geom_type'] == GEOM_POLYGON:
+                    style_key = (feat['color_rgb565'], feat['zoom_priority'])
+                    polygons_by_style[style_key].append(feat)
+                else:
+                    other_features.append(feat)
+            
+            # Merge polygons of the same style
+            poly_before = 0
+            for style_list in polygons_by_style.values():
+                poly_before += len(style_list)
+                
+            for (color, priority), poly_list in polygons_by_style.items():
+                try:
+                    shapely_polys = []
+                    for p in poly_list:
+                        sp = Polygon(p['coords'])
+                        if not sp.is_valid:
+                            sp = sp.buffer(0)
+                        shapely_polys.append(sp)
+                    
+                    merged = unary_union(shapely_polys)
+                    
+                    # Convert back to feature format
+                    parts = []
+                    if isinstance(merged, MultiPolygon):
+                        parts = list(merged.geoms)
+                    elif isinstance(merged, Polygon):
+                        parts = [merged]
+                    
+                    for part in parts:
+                        if not part.is_empty:
+                            processed_features.append({
+                                'geom_type': GEOM_POLYGON,
+                                'coords': list(part.exterior.coords),
+                                'rings': [list(p.coords) for p in part.interiors],
+                                'color_rgb565': color,
+                                'zoom_priority': priority,
+                                'width_meters': 0.0
+                            })
+                except:
+                    processed_features.extend(poly_list)
+            
+            poly_after = len([f for f in processed_features if f['geom_type'] == GEOM_POLYGON])
+            merged_count = max(0, poly_before - poly_after)
+            
+            processed_features.extend(other_features)
+        else:
+            processed_features = features
+            merged_count = 0
+
+        # Clipping box with 10% margin
+        margin = 0.10
+        lon_margin = (tile_max_lon - tile_min_lon) * margin
+        lat_margin = (tile_max_lat - tile_min_lat) * margin
+        
+        clip_box = None
+        if SHAPELY_AVAILABLE:
+            from shapely.geometry import box
+            clip_box = box(tile_min_lon - lon_margin, tile_min_lat - lat_margin, 
+                           tile_max_lon + lon_margin, tile_max_lat + lat_margin)
+
+        for feature in processed_features:
             orig_coords = feature['coords']
             is_polygon = feature['geom_type'] == GEOM_POLYGON
             
             # Each entry will be a list of rings: [ [ext_pts], [hole1_pts], ... ]
             final_features_data = []
             
-            # Clip geometry if shapely is available
+            # Clip geometry
             if clip_box:
                 try:
-                    # Simplify slightly to avoid tiny artifacts before clipping
-                    geom = Polygon(orig_coords) if is_polygon else LineString(orig_coords)
+                    from shapely.geometry import Polygon, MultiPolygon, LineString, MultiLineString, GeometryCollection
+                    geom = Polygon(orig_coords, feature.get('rings', [])) if is_polygon else LineString(orig_coords)
                     if not geom.is_valid:
                         geom = geom.buffer(0)
                     
@@ -624,7 +697,6 @@ def write_nav_tile(features: List[Dict], output_path: str, zoom: int, tile_x: in
                     if clipped.is_empty:
                         continue
                         
-                    # Extract parts of the correct type
                     parts = []
                     if isinstance(clipped, GeometryCollection):
                         parts = list(clipped.geoms)
@@ -652,7 +724,10 @@ def write_nav_tile(features: List[Dict], output_path: str, zoom: int, tile_x: in
                 except:
                     continue
             else:
-                final_features_data = [[orig_coords]]
+                rings = [orig_coords]
+                if is_polygon and 'rings' in feature:
+                    rings.extend(feature['rings'])
+                final_features_data = [rings]
 
             for feature_rings in final_features_data:
                 # Project all rings for this feature part
@@ -720,8 +795,8 @@ def write_nav_tile(features: List[Dict], output_path: str, zoom: int, tile_x: in
                         f.write(struct.pack('<hh', px, py))
 
                 if is_polygon:
-                    # Write ring ends
-                    f.write(struct.pack('<B', len(projected_rings)))
+                    # Write ring ends (using uint16 to support > 255 rings in complex merged areas)
+                    f.write(struct.pack('<H', len(projected_rings)))
                     current_end = 0
                     for ring in projected_rings:
                         current_end += len(ring)
@@ -732,7 +807,7 @@ def write_nav_tile(features: List[Dict], output_path: str, zoom: int, tile_x: in
         f.seek(4)
         f.write(struct.pack('<H', written_features))
 
-    return True
+    return True, merged_count
 
 
 def convert_pbf_to_nav(input_pbf: str, output_dir: str, config_file: str,
@@ -771,9 +846,15 @@ def convert_pbf_to_nav(input_pbf: str, output_dir: str, config_file: str,
     total_size = 0
 
     for zoom in range(zoom_range[0], zoom_range[1] + 1):
-        tile_features: Dict[Tuple[int, int], List[Dict]] = defaultdict(list)
+        tile_features = defaultdict(list)
         tolerance = get_simplify_tolerance(zoom)
-
+        zoom_merged = 0
+        
+        # Phase 1: Prepare and filter features for this zoom level
+        zoom_start = time.time()
+        prepared_count = 0
+        total_to_process = len(handler.features)
+        
         for feature in handler.features:
             min_zoom = feature['zoom_priority'] >> 4
             if min_zoom > zoom:
@@ -784,15 +865,27 @@ def convert_pbf_to_nav(input_pbf: str, output_dir: str, config_file: str,
             if len(coords) > 2:
                 coords = simplify_coords(coords, tolerance)
             
-            # Create a shallow copy with simplified coords for this zoom
-            zoom_feature = feature.copy()
-            zoom_feature['coords'] = coords
+            if not coords:
+                continue
+
+            # Create a lightweight record for this zoom
+            zoom_feature = {
+                'geom_type': feature['geom_type'],
+                'coords': coords,
+                'color_rgb565': feature['color_rgb565'],
+                'zoom_priority': feature['zoom_priority'],
+                'width_meters': feature.get('width_meters', 0.0)
+            }
 
             is_polygon = zoom_feature['geom_type'] == GEOM_POLYGON
             tiles = get_feature_tiles(zoom_feature['coords'], zoom, is_polygon)
 
             for tile in tiles:
                 tile_features[tile].append(zoom_feature)
+            
+            prepared_count += 1
+            if prepared_count % 25000 == 0:
+                print(f"\r  Zoom {zoom:2d}: Preparing features... {prepared_count:,} / {total_to_process:,}", end='', flush=True)
 
         if not tile_features:
             continue
@@ -800,25 +893,36 @@ def convert_pbf_to_nav(input_pbf: str, output_dir: str, config_file: str,
         num_tiles = len(tile_features)
         tiles_written = 0
         tile_items = list(tile_features.items())
+        print() # New line after preparation phase
 
+        # Phase 2: Process and write tiles
+        zoom_features_total = 0
         for i, ((x, y), features) in enumerate(tile_items):
             progress = (i + 1) / num_tiles
-            bar_width = 30
+            bar_width = 25
             filled = int(bar_width * progress)
             bar = '█' * filled + '░' * (bar_width - filled)
-            print(f"\r  Zoom {zoom:2d}: [{bar}] {i+1}/{num_tiles} tiles", end='', flush=True)
+            print(f"\r  Zoom {zoom:2d}: Tiles [{bar}] {i+1}/{num_tiles}", end='', flush=True)
 
             tile_dir = os.path.join(output_dir, str(zoom), str(x))
             tile_path = os.path.join(tile_dir, f"{y}.nav")
 
-            # Pre-sort by priority (low nibble) for streaming render on ESP32
+            # Pre-sort by priority
             features.sort(key=lambda f: f['zoom_priority'] & 0x0F)
 
-            if write_nav_tile(features, tile_path, zoom, x, y):
+            success, merged = write_nav_tile(features, tile_path, zoom, x, y)
+            if success:
                 tiles_written += 1
+                zoom_merged += merged
+                zoom_features_total += (len(features) - merged) # Count unique features written
                 total_size += os.path.getsize(tile_path)
 
-        print(f"\r  Zoom {zoom:2d}: {tiles_written} tiles written" + " " * 30)
+        # Clear memory before next zoom level
+        tile_features.clear()
+        tile_items.clear()
+        
+        zoom_elapsed = time.time() - zoom_start
+        print(f"\r  Zoom {zoom:2d}: {tiles_written} tiles written. Merged {zoom_merged} polygons. ({zoom_elapsed:.1f}s, {zoom_features_total:,} features)" + " " * 5)
         total_tiles += tiles_written
 
     total_time = time.time() - start_time
