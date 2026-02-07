@@ -4,7 +4,7 @@
 
 ## Features
 
-- **Optimized Format Support**: Reads the latest NAV format with `int16` relative coordinates and pre-calculated projection.
+- **Optimized Format Support**: Reads the latest NAV format with Delta Encoding (VarInt/ZigZag) and pre-calculated projection.
 - **ESP32 Rendering Simulation**: Mirrors the bit-shift pixel calculation used in the ESP32 firmware.
 - **Adaptive Tile Loading**: Loads up to a 4x4 tile grid to ensure the 768x768 viewport is always fully covered.
 - **Feature Identification**: Right-click any object to see its type, color, zoom level, and pre-calculated BBox.
@@ -29,8 +29,8 @@
 
 The viewer expects the optimized binary structure:
 - **Header**: 22-byte tile header (Magic, Count, Lat/Lon BBox).
-- **Features**: 12-byte aligned feature header including a 4-byte object-level BBox for culling.
-- **Coordinates**: Signed `int16` pairs relative to the tile origin (0-4096 range with 10% safety margin).
+- **Features**: 13-byte feature header including a 4-byte object-level BBox and a 2-byte `payload_size` for culling.
+- **Coordinates**: Delta Encoded VarInt/ZigZag coordinates relative to the tile origin (0-4096 range).
 - **Multi-Ring Support**: Correctly renders complex polygons with holes (islands).
 
 ---

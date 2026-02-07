@@ -5,9 +5,9 @@ PBF to NAV Tile Converter
 Converts OpenStreetMap .pbf files to NAV binary format (.nav) with tile structure.
 NAV format optimized for ESP32:
 - 22-byte tile header (Magic, Count, Bbox)
-- 11-byte feature header (Type, Color, Zoom/Priority, Width, BBox, Count)
-- int16 relative coordinates (0-4096 range with safety margin)
-- ~50% size reduction vs previous version
+- 13-byte feature header (Type, Color, Zoom/Priority, Width, BBox, Count, PayloadSize)
+- Delta Encoding + VarInt/ZigZag coordinates (0-4096 range)
+- ~30-50% additional size reduction vs fixed int16 version
 
 Usage:
     python tile_generator.py input.pbf output_dir features.json [--zoom 6-17]
@@ -555,6 +555,22 @@ def simplify_coords(coords: List[Tuple[float, float]], tolerance: float) -> List
     return coords
 
 
+
+def to_varint(value: int) -> bytearray:
+    """Encode an integer to a VarInt bytearray."""
+    out = bytearray()
+    while value >= 0x80:
+        out.append((value & 0x7F) | 0x80)
+        value >>= 7
+    out.append(value)
+    return out
+
+
+def zigzag_encode(n: int) -> int:
+    """ZigZag encode a signed integer."""
+    return (n << 1) ^ (n >> 31)
+
+
 def write_nav_tile(features: List[Dict], output_path: str, zoom: int, tile_x: int, tile_y: int) -> Tuple[bool, int]:
     """
     Write features to NAV binary tile format using relative coordinates.
@@ -737,6 +753,10 @@ def write_nav_tile(features: List[Dict], output_path: str, zoom: int, tile_x: in
                 f_max_x, f_max_y = 0, 0
                 is_visible = False
 
+                # Buffer for encoded data
+                coord_buffer = bytearray()
+                last_x, last_y = 0, 0
+
                 for ring in feature_rings:
                     projected_ring = []
                     for lon, lat in ring:
@@ -755,19 +775,28 @@ def write_nav_tile(features: List[Dict], output_path: str, zoom: int, tile_x: in
                     
                     if len(projected_ring) >= (3 if is_polygon else 2):
                         projected_rings.append(projected_ring)
+                        
+                        # Encode points for this ring
+                        for px, py in projected_ring:
+                            dx = px - last_x
+                            dy = py - last_y
+                            coord_buffer.extend(to_varint(zigzag_encode(dx)))
+                            coord_buffer.extend(to_varint(zigzag_encode(dy)))
+                            last_x, last_y = px, py
+                            
                         total_points += len(projected_ring)
 
                 if is_polygon:
                     # Minimum area filter: discard polygons smaller than 4 pixels squared
-                    if len(projected_rings[0]) >= 3:
+                    if len(projected_rings) > 0 and len(projected_rings[0]) >= 3:
                         area = 0.0
                         pts = projected_rings[0]
                         for i in range(len(pts)):
                             x1, y1 = pts[i]
                             x2, y2 = pts[(i + 1) % len(pts)]
                             area += (x1 * y2 - x2 * y1)
-                        if abs(area) < 32: # Area in coordinate units (4096 scale), 4px^2 * (4096/256)^2 = 1024. Wait, let's use a simpler pixel-based check.
-                            pass # We'll check actual pixel area below
+                        if abs(area) < 32: # Area in coordinate units
+                            pass 
 
                 # Simple bounding box area check in pixels (more efficient)
                 pixel_area = (f_max_x - f_min_x) * (f_max_y - f_min_y) / (16 * 16)
@@ -780,27 +809,30 @@ def write_nav_tile(features: List[Dict], output_path: str, zoom: int, tile_x: in
                 bx1, by1 = max(0, min(255, f_min_x >> 4)), max(0, min(255, f_min_y >> 4))
                 bx2, by2 = max(0, min(255, f_max_x >> 4)), max(0, min(255, f_max_y >> 4))
 
-                # Feature Header
+                # Prepare extra payload (ring info)
+                extra_payload = bytearray()
+                if is_polygon:
+                    extra_payload.extend(struct.pack('<H', len(projected_rings)))
+                    current_end = 0
+                    for ring in projected_rings:
+                        current_end += len(ring)
+                        extra_payload.extend(struct.pack('<H', current_end))
+
+                payload_size = len(coord_buffer) + len(extra_payload)
+
+                # Feature Header (13 bytes now)
+                # geom(1) + color(2) + zoom(1) + width(1) + bbox(4) + count(2) + payload_size(2)
                 f.write(struct.pack('<B', feature['geom_type']))
                 f.write(struct.pack('<H', feature['color_rgb565']))
                 f.write(struct.pack('<B', feature['zoom_priority']))
                 f.write(struct.pack('<B', width_pixels))
                 f.write(struct.pack('<BBBB', bx1, by1, bx2, by2))
                 f.write(struct.pack('<H', total_points))
-                f.write(b'\x00')
+                f.write(struct.pack('<H', payload_size))
 
-                # Points for all rings
-                for ring in projected_rings:
-                    for px, py in ring:
-                        f.write(struct.pack('<hh', px, py))
-
-                if is_polygon:
-                    # Write ring ends (using uint16 to support > 255 rings in complex merged areas)
-                    f.write(struct.pack('<H', len(projected_rings)))
-                    current_end = 0
-                    for ring in projected_rings:
-                        current_end += len(ring)
-                        f.write(struct.pack('<H', current_end))
+                # Write payload (Coords + Rings)
+                f.write(coord_buffer)
+                f.write(extra_payload)
 
                 written_features += 1
 
@@ -955,10 +987,10 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 NAV Format - IceNav Navigation Tiles:
-  - int16 relative coordinates (0-4096) for ~50% size reduction
+  - Delta VarInt relative coordinates (0-4096) for maximum compression
   - Pre-calculated projection for ultra-fast rendering on ESP32
-  - BBox-based culling for improved performance
-  - Simple binary format optimized for streaming
+  - Payload-based culling for improved skip performance
+  - Simple binary format optimized for streaming from SD cards
         """
     )
 

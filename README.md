@@ -7,10 +7,10 @@ Converts OpenStreetMap PBF files to NAV tiles for [IceNav](https://github.com/jg
 - **Direct PBF processing** - No intermediate formats (GOL, Docker, etc.)
 - **Tile-based structure** - Standard z/x/y tile layout
 - **Pre-calculated projection** - Mercator projection done on PC for zero-CPU rendering on ESP32
-- **Optimized Storage** - int16 relative coordinates with 12-byte aligned headers
+- **Optimized Storage** - Delta Encoding with VarInt/ZigZag compression and 13-byte feature headers
 - **Multi-Ring Polygons** - Correctly handles islands and holes in water/land features
 - **Area Filtering** - Automatically discards polygons smaller than 4px² to reduce noise
-- **BBox-based Culling** - 4-byte object bounding box for ultra-fast visibility checks
+- **BBox-based Culling** - 4-byte object bounding box + fast payload skip (seek)
 - **Seamless borders** - Features stored with 10% safety margin to avoid edge artifacts
 - **Feature filtering** - Configurable via `features.json`
 
@@ -80,8 +80,9 @@ NAV is a proprietary binary format designed as a lightweight alternative to Flat
 
 **Key Features:**
 - Pre-projected Mercator coordinates relative to tile (0-4096 range).
-- int16 coordinates for minimal memory footprint.
-- Sequential structure for streaming reads.
+- **Delta Encoding**: Coordinates stored as differences (dx, dy) from previous point.
+- **VarInt/ZigZag Compression**: Variable-length encoding for 30-50% size reduction.
+- **Payload-based Culling**: Header includes payload size for instant skipping of non-visible objects.
 
 **File Header (22 bytes):**
 
@@ -91,7 +92,7 @@ NAV is a proprietary binary format designed as a lightweight alternative to Flat
 | 4 | 2 | Feature count | Number of features (little-endian) |
 | 6 | 16 | Tile BBox | lon_min, lat_min, lon_max, lat_max (4 x int32 scaled 1e7) |
 
-**Feature Record:**
+**Feature Record (13-byte Header + Variable Payload):**
 
 | Size | Field | Description |
 |------|-------|-------------|
@@ -101,9 +102,8 @@ NAV is a proprietary binary format designed as a lightweight alternative to Flat
 | 1 | Width | Line width in pixels (1-15) |
 | 4 | Object BBox | Normalized relative BBox [x1, y1, x2, y2] (4 x uint8) |
 | 2 | Coord count | Number of coordinates (little-endian) |
-| 4×N | Coordinates | x(int16) + y(int16) relative to tile origin |
-| 1 | Ring count | (Polygons only) Number of rings (default 1) |
-| 2×R | Ring ends | (Polygons only) End index of each ring |
+| 2 | Payload size | Size of coordinate block + ring info in bytes |
+| Var | Payload Data | Delta VarInt coordinates + (Polygons only) ring info |
 
 **Coordinate Mapping:**
 

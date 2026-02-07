@@ -2,7 +2,7 @@
 """
 NAV Tile Viewer - ESP32 Map Simulator
 
-Displays NAV binary tiles using the optimized int16 relative coordinate format.
+Displays NAV binary tiles using the optimized Delta VarInt relative coordinate format.
 Simulates the ESP32 rendering pipeline in a 768x768 viewport.
 
 Usage:
@@ -107,8 +107,29 @@ class NavFeature:
         return rings
 
 
+
+def zigzag_decode(n: int) -> int:
+    """ZigZag decode an integer."""
+    return (n >> 1) ^ -(n & 1)
+
+
+def read_varint(buffer: bytes, offset: int) -> Tuple[int, int]:
+    """Read a VarInt from buffer at offset. Returns (value, new_offset)."""
+    result = 0
+    shift = 0
+    while True:
+        if offset >= len(buffer):
+            raise IndexError("VarInt read out of bounds")
+        b = buffer[offset]
+        offset += 1
+        result |= (b & 0x7F) << shift
+        if not (b & 0x80):
+            return result, offset
+        shift += 7
+
+
 def read_nav_tile(path: str, tile_x: int, tile_y: int) -> List[NavFeature]:
-    """Read optimized NAV tile file and return list of features with rings."""
+    """Read optimized NAV tile file (VarInt Delta Encoded) and return list of features."""
     features = []
     try:
         with open(path, 'rb') as f:
@@ -124,22 +145,55 @@ def read_nav_tile(path: str, tile_x: int, tile_y: int) -> List[NavFeature]:
                 feature.tile_x = tile_x
                 feature.tile_y = tile_y
 
-                feature.geom_type = struct.unpack('<B', f.read(1))[0]
-                feature.color_rgb565 = struct.unpack('<H', f.read(2))[0]
-                feature.zoom_priority = struct.unpack('<B', f.read(1))[0]
-                feature.width = struct.unpack('<B', f.read(1))[0]
-                feature.bbox = struct.unpack('<BBBB', f.read(4))
-                coord_count = struct.unpack('<H', f.read(2))[0]
-                f.read(1)
+                # Read Header (13 bytes)
+                header_data = f.read(13)
+                if len(header_data) < 13:
+                    break
+                    
+                feature.geom_type = header_data[0]
+                feature.color_rgb565 = struct.unpack('<H', header_data[1:3])[0]
+                feature.zoom_priority = header_data[3]
+                feature.width = header_data[4]
+                feature.bbox = struct.unpack('<BBBB', header_data[5:9])
+                coord_count = struct.unpack('<H', header_data[9:11])[0]
+                payload_size = struct.unpack('<H', header_data[11:13])[0]
 
+                # Read Payload
+                payload = f.read(payload_size)
+                if len(payload) < payload_size:
+                    break
+                
+                # Decode Coordinates (VarInt + ZigZag + Delta)
+                offset = 0
+                last_x, last_y = 0, 0
+                
                 for _ in range(coord_count):
-                    px, py = struct.unpack('<hh', f.read(4))
+                    dx, offset = read_varint(payload, offset)
+                    dy, offset = read_varint(payload, offset)
+                    
+                    dx = zigzag_decode(dx)
+                    dy = zigzag_decode(dy)
+                    
+                    px = last_x + dx
+                    py = last_y + dy
+                    
                     feature.coords.append((px, py))
+                    last_x, last_y = px, py
 
-                if feature.geom_type == GEOM_POLYGON:
-                    ring_count = struct.unpack('<H', f.read(2))[0]
-                    for _ in range(ring_count):
-                        feature.ring_ends.append(struct.unpack('<H', f.read(2))[0])
+                # Decode Ring Info (if Polygon)
+                if feature.geom_type == GEOM_POLYGON and offset < len(payload):
+                    # Remaining payload is ring info
+                    # We can use struct to unpack from the remaining bytes
+                    # First 2 bytes are ring_count
+                    try:
+                        ring_count = struct.unpack_from('<H', payload, offset)[0]
+                        offset += 2
+                        for _ in range(ring_count):
+                            ring_end = struct.unpack_from('<H', payload, offset)[0]
+                            feature.ring_ends.append(ring_end)
+                            offset += 2
+                    except struct.error:
+                        pass # Should not happen if file is valid
 
                 features.append(feature)
     except Exception as e:
