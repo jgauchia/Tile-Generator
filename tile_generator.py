@@ -23,6 +23,7 @@ import struct
 from typing import Dict, List, Tuple, Set, Any, Optional
 from collections import defaultdict
 import time
+import concurrent.futures
 
 try:
     import osmium
@@ -571,13 +572,17 @@ def zigzag_encode(n: int) -> int:
     return (n << 1) ^ (n >> 31)
 
 
-def write_nav_tile(features: List[Dict], output_path: str, zoom: int, tile_x: int, tile_y: int) -> Tuple[bool, int]:
+def write_nav_tile(features: List[Dict], output_path: str, zoom: int, tile_x: int, tile_y: int) -> Tuple[bool, int, int]:
     """
     Write features to NAV binary tile format using relative coordinates.
-    Returns (success, merged_count).
+    Returns (success, merged_count, written_count).
     """
     if not features:
-        return False, 0
+        return False, 0, 0
+
+    # Ensure features are sorted by priority (low nibble of zoom_priority)
+    # Moving this here parallelizes the sorting effort across processes
+    features.sort(key=lambda f: f['zoom_priority'] & 0x0F)
 
     # Calculate tile bounds
     n = 2.0 ** zoom
@@ -839,7 +844,7 @@ def write_nav_tile(features: List[Dict], output_path: str, zoom: int, tile_x: in
         f.seek(4)
         f.write(struct.pack('<H', written_features))
 
-    return True, merged_count
+    return True, merged_count, written_features
 
 
 def convert_pbf_to_nav(input_pbf: str, output_dir: str, config_file: str,
@@ -927,34 +932,48 @@ def convert_pbf_to_nav(input_pbf: str, output_dir: str, config_file: str,
         tile_items = list(tile_features.items())
         print() # New line after preparation phase
 
-        # Phase 2: Process and write tiles
+        # Phase 2: Process and write tiles (Parallel - Threading)
         zoom_features_total = 0
-        for i, ((x, y), features) in enumerate(tile_items):
-            progress = (i + 1) / num_tiles
-            bar_width = 25
-            filled = int(bar_width * progress)
-            bar = '█' * filled + '░' * (bar_width - filled)
-            print(f"\r  Zoom {zoom:2d}: Tiles [{bar}] {i+1}/{num_tiles}", end='', flush=True)
-
-            tile_dir = os.path.join(output_dir, str(zoom), str(x))
-            tile_path = os.path.join(tile_dir, f"{y}.nav")
-
-            # Pre-sort by priority
-            features.sort(key=lambda f: f['zoom_priority'] & 0x0F)
-
-            success, merged = write_nav_tile(features, tile_path, zoom, x, y)
-            if success:
-                tiles_written += 1
-                zoom_merged += merged
-                zoom_features_total += (len(features) - merged) # Count unique features written
-                total_size += os.path.getsize(tile_path)
+        
+        # Use ThreadPoolExecutor (like the fork) for lower memory overhead compared to Multiprocessing.
+        # Although GIL limits CPU parallelism, it helps with I/O and avoids pickling large data structures.
+        max_workers = min(32, (os.cpu_count() or 4) * 2) 
+        
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Submit all tasks
+            future_to_tile = {
+                executor.submit(write_nav_tile, features, 
+                                os.path.join(output_dir, str(zoom), str(x), f"{y}.nav"), 
+                                zoom, x, y): (x, y)
+                for (x, y), features in tile_items
+            }
+            
+            completed_count = 0
+            for future in concurrent.futures.as_completed(future_to_tile):
+                completed_count += 1
+                try:
+                    success, merged, written = future.result()
+                    
+                    if success:
+                        tiles_written += 1
+                        zoom_merged += merged
+                        zoom_features_total += written
+                except Exception as e:
+                    logger.error(f"Error processing tile {future_to_tile[future]}: {e}")
+                
+                # Update progress bar
+                progress = completed_count / num_tiles
+                bar_width = 25
+                filled = int(bar_width * progress)
+                bar = '█' * filled + '░' * (bar_width - filled)
+                print(f"\r  Zoom {zoom:2d}: Tiles [{bar}] {completed_count}/{num_tiles}", end='', flush=True)
 
         # Clear memory before next zoom level
         tile_features.clear()
         tile_items.clear()
         
         zoom_elapsed = time.time() - zoom_start
-        print(f"\r  Zoom {zoom:2d}: {tiles_written} tiles written. Merged {zoom_merged} polygons. ({zoom_elapsed:.1f}s, {zoom_features_total:,} features)" + " " * 5)
+        print(f"\r  Zoom {zoom:2d}: {tiles_written} tiles written. Merged {zoom_merged} polygons. ({zoom_elapsed:.1f}s, {zoom_features_total:,} features)" + " " * 10)
         total_tiles += tiles_written
 
     total_time = time.time() - start_time
