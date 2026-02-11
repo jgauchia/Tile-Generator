@@ -24,3 +24,4 @@ rsync_copy.sh
 FGBMAP/
 NAVMAP/
 GEMINI.md
+test_output/

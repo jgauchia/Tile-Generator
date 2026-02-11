@@ -1,0 +1,3 @@
+/mnt/EXT_HDD/Projects/Tile-Generator/cpp_generator/build/CMakeFiles/nav_generator.dir
+/mnt/EXT_HDD/Projects/Tile-Generator/cpp_generator/build/CMakeFiles/edit_cache.dir
+/mnt/EXT_HDD/Projects/Tile-Generator/cpp_generator/build/CMakeFiles/rebuild_cache.dir

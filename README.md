@@ -2,19 +2,18 @@
 
 Converts OpenStreetMap PBF files to NAV tiles for [IceNav](https://github.com/jgauchia/IceNav-v3) ESP32-based GPS navigator.
 
+## Performance options
+
+- **Python Generator:** Standard version, easier to modify. Suitable for small areas (cities).
+- **C++ Generator:** High-performance engine located in `cpp_generator/`. Up to 50x faster and 10x more RAM efficient. **Recommended for large regions or entire countries.**
+
 ## Features
 
-- **Direct PBF processing** - No intermediate formats (GOL, Docker, etc.)
-- **Tile-based structure** - Standard z/x/y tile layout
-- **Pre-calculated projection** - Mercator projection done on PC for zero-CPU rendering on ESP32
-- **Optimized Storage** - Delta Encoding with VarInt/ZigZag compression and 13-byte feature headers
-- **Multi-Ring Polygons** - Correctly handles islands and holes in water/land features
-- **Area Filtering** - Automatically discards polygons smaller than 4px² to reduce noise
-- **BBox-based Culling** - 4-byte object bounding box + fast payload skip (seek)
-- **Seamless borders** - Features stored with 10% safety margin to avoid edge artifacts
-- **Feature filtering** - Configurable via `features.json`
-
-## Requirements
+- **Direct PBF processing** - No intermediate formats.
+- **GEOS Geometry Engine** - Professional merging and clipping for perfect tile borders.
+- **Delta VarInt Encoding** - Optimized storage for embedded devices (ESP32).
+- **Multi-Ring Support** - Correctly handles islands and holes in complex water/land features.
+- **Real-time Monitoring** - Detailed progress logs with tiles/sec and live size calculation.
 
 - Python 3.8+
 - Virtual environment (recommended)
