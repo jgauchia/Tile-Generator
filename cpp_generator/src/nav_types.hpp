@@ -47,7 +47,8 @@ struct Feature
     uint16_t color_rgb565;  ///< Display color in RGB565 format
     uint8_t zoom_priority;  ///< Packed byte: high nibble=min_zoom, low nibble=priority
     float width_meters;     ///< Line width in meters (for Linestrings)
-    std::vector<std::vector<Point>> rings; ///< rings[0] is outer ring, others are inner rings (holes)
+    std::vector<Point> points;       ///< Flattened coordinate points for all rings
+    std::vector<uint32_t> ring_ends; ///< End indices for each ring in the points vector
 };
 
 /**

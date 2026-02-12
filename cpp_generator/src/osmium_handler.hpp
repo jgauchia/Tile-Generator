@@ -113,7 +113,6 @@ public:
         {
             feat.geom_type = GEOM_POLYGON;
             feat.width_meters = 0;
-            feat.rings.push_back(std::move(way_points));
             processed_areas.insert(w.id());
             combined_priority = layer_base + (f_cfg.priority % 10);
         }
@@ -121,7 +120,6 @@ public:
         {
             feat.geom_type = GEOM_LINESTRING;
             feat.width_meters = get_width(tags);
-            feat.rings.push_back(std::move(way_points));
             
             // Lower priority for centerlines in water layer to stay behind polygons
             if (layer == "water")
@@ -130,6 +128,8 @@ public:
                 combined_priority = layer_base + (f_cfg.priority % 10);
         }
 
+        feat.points = std::move(way_points);
+        feat.ring_ends.push_back(static_cast<uint32_t>(feat.points.size()));
         feat.zoom_priority = utils::pack_zoom_priority(f_cfg.min_zoom, combined_priority);
         features_by_zoom[f_cfg.min_zoom].push_back(std::move(feat));
     }
@@ -175,23 +175,24 @@ public:
             feat.zoom_priority = zoom_prio;
             feat.width_meters = 0;
 
-            std::vector<Point> opts;
             for (const auto& n : outer_ring)
-                opts.push_back(Point{n.lon(), n.lat()});
+                feat.points.push_back(Point{n.lon(), n.lat()});
             
-            if (opts.size() < 3)
+            if (feat.points.size() < 3)
                 continue;
             
-            feat.rings.push_back(std::move(opts));
+            feat.ring_ends.push_back(static_cast<uint32_t>(feat.points.size()));
 
             for (const auto& inner_ring : a.inner_rings(outer_ring))
             {
-                std::vector<Point> ipts;
+                size_t pts_before = feat.points.size();
                 for (const auto& n : inner_ring)
-                    ipts.push_back(Point{n.lon(), n.lat()});
+                    feat.points.push_back(Point{n.lon(), n.lat()});
                 
-                if (ipts.size() >= 3)
-                    feat.rings.push_back(std::move(ipts));
+                if (feat.points.size() - pts_before >= 3)
+                    feat.ring_ends.push_back(static_cast<uint32_t>(feat.points.size()));
+                else
+                    feat.points.resize(pts_before); // Rollback invalid small ring
             }
 
             features_by_zoom[f_cfg.min_zoom].push_back(std::move(feat));

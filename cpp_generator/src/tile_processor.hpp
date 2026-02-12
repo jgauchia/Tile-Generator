@@ -86,21 +86,22 @@ private:
      */
     GEOSGeometry* feature_to_geos(const Feature& f, GEOSContextHandle_t handle)
     {
-        if (f.rings.empty())
+        if (f.ring_ends.empty())
             return nullptr;
         
         if (f.geom_type == GEOM_POLYGON)
         {
-            // Create outer ring
-            const auto& outer = f.rings[0];
-            if (outer.size() < 3)
-                return nullptr;
+            // Outer ring (always first)
+            uint32_t start = 0;
+            uint32_t end = f.ring_ends[0];
+            uint32_t size = end - start;
+            if (size < 3) return nullptr;
 
-            GEOSCoordSequence* seq = GEOSCoordSeq_create_r(handle, outer.size(), 2);
-            for (size_t i = 0; i < outer.size(); ++i)
+            GEOSCoordSequence* seq = GEOSCoordSeq_create_r(handle, size, 2);
+            for (uint32_t i = 0; i < size; ++i)
             {
-                GEOSCoordSeq_setX_r(handle, seq, i, outer[i].lon);
-                GEOSCoordSeq_setY_r(handle, seq, i, outer[i].lat);
+                GEOSCoordSeq_setX_r(handle, seq, i, f.points[start + i].lon);
+                GEOSCoordSeq_setY_r(handle, seq, i, f.points[start + i].lat);
             }
             GEOSGeometry* shell = GEOSGeom_createLinearRing_r(handle, seq);
             if (!shell)
@@ -109,18 +110,20 @@ private:
                 return nullptr;
             }
             
-            // Create inner rings (holes)
+            // Inner rings
             std::vector<GEOSGeometry*> holes;
-            for (size_t i = 1; i < f.rings.size(); ++i)
+            for (size_t r = 1; r < f.ring_ends.size(); ++r)
             {
-                const auto& inner = f.rings[i];
-                if (inner.size() < 3)
-                    continue;
-                GEOSCoordSequence* hseq = GEOSCoordSeq_create_r(handle, inner.size(), 2);
-                for (size_t j = 0; j < inner.size(); ++j)
+                start = f.ring_ends[r-1];
+                end = f.ring_ends[r];
+                size = end - start;
+                if (size < 3) continue;
+
+                GEOSCoordSequence* hseq = GEOSCoordSeq_create_r(handle, size, 2);
+                for (uint32_t j = 0; j < size; ++j)
                 {
-                    GEOSCoordSeq_setX_r(handle, hseq, j, inner[j].lon);
-                    GEOSCoordSeq_setY_r(handle, hseq, j, inner[j].lat);
+                    GEOSCoordSeq_setX_r(handle, hseq, j, f.points[start + j].lon);
+                    GEOSCoordSeq_setY_r(handle, hseq, j, f.points[start + j].lat);
                 }
                 GEOSGeometry* hole = GEOSGeom_createLinearRing_r(handle, hseq);
                 if (hole)
@@ -133,8 +136,7 @@ private:
             if (!poly)
             {
                 GEOSGeom_destroy_r(handle, shell);
-                for (auto h : holes)
-                    GEOSGeom_destroy_r(handle, h);
+                for (auto h : holes) GEOSGeom_destroy_r(handle, h);
                 return nullptr;
             }
             if (!GEOSisValid_r(handle, poly))
@@ -148,14 +150,13 @@ private:
         else
         {
             // LineString
-            const auto& pts = f.rings[0];
-            if (pts.size() < 2)
-                return nullptr;
-            GEOSCoordSequence* seq = GEOSCoordSeq_create_r(handle, pts.size(), 2);
-            for (size_t i = 0; i < pts.size(); ++i)
+            uint32_t size = f.ring_ends[0];
+            if (size < 2) return nullptr;
+            GEOSCoordSequence* seq = GEOSCoordSeq_create_r(handle, size, 2);
+            for (uint32_t i = 0; i < size; ++i)
             {
-                GEOSCoordSeq_setX_r(handle, seq, i, pts[i].lon);
-                GEOSCoordSeq_setY_r(handle, seq, i, pts[i].lat);
+                GEOSCoordSeq_setX_r(handle, seq, i, f.points[i].lon);
+                GEOSCoordSeq_setY_r(handle, seq, i, f.points[i].lat);
             }
             return GEOSGeom_createLineString_r(handle, seq);
         }
@@ -169,8 +170,6 @@ private:
     void process_zoom_level(std::vector<Feature> (&features_by_zoom)[18], int z)
     {
         auto start = std::chrono::steady_clock::now();
-        
-        // tile_map: maps tile coordinates to a list of {bucket_idx, feature_idx}
         std::map<TileCoord, std::vector<std::pair<int, size_t>>> tile_map;
         size_t zoom_features = 0;
 
@@ -183,15 +182,12 @@ private:
                 zoom_features++;
 
                 int min_tx = 1e9, max_tx = -1, min_ty = 1e9, max_ty = -1;
-                for (const auto& ring : f.rings)
+                for (const auto& p : f.points)
                 {
-                    for (const auto& p : ring)
-                    {
-                        int tx = static_cast<int>(utils::lon_to_x(p.lon, z));
-                        int ty = static_cast<int>(utils::lat_to_y(p.lat, z));
-                        min_tx = std::min(min_tx, tx); max_tx = std::max(max_tx, tx);
-                        min_ty = std::min(min_ty, ty); max_ty = std::max(max_ty, ty);
-                    }
+                    int tx = static_cast<int>(utils::lon_to_x(p.lon, z));
+                    int ty = static_cast<int>(utils::lat_to_y(p.lat, z));
+                    min_tx = std::min(min_tx, tx); max_tx = std::max(max_tx, tx);
+                    min_ty = std::min(min_ty, ty); max_ty = std::max(max_ty, ty);
                 }
                 for (int x = min_tx; x <= max_tx; ++x)
                     for (int y = min_ty; y <= max_ty; ++y)
@@ -328,7 +324,6 @@ private:
         double tolerance = (lmax - lmin) / 512.0;
         std::vector<ProcessedFeature> final_features;
 
-        // Process Polygons (Merge + Clip + Simplify)
         for (auto& [style, geos_polys] : poly_groups)
         {
             size_t before = geos_polys.size();
@@ -372,7 +367,6 @@ private:
             GEOSGeom_destroy_r(local_handle, simplified); GEOSGeom_destroy_r(local_handle, clipped);
         }
 
-        // Process Lines (Clip + Simplify)
         for (const auto* f : lines)
         {
             GEOSGeometry* g = feature_to_geos(*f, local_handle);
@@ -406,7 +400,7 @@ private:
             GEOSGeom_destroy_r(local_handle, g); GEOSGeom_destroy_r(local_handle, simplified); GEOSGeom_destroy_r(local_handle, clipped);
         }
 
-        // Writing
+        // File writing
         std::string dir = output_dir + "/" + std::to_string(z) + "/" + std::to_string(x);
         std::filesystem::create_directories(dir);
         std::ofstream out(dir + "/" + std::to_string(y) + ".nav", std::ios::binary);
@@ -419,6 +413,7 @@ private:
             out.write((char*)th, 22);
             uint16_t count = 0;
             
+            // Write feature data
             for (const auto& pf : final_features)
             {
                 std::vector<uint8_t> payload; 
@@ -434,7 +429,10 @@ private:
                         payload.insert(payload.end(), vx.begin(), vx.end());
                         auto vy = utils::to_varint(utils::zigzag_encode(p.second - ly));
                         payload.insert(payload.end(), vy.begin(), vy.end());
-                        lx = p.first; ly = p.second;
+                        
+                        lx = p.first; 
+                        ly = p.second;
+
                         int16_t cx = std::max((int16_t)0, std::min((int16_t)4096, p.first));
                         int16_t cy = std::max((int16_t)0, std::min((int16_t)4096, p.second));
                         minx = std::min(minx, cx); maxx = std::max(maxx, cx);
@@ -466,10 +464,12 @@ private:
 
                 out.write((char*)fh, 13); 
                 out.write((char*)payload.data(), payload.size()); 
-                if (!ri.empty()) out.write((char*)ri.data(), ri.size());
+                if (!ri.empty())
+                    out.write((char*)ri.data(), ri.size());
                 
                 count++; 
-                if (count == 0xFFFF) break;
+                if (count == 0xFFFF)
+                    break;
             }
             // Capture real size before seeking back to header
             bytes_out = (uint64_t)out.tellp();
