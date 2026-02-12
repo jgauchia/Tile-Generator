@@ -92,8 +92,8 @@ inline double lat_from_tile_y(int y, int z)
 }
 
 /**
- * @brief Tile X to Longitude.
- * @param x Tile X.
+ * @brief Inverse projection: Tile X to Longitude.
+ * @param x Tile X coordinate.
  * @param z Zoom level.
  * @return Longitude in degrees.
  */
@@ -103,8 +103,8 @@ inline double tile_x_to_lon(double x, int z)
 }
 
 /**
- * @brief Tile Y to Latitude.
- * @param y Tile Y.
+ * @brief Inverse projection: Tile Y to Latitude.
+ * @param y Tile Y coordinate.
  * @param z Zoom level.
  * @return Latitude in degrees.
  */

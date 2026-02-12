@@ -131,14 +131,19 @@ int main(int argc, char* argv[])
         std::cout << "Statistics:" << std::endl;
         std::cout << "  Nodes visited:      " << osm_handler.stats_nodes << std::endl;
         std::cout << "  Ways processed:     " << osm_handler.stats_ways << std::endl;
-        std::cout << "  Features extracted: " << osm_handler.features.size() << std::endl;
+
+        size_t total_features = 0;
+        for (int i = 0; i < 18; ++i)
+            total_features += osm_handler.features_by_zoom[i].size();
+
+        std::cout << "  Features extracted: " << total_features << std::endl;
         std::cout << "  Features filtered:  " << osm_handler.stats_filtered << std::endl;
 
         std::cout << "Generating NAV tile files..." << std::endl;
         std::cout << "Generating tiles for zooms " << min_zoom << " to " << max_zoom << "..." << std::endl;
         
         nav::TileProcessor processor{output_dir};
-        processor.process_all(osm_handler.features, min_zoom, max_zoom);
+        processor.process_all(osm_handler.features_by_zoom, min_zoom, max_zoom);
 
         auto end_all = std::chrono::steady_clock::now();
         std::chrono::duration<double> total_elapsed = end_all - start_time;

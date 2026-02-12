@@ -39,19 +39,22 @@ public:
 
     /**
      * @brief Processes all features for a given zoom range.
-     * @param features Vector of extracted map features.
+     * @param features_by_zoom Array of vectors containing map features grouped by min_zoom.
      * @param min_z Minimum zoom level.
      * @param max_z Maximum zoom level.
      */
-    void process_all(std::vector<Feature>& features, int min_z, int max_z)
+    void process_all(std::vector<Feature> (&features_by_zoom)[18], int min_z, int max_z)
     {
         total_generated_bytes = 0;
         total_generated_files = 0;
         for (int z = min_z; z <= max_z; ++z)
-            process_zoom_level(features, z);
+            process_zoom_level(features_by_zoom, z);
     }
 
+    /** @return Total bytes written to disk during the last process_all call. */
     uint64_t get_total_bytes() const { return total_generated_bytes; }
+    
+    /** @return Total number of .nav files generated. */
     size_t get_total_files() const { return total_generated_files; }
 
 private:
@@ -65,7 +68,7 @@ private:
         bool operator<(const TileCoord& o) const { return x < o.x || (x == o.x && y < o.y); }
     };
 
-    // Internal structure for processed objects
+    // Internal structure for processed objects after geometry operations
     struct ProcessedFeature
     {
         uint8_t type;
@@ -106,7 +109,7 @@ private:
                 return nullptr;
             }
             
-            // Create inner rings
+            // Create inner rings (holes)
             std::vector<GEOSGeometry*> holes;
             for (size_t i = 1; i < f.rings.size(); ++i)
             {
@@ -160,43 +163,46 @@ private:
 
     /**
      * @brief Processes all tiles for a specific zoom level in parallel.
-     * @param features Source features.
+     * @param features_by_zoom Source features grouped by zoom.
      * @param z Current zoom level.
      */
-    void process_zoom_level(std::vector<Feature>& features, int z)
+    void process_zoom_level(std::vector<Feature> (&features_by_zoom)[18], int z)
     {
         auto start = std::chrono::steady_clock::now();
-        std::map<TileCoord, std::vector<size_t>> tile_map;
+        
+        // tile_map: maps tile coordinates to a list of {bucket_idx, feature_idx}
+        std::map<TileCoord, std::vector<std::pair<int, size_t>>> tile_map;
         size_t zoom_features = 0;
 
-        for (size_t i = 0; i < features.size(); ++i)
+        for (int b = 0; b <= z; ++b)
         {
-            const auto& f = features[i];
-            int f_min_zoom = (f.zoom_priority >> 4) & 0x0F;
-            if (z < f_min_zoom)
-                continue;
-            zoom_features++;
-
-            int min_tx = 1e9, max_tx = -1, min_ty = 1e9, max_ty = -1;
-            for (const auto& ring : f.rings)
+            const auto& bucket = features_by_zoom[b];
+            for (size_t i = 0; i < bucket.size(); ++i)
             {
-                for (const auto& p : ring)
+                const auto& f = bucket[i];
+                zoom_features++;
+
+                int min_tx = 1e9, max_tx = -1, min_ty = 1e9, max_ty = -1;
+                for (const auto& ring : f.rings)
                 {
-                    int tx = static_cast<int>(utils::lon_to_x(p.lon, z));
-                    int ty = static_cast<int>(utils::lat_to_y(p.lat, z));
-                    min_tx = std::min(min_tx, tx); max_tx = std::max(max_tx, tx);
-                    min_ty = std::min(min_ty, ty); max_ty = std::max(max_ty, ty);
+                    for (const auto& p : ring)
+                    {
+                        int tx = static_cast<int>(utils::lon_to_x(p.lon, z));
+                        int ty = static_cast<int>(utils::lat_to_y(p.lat, z));
+                        min_tx = std::min(min_tx, tx); max_tx = std::max(max_tx, tx);
+                        min_ty = std::min(min_ty, ty); max_ty = std::max(max_ty, ty);
+                    }
                 }
+                for (int x = min_tx; x <= max_tx; ++x)
+                    for (int y = min_ty; y <= max_ty; ++y)
+                        tile_map[{x, y}].push_back({b, i});
             }
-            for (int x = min_tx; x <= max_tx; ++x)
-                for (int y = min_ty; y <= max_ty; ++y)
-                    tile_map[{x, y}].push_back(i);
         }
 
         if (tile_map.empty())
             return;
 
-        std::vector<std::pair<TileCoord, std::vector<size_t>>> tiles(tile_map.begin(), tile_map.end());
+        std::vector<std::pair<TileCoord, std::vector<std::pair<int, size_t>>>> tiles(tile_map.begin(), tile_map.end());
         unsigned int num_threads = std::thread::hardware_concurrency();
         if (num_threads == 0)
             num_threads = 4;
@@ -219,7 +225,7 @@ private:
                     size_t m = 0;
                     uint64_t b = 0;
                     const auto& [coord, indices] = tiles[idx];
-                    write_tile(z, coord.x, coord.y, features, indices, handle, m, b);
+                    write_tile(z, coord.x, coord.y, features_by_zoom, indices, handle, m, b);
                     merged_count += m;
                     zoom_bytes += b;
                 }
@@ -276,13 +282,14 @@ private:
      * @param z Zoom level.
      * @param x Tile X coordinate.
      * @param y Tile Y coordinate.
-     * @param all_features Vector of all features.
-     * @param indices Indices of features relevant to this tile.
+     * @param features_by_zoom Source features grouped by zoom level buckets.
+     * @param indices List of {bucket_idx, feature_idx} relevant to this tile.
      * @param local_handle Thread-local GEOS context.
      * @param merged_out [out] Atomic counter for merged polygons.
      * @param bytes_out [out] Atomic counter for bytes written.
      */
-    void write_tile(int z, int x, int y, const std::vector<Feature>& all_features, const std::vector<size_t>& indices, 
+    void write_tile(int z, int x, int y, std::vector<Feature> (&features_by_zoom)[18], 
+                   const std::vector<std::pair<int, size_t>>& indices, 
                    GEOSContextHandle_t local_handle, size_t& merged_out, uint64_t& bytes_out)
     {
         struct Style
@@ -293,9 +300,9 @@ private:
         std::map<Style, std::vector<GEOSGeometry*>> poly_groups;
         std::vector<const Feature*> lines;
 
-        for (size_t idx : indices)
+        for (const auto& idx_pair : indices)
         {
-            const auto& f = all_features[idx];
+            const auto& f = features_by_zoom[idx_pair.first][idx_pair.second];
             if (f.geom_type == GEOM_POLYGON)
             {
                 GEOSGeometry* g = feature_to_geos(f, local_handle);
@@ -306,7 +313,6 @@ private:
                 lines.push_back(&f);
         }
 
-        // Clip box with 10% margin
         double lmin = utils::tile_x_to_lon(x, z); double lmax = utils::tile_x_to_lon(x + 1, z);
         double tmax = utils::tile_y_to_lat(y, z); double tmin = utils::tile_y_to_lat(y + 1, z);
         double lm = (lmax - lmin) * 0.1; double tm = (tmax - tmin) * 0.1;
@@ -319,9 +325,7 @@ private:
         GEOSCoordSeq_setX_r(local_handle, cbox, 4, lmin - lm); GEOSCoordSeq_setY_r(local_handle, cbox, 4, tmin - tm);
         GEOSGeometry* clip_geom = GEOSGeom_createPolygon_r(local_handle, GEOSGeom_createLinearRing_r(local_handle, cbox), NULL, 0);
 
-        // Simplification tolerance based on zoom (approx 1 pixel)
         double tolerance = (lmax - lmin) / 512.0;
-
         std::vector<ProcessedFeature> final_features;
 
         // Process Polygons (Merge + Clip + Simplify)
@@ -402,7 +406,7 @@ private:
             GEOSGeom_destroy_r(local_handle, g); GEOSGeom_destroy_r(local_handle, simplified); GEOSGeom_destroy_r(local_handle, clipped);
         }
 
-        // File writing
+        // Writing
         std::string dir = output_dir + "/" + std::to_string(z) + "/" + std::to_string(x);
         std::filesystem::create_directories(dir);
         std::ofstream out(dir + "/" + std::to_string(y) + ".nav", std::ios::binary);
@@ -415,7 +419,6 @@ private:
             out.write((char*)th, 22);
             uint16_t count = 0;
             
-            // Write feature data
             for (const auto& pf : final_features)
             {
                 std::vector<uint8_t> payload; 
@@ -431,10 +434,7 @@ private:
                         payload.insert(payload.end(), vx.begin(), vx.end());
                         auto vy = utils::to_varint(utils::zigzag_encode(p.second - ly));
                         payload.insert(payload.end(), vy.begin(), vy.end());
-                        
-                        lx = p.first; 
-                        ly = p.second;
-
+                        lx = p.first; ly = p.second;
                         int16_t cx = std::max((int16_t)0, std::min((int16_t)4096, p.first));
                         int16_t cy = std::max((int16_t)0, std::min((int16_t)4096, p.second));
                         minx = std::min(minx, cx); maxx = std::max(maxx, cx);
@@ -457,9 +457,7 @@ private:
                 }
 
                 uint8_t fh[13] = {
-                    pf.type, 
-                    (uint8_t)(pf.color & 0xFF), (uint8_t)(pf.color >> 8), 
-                    pf.prio, 
+                    pf.type, (uint8_t)(pf.color & 0xFF), (uint8_t)(pf.color >> 8), pf.prio, 
                     (uint8_t)(pf.type == GEOM_POLYGON ? 0 : utils::meters_to_pixels(pf.width, z)),
                     (uint8_t)(minx / 16), (uint8_t)(miny / 16), (uint8_t)(maxx / 16), (uint8_t)(maxy / 16), 
                     (uint8_t)(pts & 0xFF), (uint8_t)(pts >> 8),
@@ -468,12 +466,10 @@ private:
 
                 out.write((char*)fh, 13); 
                 out.write((char*)payload.data(), payload.size()); 
-                if (!ri.empty())
-                    out.write((char*)ri.data(), ri.size());
+                if (!ri.empty()) out.write((char*)ri.data(), ri.size());
                 
                 count++; 
-                if (count == 0xFFFF)
-                    break;
+                if (count == 0xFFFF) break;
             }
             // Capture real size before seeking back to header
             bytes_out = (uint64_t)out.tellp();

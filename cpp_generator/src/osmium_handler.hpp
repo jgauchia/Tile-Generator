@@ -131,7 +131,7 @@ public:
         }
 
         feat.zoom_priority = utils::pack_zoom_priority(f_cfg.min_zoom, combined_priority);
-        features.push_back(std::move(feat));
+        features_by_zoom[f_cfg.min_zoom].push_back(std::move(feat));
     }
 
     /**
@@ -194,16 +194,16 @@ public:
                     feat.rings.push_back(std::move(ipts));
             }
 
-            features.push_back(std::move(feat));
+            features_by_zoom[f_cfg.min_zoom].push_back(std::move(feat));
         }
     }
 
-    std::vector<Feature> features;
-    std::unordered_set<int64_t> processed_areas;
-    size_t stats_nodes = 0;
-    size_t stats_ways = 0;
-    size_t stats_areas = 0;
-    size_t stats_filtered = 0;
+    std::vector<Feature> features_by_zoom[18]; ///< Features grouped by minimum visibility zoom level (0-17)
+    std::unordered_set<int64_t> processed_areas; ///< IDs of ways already processed as polygons
+    size_t stats_nodes = 0;     ///< Total nodes visited
+    size_t stats_ways = 0;      ///< Total ways processed
+    size_t stats_areas = 0;     ///< Total areas processed
+    size_t stats_filtered = 0;  ///< Total features filtered out
 
 private:
     const ConfigManager& config;
