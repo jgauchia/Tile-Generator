@@ -15,6 +15,7 @@
 #include <future>
 #include <atomic>
 #include <map>
+#include <unordered_map>
 #include <cstring>
 #include <iomanip>
 #include <iostream>
@@ -51,10 +52,7 @@ public:
             process_zoom_level(features_by_zoom, z);
     }
 
-    /** @return Total bytes written to disk during the last process_all call. */
     uint64_t get_total_bytes() const { return total_generated_bytes; }
-    
-    /** @return Total number of .nav files generated. */
     size_t get_total_files() const { return total_generated_files; }
 
 private:
@@ -65,7 +63,16 @@ private:
     struct TileCoord
     {
         int x, y;
-        bool operator<(const TileCoord& o) const { return x < o.x || (x == o.x && y < o.y); }
+        bool operator==(const TileCoord& o) const { return x == o.x && y == o.y; }
+    };
+
+    struct TileCoordHash
+    {
+        std::size_t operator()(const TileCoord& k) const
+        {
+            // Simple hash combination for 2D coordinates
+            return std::hash<int>()(k.x) ^ (std::hash<int>()(k.y) << 1);
+        }
     };
 
     // Internal structure for processed objects after geometry operations
@@ -170,7 +177,10 @@ private:
     void process_zoom_level(std::vector<Feature> (&features_by_zoom)[18], int z)
     {
         auto start = std::chrono::steady_clock::now();
-        std::map<TileCoord, std::vector<std::pair<int, size_t>>> tile_map;
+        
+        // tile_map: maps tile coordinates to a list of {bucket_idx, feature_idx}
+        // Using unordered_map for O(1) insertion/lookup
+        std::unordered_map<TileCoord, std::vector<std::pair<int, size_t>>, TileCoordHash> tile_map;
         size_t zoom_features = 0;
 
         for (int b = 0; b <= z; ++b)
@@ -324,6 +334,7 @@ private:
         double tolerance = (lmax - lmin) / 512.0;
         std::vector<ProcessedFeature> final_features;
 
+        // Process Polygons (Merge + Clip + Simplify)
         for (auto& [style, geos_polys] : poly_groups)
         {
             size_t before = geos_polys.size();
@@ -367,6 +378,7 @@ private:
             GEOSGeom_destroy_r(local_handle, simplified); GEOSGeom_destroy_r(local_handle, clipped);
         }
 
+        // Process Lines (Clip + Simplify)
         for (const auto* f : lines)
         {
             GEOSGeometry* g = feature_to_geos(*f, local_handle);
@@ -429,10 +441,7 @@ private:
                         payload.insert(payload.end(), vx.begin(), vx.end());
                         auto vy = utils::to_varint(utils::zigzag_encode(p.second - ly));
                         payload.insert(payload.end(), vy.begin(), vy.end());
-                        
-                        lx = p.first; 
-                        ly = p.second;
-
+                        lx = p.first; ly = p.second;
                         int16_t cx = std::max((int16_t)0, std::min((int16_t)4096, p.first));
                         int16_t cy = std::max((int16_t)0, std::min((int16_t)4096, p.second));
                         minx = std::min(minx, cx); maxx = std::max(maxx, cx);
@@ -464,12 +473,10 @@ private:
 
                 out.write((char*)fh, 13); 
                 out.write((char*)payload.data(), payload.size()); 
-                if (!ri.empty())
-                    out.write((char*)ri.data(), ri.size());
+                if (!ri.empty()) out.write((char*)ri.data(), ri.size());
                 
                 count++; 
-                if (count == 0xFFFF)
-                    break;
+                if (count == 0xFFFF) break;
             }
             // Capture real size before seeking back to header
             bytes_out = (uint64_t)out.tellp();
