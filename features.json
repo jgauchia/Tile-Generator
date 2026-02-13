@@ -126,7 +126,7 @@
   },
   "landuse=industrial": {
     "zoom": 12,
-    "color": "#ebdbe8",
+    "color": "#ecd8ff",
     "priority": 24
   },
   "landuse=cemetery": {
@@ -311,7 +311,7 @@
   },
   "highway=track": {
     "zoom": 14,
-    "color": "#996600",
+    "color": "#ac9a7c",
     "priority": 67
   },
   "highway=path": {
@@ -363,7 +363,7 @@
   },
   "aeroway=apron": {
     "zoom": 14,
-    "color": "#dadae0",
+    "color": "#e9d1ff",
     "priority": 74
   },
 
@@ -400,17 +400,17 @@
 
   "amenity=hospital": {
     "zoom": 14,
-    "color": "#f0c0c0",
+    "color": "#ffe4e4",
     "priority": 80
   },
   "amenity=school": {
     "zoom": 15,
-    "color": "#f0f0d8",
+    "color": "#fff5cc",
     "priority": 80
   },
   "amenity=university": {
     "zoom": 14,
-    "color": "#f0f0d8",
+    "color": "#fff5cc",
     "priority": 80
   },
 
