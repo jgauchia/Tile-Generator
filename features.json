@@ -126,7 +126,7 @@
   },
   "landuse=industrial": {
     "zoom": 12,
-    "color": "#ecd8ff",
+    "color": "#ebdbe8",
     "priority": 24
   },
   "landuse=cemetery": {
@@ -363,7 +363,7 @@
   },
   "aeroway=apron": {
     "zoom": 14,
-    "color": "#e9d1ff",
+    "color": "#dadae0",
     "priority": 74
   },
 
@@ -400,17 +400,17 @@
 
   "amenity=hospital": {
     "zoom": 14,
-    "color": "#ffe4e4",
+    "color": "#f0f0d8",
     "priority": 80
   },
   "amenity=school": {
     "zoom": 15,
-    "color": "#fff5cc",
+    "color": "#f0f0d8",
     "priority": 80
   },
   "amenity=university": {
     "zoom": 14,
-    "color": "#fff5cc",
+    "color": "#f0f0d8",
     "priority": 80
   },
 
@@ -433,5 +433,116 @@
     "zoom": 14,
     "color": "#000000",
     "priority": 93
+  },
+
+  "natural=shrubbery": {
+    "zoom": 14,
+    "color": "#c8d7ab",
+    "priority": 22
+  },
+  "natural=forest": {
+    "zoom": 12,
+    "color": "#add19e",
+    "priority": 22
+  },
+  "natural=bare_rock": {
+    "zoom": 13,
+    "color": "#d0d0d0",
+    "priority": 29
+  },
+  "natural=rock": {
+    "zoom": 13,
+    "color": "#d0d0d0",
+    "priority": 29
+  },
+  "natural=scree": {
+    "zoom": 13,
+    "color": "#e0e0e0",
+    "priority": 29
+  },
+  "natural=glacier": {
+    "zoom": 12,
+    "color": "#ddecec",
+    "priority": 30
+  },
+  "landuse=orchard": {
+    "zoom": 13,
+    "color": "#aedfa3",
+    "priority": 23
+  },
+  "landuse=vineyard": {
+    "zoom": 13,
+    "color": "#abdf96",
+    "priority": 23
+  },
+  "landuse=basin": {
+    "zoom": 13,
+    "color": "#aad3df",
+    "priority": 30
+  },
+  "landuse=allotments": {
+    "zoom": 14,
+    "color": "#c8b084",
+    "priority": 24
+  },
+  "railway=narrow_gauge": {
+    "zoom": 12,
+    "color": "#999999",
+    "priority": 40
+  },
+  "railway=funicular": {
+    "zoom": 14,
+    "color": "#888888",
+    "priority": 41
+  },
+  "highway=construction": {
+    "zoom": 12,
+    "color": "#fcbc97",
+    "priority": 60
+  },
+  "waterway=ditch": {
+    "zoom": 15,
+    "color": "#aad3df",
+    "priority": 16
+  },
+  "waterway=drain": {
+    "zoom": 15,
+    "color": "#aad3df",
+    "priority": 16
+  },
+  "aeroway=aerodrome": {
+    "zoom": 10,
+    "color": "#e9e7e2",
+    "priority": 73
+  },
+  "aeroway=helipad": {
+    "zoom": 14,
+    "color": "#e9e7e2",
+    "priority": 74
+  },
+  "place=city": {
+    "zoom": 8,
+    "color": "#000000",
+    "priority": 95
+  },
+  "place=suburb": {
+    "zoom": 12,
+    "color": "#000000",
+    "priority": 94
+  },
+  "place=square": {
+    "zoom": 15,
+    "color": "#000000",
+    "priority": 90
+  },
+  "amenity=place_of_worship": {
+    "zoom": 15,
+    "color": "#999999",
+    "priority": 82
+  },
+  "amenity=grave_yard": {
+    "zoom": 15,
+    "color": "#aacbaf",
+    "priority": 24
   }
 }
