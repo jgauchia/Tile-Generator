@@ -343,10 +343,26 @@ private:
             GEOSGeometry* simplified = GEOSSimplify_r(local_handle, merged, tolerance);
             GEOSGeometry* clipped = GEOSIntersection_r(local_handle, simplified, clip_geom);
             
-            int n = GEOSGetNumGeometries_r(local_handle, clipped);
+            // Ensure the result is valid after intersection
+            GEOSGeometry* final_geom = clipped;
+            if (clipped && !GEOSisValid_r(local_handle, clipped))
+            {
+                final_geom = GEOSMakeValid_r(local_handle, clipped);
+                GEOSGeom_destroy_r(local_handle, clipped);
+            }
+
+            if (!final_geom)
+            {
+                GEOSGeom_destroy_r(local_handle, coll);
+                GEOSGeom_destroy_r(local_handle, merged);
+                GEOSGeom_destroy_r(local_handle, simplified);
+                continue;
+            }
+
+            int n = GEOSGetNumGeometries_r(local_handle, final_geom);
             for (int i = 0; i < n; ++i)
             {
-                const GEOSGeometry* g = GEOSGetGeometryN_r(local_handle, clipped, i);
+                const GEOSGeometry* g = GEOSGetGeometryN_r(local_handle, final_geom, i);
                 if (GEOSGeomTypeId_r(local_handle, g) != GEOS_POLYGON)
                     continue;
                 
@@ -375,7 +391,7 @@ private:
             }
             merged_out += (before - std::max((int)0, n));
             GEOSGeom_destroy_r(local_handle, coll); GEOSGeom_destroy_r(local_handle, merged);
-            GEOSGeom_destroy_r(local_handle, simplified); GEOSGeom_destroy_r(local_handle, clipped);
+            GEOSGeom_destroy_r(local_handle, simplified); GEOSGeom_destroy_r(local_handle, final_geom);
         }
 
         // Process Lines (Clip + Simplify)
@@ -429,12 +445,11 @@ private:
             for (const auto& pf : final_features)
             {
                 std::vector<uint8_t> payload; 
-                int16_t lx = 0, ly = 0;
                 int16_t minx = 4096, maxx = 0, miny = 4096, maxy = 0; 
                 size_t pts = 0;
-
                 for (const auto& r : pf.rings)
                 {
+                    int16_t lx = 0, ly = 0;
                     for (const auto& p : r)
                     {
                         auto vx = utils::to_varint(utils::zigzag_encode(p.first - lx));
@@ -449,7 +464,6 @@ private:
                     }
                     pts += r.size();
                 }
-
                 std::vector<uint8_t> ri; 
                 if (pf.type == GEOM_POLYGON)
                 {
@@ -462,21 +476,21 @@ private:
                         ri.push_back(cur & 0xFF); ri.push_back(cur >> 8); 
                     }
                 }
-
                 uint8_t fh[13] = {
                     pf.type, (uint8_t)(pf.color & 0xFF), (uint8_t)(pf.color >> 8), pf.prio, 
                     (uint8_t)(pf.type == GEOM_POLYGON ? 0 : utils::meters_to_pixels(pf.width, z)),
-                    (uint8_t)(minx / 16), (uint8_t)(miny / 16), (uint8_t)(maxx / 16), (uint8_t)(maxy / 16), 
+                    (uint8_t)std::min(255, minx / 16), (uint8_t)std::min(255, miny / 16), 
+                    (uint8_t)std::min(255, maxx / 16), (uint8_t)std::min(255, maxy / 16), 
                     (uint8_t)(pts & 0xFF), (uint8_t)(pts >> 8),
                     (uint8_t)((payload.size() + ri.size()) & 0xFF), (uint8_t)((payload.size() + ri.size()) >> 8)
                 };
-
                 out.write((char*)fh, 13); 
                 out.write((char*)payload.data(), payload.size()); 
-                if (!ri.empty()) out.write((char*)ri.data(), ri.size());
-                
+                if (!ri.empty())
+                    out.write((char*)ri.data(), ri.size());
                 count++; 
-                if (count == 0xFFFF) break;
+                if (count == 0xFFFF)
+                    break;
             }
             // Capture real size before seeking back to header
             bytes_out = (uint64_t)out.tellp();
