@@ -131,6 +131,7 @@ public:
         feat.points = std::move(way_points);
         feat.ring_ends.push_back(static_cast<uint32_t>(feat.points.size()));
         feat.zoom_priority = utils::pack_zoom_priority(f_cfg.min_zoom, combined_priority);
+        feat.zoom_widths = f_cfg.zoom_widths; // Transfer dynamic widths
         features_by_zoom[f_cfg.min_zoom].push_back(std::move(feat));
     }
 
@@ -174,6 +175,7 @@ public:
             feat.color_rgb565 = f_cfg.color_rgb565;
             feat.zoom_priority = zoom_prio;
             feat.width_meters = 0;
+            feat.zoom_widths = f_cfg.zoom_widths; // Transfer dynamic widths
 
             for (const auto& n : outer_ring)
                 feat.points.push_back(Point{n.lon(), n.lat()});

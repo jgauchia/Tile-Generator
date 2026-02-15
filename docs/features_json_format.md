@@ -43,7 +43,31 @@ Each feature definition object includes:
 |--------------|----------|---------------------------------------------------------------------------------------------------|
 | zoom         | integer  | Minimum zoom level at which the feature is rendered.                                             |
 | color        | string   | Fill/stroke color in HTML hexadecimal format (`#rrggbb`).                                         |
-| priority     | integer  | Priority offset within its layer (0-9). Higher numbers render on top.                             |
+| `priority` | `int` | No | Rendering priority (higher numbers are drawn on top). |
+| `width` | `float` | No | Physical width in meters (used to calculate pixel width). |
+| `widths` | `object` | No | Dictionary of zoom level to fixed pixel width (dynamic styling). |
+
+### Static vs. Dynamic Widths
+
+You can define the line width in two ways:
+
+1. **Physical Width (`width`):** A float value in meters. The generator will calculate the exact pixel size based on the zoom level and latitude.
+   ```json
+   "highway=primary": { "width": 10.5 }
+   ```
+
+2. **Dynamic Widths (`widths`):** A dictionary mapping zoom levels to fixed pixel values. The generator will select the maximum value between the physical calculation and this aesthetic table.
+   ```json
+   "highway=motorway": {
+     "widths": {
+       "6": 1,
+       "10": 2,
+       "12": 4,
+       "15": 8
+     }
+   }
+   ```
+
 
 ---
 

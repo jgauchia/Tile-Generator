@@ -22,6 +22,8 @@ struct FeatureConfig
     int min_zoom = 6;           ///< Minimum visibility zoom level
     uint16_t color_rgb565 = 0xFFFF; ///< Color in RGB565 format
     int priority = 50;          ///< Rendering priority (higher = front)
+    float width_meters = 0.0f;  ///< Fixed width in meters (if present)
+    std::map<int, uint8_t> zoom_widths; ///< Table of minimum pixel widths per zoom
 };
 
 /**
@@ -44,11 +46,10 @@ public:
         
         nlohmann::json j;
         f >> j;
-
         for (auto it = j.begin(); it != j.end(); ++it)
         {
             if (it.key().substr(0, 1) == "_")
-                continue; // Skip comments/metadata
+                continue;
             
             FeatureConfig cfg;
             if (it.value().contains("zoom"))
@@ -57,6 +58,14 @@ public:
                 cfg.color_rgb565 = utils::hex_to_rgb565(it.value()["color"]);
             if (it.value().contains("priority"))
                 cfg.priority = it.value()["priority"];
+            if (it.value().contains("width"))
+                cfg.width_meters = it.value()["width"];
+            
+            if (it.value().contains("widths"))
+            {
+                for (auto& w_it : it.value()["widths"].items())
+                    cfg.zoom_widths[std::stoi(w_it.key())] = static_cast<uint8_t>(w_it.value());
+            }
             
             config_map[it.key()] = cfg;
         }

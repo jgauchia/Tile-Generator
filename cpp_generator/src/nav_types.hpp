@@ -49,6 +49,7 @@ struct Feature
     float width_meters;     ///< Line width in meters (for Linestrings)
     std::vector<Point> points;       ///< Flattened coordinate points for all rings
     std::vector<uint32_t> ring_ends; ///< End indices for each ring in the points vector
+    std::map<int, uint8_t> zoom_widths; ///< Optional aesthetic widths per zoom level
 };
 
 /**
