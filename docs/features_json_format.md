@@ -92,7 +92,8 @@ You can define the line width in two ways:
 
 - **priority**  
   - Controls draw order within each layer.
-  - Final priority = `layer_base + (priority % 10)`.
+  - Final priority (0-15) = `layer_base_priority + (priority_from_json / 7)` (clamped to 15).
+    - Note: This means a value of `priority=0` to `priority=6` results in `0`. `priority=7` to `priority=13` results in `1`, etc. Max effective `priority_from_json` is `104` to get `14`.
 
 ---
 
