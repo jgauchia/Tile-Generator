@@ -243,91 +243,91 @@
     "zoom": 6,
     "color": "#e990a0",
     "priority": 60,
-    "widths": { "6": 1, "10": 2, "12": 4, "14": 7, "16": 10 }
+    "widths": { "6": 1, "10": 2, "12": 3, "13": 4, "14": 5, "15": 7, "16": 9 }
   },
   "highway=motorway_link": {
     "zoom": 8,
     "color": "#e990a0",
     "priority": 60,
-    "widths": { "10": 1, "12": 2, "14": 4, "16": 6 }
+    "widths": { "10": 1, "12": 2, "14": 3, "15": 4, "16": 6 }
   },
   "highway=trunk": {
     "zoom": 6,
     "color": "#f9b29c",
     "priority": 61,
-    "widths": { "6": 1, "10": 2, "12": 3, "14": 6, "16": 9 }
+    "widths": { "6": 1, "10": 2, "12": 3, "14": 4, "15": 6, "16": 8 }
   },
   "highway=trunk_link": {
     "zoom": 8,
     "color": "#f9b29c",
     "priority": 61,
-    "widths": { "10": 1, "12": 2, "14": 4, "16": 6 }
+    "widths": { "10": 1, "12": 2, "14": 3, "15": 4, "16": 6 }
   },
   "highway=primary": {
     "zoom": 6,
     "color": "#fcd6a4",
     "priority": 62,
-    "widths": { "6": 1, "10": 1, "12": 3, "14": 5, "16": 8 }
+    "widths": { "6": 1, "10": 1, "12": 2, "13": 3, "14": 4, "15": 5, "16": 7 }
   },
   "highway=primary_link": {
     "zoom": 10,
     "color": "#fcd6a4",
     "priority": 62,
-    "widths": { "10": 1, "12": 2, "14": 3, "16": 5 }
+    "widths": { "10": 1, "12": 2, "14": 3, "15": 4, "16": 5 }
   },
   "highway=secondary": {
     "zoom": 10,
     "color": "#f7f496",
     "priority": 63,
-    "widths": { "10": 1, "12": 2, "14": 4, "16": 7 }
+    "widths": { "10": 1, "12": 2, "14": 3, "15": 4, "16": 6 }
   },
   "highway=secondary_link": {
     "zoom": 12,
     "color": "#f7f496",
     "priority": 63,
-    "widths": { "12": 1, "14": 3, "16": 5 }
+    "widths": { "12": 1, "14": 2, "15": 3, "16": 5 }
   },
   "highway=tertiary": {
     "zoom": 12,
     "color": "#ffffff",
     "priority": 64,
-    "widths": { "12": 1, "14": 3, "16": 6 }
+    "widths": { "12": 1, "14": 2, "15": 4, "16": 6 }
   },
   "highway=tertiary_link": {
     "zoom": 12,
     "color": "#ffffff",
     "priority": 64,
-    "widths": { "12": 1, "14": 2, "16": 4 }
+    "widths": { "12": 1, "14": 2, "15": 3, "16": 4 }
   },
   "highway=residential": {
     "zoom": 14,
     "color": "#ffffff",
     "priority": 65,
-    "widths": { "14": 2, "16": 5 }
+    "widths": { "14": 2, "15": 3, "16": 5 }
   },
   "highway=living_street": {
     "zoom": 14,
     "color": "#ededed",
     "priority": 65,
-    "widths": { "14": 2, "16": 5 }
+    "widths": { "14": 2, "15": 3, "16": 5 }
   },
   "highway=unclassified": {
     "zoom": 12,
     "color": "#ffffff",
     "priority": 65,
-    "widths": { "12": 1, "14": 2, "16": 5 }
+    "widths": { "12": 1, "14": 2, "15": 3, "16": 5 }
   },
   "highway=service": {
     "zoom": 15,
     "color": "#ffffff",
     "priority": 66,
-    "widths": { "15": 1, "16": 3 }
+    "widths": { "15": 1, "16": 2 }
   },
   "highway=track": {
     "zoom": 14,
     "color": "#ac9a7c",
     "priority": 67,
-    "widths": { "14": 1, "16": 3 }
+    "widths": { "14": 1, "15": 2, "16": 3 }
   },
   "highway=path": {
     "zoom": 15,

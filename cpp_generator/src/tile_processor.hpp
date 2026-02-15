@@ -1,6 +1,9 @@
 /**
  * @file tile_processor.hpp
+ * @author Jordi Gauchía (jgauchia @jgauchia.com)
  * @brief Optimized tile generation engine with hardware-aware simplification.
+ * @version 0.4.0
+ * @date 2026-02
  */
 
 #pragma once
@@ -77,7 +80,7 @@ private:
 
     uint32_t count_geos_points(GEOSContextHandle_t handle, const GEOSGeometry* g)
     {
-        if (!g) return 0;
+        if (!g || GEOSisEmpty_r(handle, g)) return 0;
         int type = GEOSGeomTypeId_r(handle, g);
         if (type == GEOS_POINT) return 1;
         if (type == GEOS_LINESTRING || type == GEOS_LINEARRING)
@@ -89,7 +92,8 @@ private:
         }
         if (type == GEOS_POLYGON)
         {
-            uint32_t count = count_geos_points(handle, GEOSGetExteriorRing_r(handle, g));
+            const GEOSGeometry* ext = GEOSGetExteriorRing_r(handle, g);
+            uint32_t count = ext ? count_geos_points(handle, ext) : 0;
             int nh = GEOSGetNumInteriorRings_r(handle, g);
             for (int h = 0; h < nh; ++h)
                 count += count_geos_points(handle, GEOSGetInteriorRingN_r(handle, g, h));
@@ -222,14 +226,6 @@ private:
 
     /**
      * @brief Performs merging, clipping and simplification for a single tile.
-     * @param z Zoom level.
-     * @param x Tile X coordinate.
-     * @param y Tile Y coordinate.
-     * @param features_by_zoom Source features grouped by zoom level buckets.
-     * @param indices List of {bucket_idx, feature_idx} relevant to this tile.
-     * @param local_handle Thread-local GEOS context.
-     * @param merged_out [out] Atomic counter for merged polygons.
-     * @param bytes_out [out] Atomic counter for bytes written.
      */
     void write_tile(int z, int x, int y, std::vector<Feature> (&features_by_zoom)[18], const std::vector<std::pair<int, size_t>>& indices, GEOSContextHandle_t local_handle, size_t& merged_out, uint64_t& bytes_out)
     {
@@ -255,10 +251,11 @@ private:
         GEOSCoordSeq_setX_r(local_handle, cbox, 3, lmin - lm); GEOSCoordSeq_setY_r(local_handle, cbox, 3, tmax + tm);
         GEOSCoordSeq_setX_r(local_handle, cbox, 4, lmin - lm); GEOSCoordSeq_setY_r(local_handle, cbox, 4, tmin - tm);
         GEOSGeometry* clip_geom = GEOSGeom_createPolygon_r(local_handle, GEOSGeom_createLinearRing_r(local_handle, cbox), NULL, 0);
-        double tolerance = (lmax - lmin) / 512.0;
-        const size_t MAX_SAFE_POINTS = 1000;
+        double tolerance = (lmax - lmin) / 1024.0;
+        const size_t MAX_SAFE_POINTS = 2000;
         std::vector<ProcessedFeature> final_features;
         auto protect_esp32 = [&](GEOSGeometry* g) {
+            if (!g || GEOSisEmpty_r(local_handle, g)) return (GEOSGeometry*)nullptr;
             GEOSGeometry* current = g;
             uint32_t pts = count_geos_points(local_handle, current);
             double current_tol = tolerance;
@@ -275,19 +272,27 @@ private:
             size_t before = geos_polys.size();
             GEOSGeometry* coll = GEOSGeom_createCollection_r(local_handle, GEOS_GEOMETRYCOLLECTION, geos_polys.data(), geos_polys.size());
             GEOSGeometry* merged = GEOSUnaryUnion_r(local_handle, coll);
-            GEOSGeometry* clipped = GEOSIntersection_r(local_handle, merged, clip_geom);
-            GEOSGeometry* final_geom = clipped;
-            if (clipped && !GEOSisValid_r(local_handle, clipped)) { final_geom = GEOSMakeValid_r(local_handle, clipped); GEOSGeom_destroy_r(local_handle, clipped); }
-            if (!final_geom) { GEOSGeom_destroy_r(local_handle, coll); GEOSGeom_destroy_r(local_handle, merged); continue; }
+            GEOSGeometry* final_geom = nullptr;
+            if (merged)
+            {
+                GEOSGeometry* clipped = GEOSIntersection_r(local_handle, merged, clip_geom);
+                if (clipped)
+                {
+                    if (!GEOSisValid_r(local_handle, clipped)) { final_geom = GEOSMakeValid_r(local_handle, clipped); GEOSGeom_destroy_r(local_handle, clipped); } 
+                    else final_geom = clipped;
+                }
+                GEOSGeom_destroy_r(local_handle, merged);
+            }
+            if (!final_geom) { GEOSGeom_destroy_r(local_handle, coll); continue; }
             int n = GEOSGetNumGeometries_r(local_handle, final_geom);
             for (int i = 0; i < n; ++i)
             {
                 const GEOSGeometry* g = GEOSGetGeometryN_r(local_handle, final_geom, i);
-                if (!g || GEOSGeomTypeId_r(local_handle, g) != GEOS_POLYGON) continue;
+                if (!g || GEOSGeomTypeId_r(local_handle, g) != GEOS_POLYGON || GEOSisEmpty_r(local_handle, g)) continue;
                 GEOSGeometry* simplified = GEOSTopologyPreserveSimplify_r(local_handle, g, tolerance);
                 if (!simplified) continue;
                 GEOSGeometry* safe = protect_esp32(simplified);
-                if (!safe) { GEOSGeom_destroy_r(local_handle, simplified); continue; }
+                if (!safe || GEOSGeomTypeId_r(local_handle, safe) != GEOS_POLYGON || GEOSisEmpty_r(local_handle, safe)) { if (safe && safe != simplified) GEOSGeom_destroy_r(local_handle, safe); GEOSGeom_destroy_r(local_handle, simplified); continue; }
                 ProcessedFeature pf{GEOM_POLYGON, style.color, style.prio, 0, {}, {}};
                 auto process_ring = [&](const GEOSGeometry* ring) {
                     if (!ring) return;
@@ -298,14 +303,12 @@ private:
                     std::vector<std::pair<int16_t, int16_t>> rpts;
                     for (uint32_t j = 0; j < sz; ++j)
                     {
-                        double lon, lat; 
-                        if (GEOSCoordSeq_getX_r(local_handle, s, j, &lon) && GEOSCoordSeq_getY_r(local_handle, s, j, &lat))
+                        double lon, lat; if (GEOSCoordSeq_getX_r(local_handle, s, j, &lon) && GEOSCoordSeq_getY_r(local_handle, s, j, &lat))
                             rpts.push_back({static_cast<int16_t>((utils::lon_to_x(lon, z) - x) * 4096), static_cast<int16_t>((utils::lat_to_y(lat, z) - y) * 4096)});
                     }
                     if (rpts.size() >= 3) pf.rings.push_back(std::move(rpts));
                 };
-                const GEOSGeometry* ext = GEOSGetExteriorRing_r(local_handle, safe);
-                if (ext) process_ring(ext);
+                process_ring(GEOSGetExteriorRing_r(local_handle, safe));
                 int nh = GEOSGetNumInteriorRings_r(local_handle, safe);
                 for (int h = 0; h < nh; ++h) process_ring(GEOSGetInteriorRingN_r(local_handle, safe, h));
                 if (!pf.rings.empty()) final_features.push_back(std::move(pf));
@@ -313,32 +316,34 @@ private:
                 GEOSGeom_destroy_r(local_handle, simplified);
             }
             merged_out += (before - std::max((int)0, n));
-            GEOSGeom_destroy_r(local_handle, coll); GEOSGeom_destroy_r(local_handle, merged); GEOSGeom_destroy_r(local_handle, final_geom);
+            GEOSGeom_destroy_r(local_handle, coll); GEOSGeom_destroy_r(local_handle, final_geom);
         }
         for (const auto* f : lines)
         {
             GEOSGeometry* g = feature_to_geos(*f, local_handle);
             if (!g) continue;
             GEOSGeometry* clipped = GEOSIntersection_r(local_handle, g, clip_geom);
+            if (!clipped || GEOSisEmpty_r(local_handle, clipped)) { GEOSGeom_destroy_r(local_handle, g); if (clipped) GEOSGeom_destroy_r(local_handle, clipped); continue; }
             int n = GEOSGetNumGeometries_r(local_handle, clipped);
             for (int i = 0; i < n; ++i)
             {
                 const GEOSGeometry* part = GEOSGetGeometryN_r(local_handle, clipped, i);
-                int type = GEOSGeomTypeId_r(local_handle, part);
-                if (type != GEOS_LINESTRING && type != GEOS_LINEARRING) continue;
+                if (!part || (GEOSGeomTypeId_r(local_handle, part) != GEOS_LINESTRING && GEOSGeomTypeId_r(local_handle, part) != GEOS_LINEARRING) || GEOSisEmpty_r(local_handle, part)) continue;
                 GEOSGeometry* simplified = GEOSTopologyPreserveSimplify_r(local_handle, part, tolerance);
+                if (!simplified) continue;
                 GEOSGeometry* safe = protect_esp32(simplified);
+                if (!safe || (GEOSGeomTypeId_r(local_handle, safe) != GEOS_LINESTRING && GEOSGeomTypeId_r(local_handle, safe) != GEOS_LINEARRING) || GEOSisEmpty_r(local_handle, safe)) { if (safe && safe != simplified) GEOSGeom_destroy_r(local_handle, safe); GEOSGeom_destroy_r(local_handle, simplified); continue; }
                 const GEOSCoordSequence* s = GEOSGeom_getCoordSeq_r(local_handle, safe);
-                uint32_t sz; GEOSCoordSeq_getSize_r(local_handle, s, &sz);
+                uint32_t sz; if (s) GEOSCoordSeq_getSize_r(local_handle, s, &sz); else sz = 0;
                 if (sz >= 2)
                 {
                     ProcessedFeature pf{GEOM_LINESTRING, f->color_rgb565, f->zoom_priority, f->width_meters, {{}}, f->zoom_widths};
                     for (uint32_t j = 0; j < sz; ++j)
                     {
-                        double lon, lat; GEOSCoordSeq_getX_r(local_handle, s, j, &lon); GEOSCoordSeq_getY_r(local_handle, s, j, &lat);
-                        pf.rings[0].push_back({static_cast<int16_t>((utils::lon_to_x(lon, z) - x) * 4096), static_cast<int16_t>((utils::lat_to_y(lat, z) - y) * 4096)});
+                        double lon, lat; if (GEOSCoordSeq_getX_r(local_handle, s, j, &lon) && GEOSCoordSeq_getY_r(local_handle, s, j, &lat))
+                            pf.rings[0].push_back({static_cast<int16_t>((utils::lon_to_x(lon, z) - x) * 4096), static_cast<int16_t>((utils::lat_to_y(lat, z) - y) * 4096)});
                     }
-                    final_features.push_back(std::move(pf));
+                    if (pf.rings[0].size() >= 2) final_features.push_back(std::move(pf));
                 }
                 if (safe != simplified) GEOSGeom_destroy_r(local_handle, safe);
                 GEOSGeom_destroy_r(local_handle, simplified);
@@ -361,8 +366,7 @@ private:
                 if (!pf.zoom_widths.empty())
                 {
                     uint8_t dynamic_w = 0;
-                    for (auto const& [w_zoom, w_pixels] : pf.zoom_widths)
-                        if (z >= w_zoom) dynamic_w = w_pixels;
+                    for (auto const& [w_zoom, w_pixels] : pf.zoom_widths) if (z >= w_zoom) dynamic_w = w_pixels;
                     final_width = std::max(final_width, dynamic_w);
                 }
                 if (final_width == 0) final_width = 1;
@@ -377,8 +381,7 @@ private:
                         auto vy = utils::to_varint(utils::zigzag_encode(p.second - ly));
                         payload.insert(payload.end(), vy.begin(), vy.end());
                         lx = p.first; ly = p.second;
-                        int16_t cx = std::max((int16_t)0, std::min((int16_t)4096, p.first));
-                        int16_t cy = std::max((int16_t)0, std::min((int16_t)4096, p.second));
+                        int16_t cx = std::max((int16_t)0, std::min((int16_t)4096, p.first)), cy = std::max((int16_t)0, std::min((int16_t)4096, p.second));
                         minx = std::min(minx, cx); maxx = std::max(maxx, cx); miny = std::min(miny, cy); maxy = std::max(maxy, cy);
                     }
                     pts += r.size();

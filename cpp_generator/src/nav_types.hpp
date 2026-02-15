@@ -1,6 +1,9 @@
 /**
  * @file nav_types.hpp
+ * @author Jordi Gauchía (jgauchia @jgauchia.com)
  * @brief Basic data structures and constants for the NAV tile generator.
+ * @version 0.4.0
+ * @date 2026-02
  */
 
 #pragma once
@@ -50,27 +53,6 @@ struct Feature
     std::vector<Point> points;       ///< Flattened coordinate points for all rings
     std::vector<uint32_t> ring_ends; ///< End indices for each ring in the points vector
     std::map<int, uint8_t> zoom_widths; ///< Optional aesthetic widths per zoom level
-};
-
-/**
- * @struct TilePos
- * @brief Position of a tile in the Z/X/Y structure.
- */
-struct TilePos
-{
-    int x;
-    int y;
-    int z;
-
-    /** @brief Comparison operator for map/set indexing */
-    bool operator<(const TilePos& other) const
-    {
-        if (z != other.z)
-            return z < other.z;
-        if (x != other.x)
-            return x < other.x;
-        return y < other.y;
-    }
 };
 
 } // namespace nav

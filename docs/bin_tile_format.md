@@ -75,41 +75,20 @@ Only present if `geom_type == 3`. Located at the end of the coordinate data bloc
 ### Tile-Relative Projection
 NAV stores coordinates already projected using the Web Mercator projection. Values are mapped to a 12-bit space (0-4096) relative to the tile's top-left corner.
 
-- **Range**: The standard tile extent is 0-4096. To ensure seamless rendering across tiles, features are clipped with a **10% safety margin**, allowing coordinates to range from approximately -410 to 4506.
+- **Range**: The standard tile extent is 0-4096. To ensure seamless rendering across tiles, features are clipped with a **20% safety margin**, allowing coordinates to range from approximately -820 to 4916.
 - **Precision**: 1 unit = 1/16th of a pixel (assuming a 256px tile).
-
-### ESP32 Rendering Math
-Conversion to screen pixels is extremely efficient:
-```cpp
-pixel_x = (nav_x * screen_tile_size) >> 12;
-pixel_y = (nav_y * screen_tile_size) >> 12;
-```
+- **Complexity**: While the format supports up to 65535 points per feature, the standard v0.4.0 generator limits features to **2000 points** to ensure stability on ESP32 hardware.
 
 ---
 
-## Optimizations
+## Rendering Rules
 
-### Payload-Based Culling
-The `payload_size` field in the header allows the renderer to skip the entire coordinate block with a single `seek()` operation if the feature's `bbox` is outside the current viewport. This significantly improves performance when navigating through dense areas.
+### Line Width Damping
+To prevent roads from obscuring the map at high detail levels, the generator applies a **damping factor of 0.7x** to the calculated pixel width for all features at **Zoom 13 and above**.
 
-### Delta VarInt Compression
-By storing differences instead of absolute coordinates, most values fit into a single byte. This reduces file size by **30-50%** compared to fixed 16-bit coordinates, leading to faster SD card reads.
-
-### BBox Culling
-The 4-byte `bbox` field stores normalized extents (`tile_coord >> 4`). The renderer can reconstruct the pixel bounds (`bbox[i] << 4`) and skip features before reading any payload data.
-
-### Geometry Clipping & Simplification
-All features are clipped and simplified during generation, reducing the workload for the ESP32.
-
----
-
-## Color & Priority Encoding
-
-### RGB565
-Colors are stored in the native 16-bit format used by most ESP32 displays (`RRRRRGGGGGGBBBBB`).
-
-### Zoom Priority
-Packed into a single byte: `min_zoom` (4 bits) + `priority` (4 bits).
+### Delta Reset Logic
+- **Linestrings**: The delta accumulator (lastX, lastY) is reset to (0,0) at the start of each feature.
+- **Polygons**: The delta accumulator is reset to (0,0) at the start of the feature **and at the start of every interior ring (hole)**. This ensures that errors don't propagate between separate geometric rings.
 
 ---
 

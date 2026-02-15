@@ -1,6 +1,9 @@
 /**
  * @file osmium_handler.hpp
+ * @author Jordi Gauchía (jgauchia @jgauchia.com)
  * @brief OSM PBF extractor using Osmium library.
+ * @version 0.4.0
+ * @date 2026-02
  */
 
 #pragma once

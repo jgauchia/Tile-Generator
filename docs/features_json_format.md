@@ -41,11 +41,19 @@ Each feature definition object includes:
 
 | Parameter    | Type     | Description                                                                                       |
 |--------------|----------|---------------------------------------------------------------------------------------------------|
-| zoom         | integer  | Minimum zoom level at which the feature is rendered.                                             |
-| color        | string   | Fill/stroke color in HTML hexadecimal format (`#rrggbb`).                                         |
-| `priority` | `int` | No | Rendering priority (higher numbers are drawn on top). |
-| `width` | `float` | No | Physical width in meters (used to calculate pixel width). |
-| `widths` | `object` | No | Dictionary of zoom level to fixed pixel width (dynamic styling). |
+| `zoom`       | integer  | Minimum zoom level at which the feature is rendered.                                             |
+| `color`      | string   | Fill/stroke color in HTML hexadecimal format (`#rrggbb`).                                         |
+| `priority`   | integer  | Rendering priority (higher numbers are drawn on top).                                             |
+| `width`      | float    | Physical width in meters (used to calculate pixel width).                                         |
+| `widths`     | object   | Dictionary of zoom level to fixed pixel width (dynamic styling).                                  |
+
+### Width Calculation Rules
+
+The final rendered width in pixels is determined by:
+1. Calculating the pixel equivalent of the physical `width` (if provided).
+2. Selecting the maximum value between that and any value in the `widths` table for the current zoom.
+3. **Automatic Damping**: For Zoom 13 and above, the calculated width is multiplied by **0.7** to prevent roads from overcrowding the map display.
+4. Clamping the result between **1 and 15 pixels**.
 
 ### Static vs. Dynamic Widths
 

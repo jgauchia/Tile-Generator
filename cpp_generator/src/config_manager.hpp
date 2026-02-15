@@ -1,6 +1,9 @@
 /**
  * @file config_manager.hpp
+ * @author Jordi Gauchía (jgauchia @jgauchia.com)
  * @brief Manages feature styling and zoom configuration from JSON.
+ * @version 0.4.0
+ * @date 2026-02
  */
 
 #pragma once

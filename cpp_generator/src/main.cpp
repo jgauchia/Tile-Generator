@@ -1,6 +1,9 @@
 /**
  * @file main.cpp
+ * @author Jordi Gauchía (jgauchia @jgauchia.com)
  * @brief Entry point for the NAV Tile Generator C++ implementation.
+ * @version 0.4.0
+ * @date 2026-02
  */
 
 #include <iostream>
