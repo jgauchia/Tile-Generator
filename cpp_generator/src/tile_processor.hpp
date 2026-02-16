@@ -369,6 +369,11 @@ private:
                     for (auto const& [w_zoom, w_pixels] : pf.zoom_widths) if (z >= w_zoom) dynamic_w = w_pixels;
                     final_width = std::max(final_width, dynamic_w);
                 }
+                if (z >= 13)
+                {
+                    float damped = final_width * 0.7f;
+                    final_width = static_cast<uint8_t>(damped + 0.5f);
+                }
                 if (final_width == 0) final_width = 1;
                 std::vector<uint8_t> payload; int16_t minx=4096, maxx=0, miny=4096, maxy=0; size_t pts=0;
                 for (const auto& r : pf.rings)
