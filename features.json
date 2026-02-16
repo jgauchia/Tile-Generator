@@ -134,47 +134,47 @@
   "landuse=grass": {
     "zoom": 14,
     "color": "#cdebb0",
-    "priority": 0
+    "priority": 7
   },
   "landuse=meadow": {
     "zoom": 14,
     "color": "#cdebb0",
-    "priority": 0
+    "priority": 7
   },
   "leisure=park": {
     "zoom": 12,
     "color": "#c8facc",
-    "priority": 0
+    "priority": 7
   },
   "leisure=garden": {
     "zoom": 14,
     "color": "#cdebb0",
-    "priority": 0
+    "priority": 7
   },
   "leisure=playground": {
     "zoom": 15,
     "color": "#c8facc",
-    "priority": 0
+    "priority": 7
   },
   "leisure=nature_reserve": {
     "zoom": 12,
     "color": "#add19e",
-    "priority": 0
+    "priority": 7
   },
   "leisure=golf_course": {
     "zoom": 14,
     "color": "#def6c0",
-    "priority": 0
+    "priority": 7
   },
   "leisure=recreation_ground": {
     "zoom": 14,
     "color": "#c8facc",
-    "priority": 0
+    "priority": 7
   },
   "landuse=recreation_ground": {
     "zoom": 14,
     "color": "#c8facc",
-    "priority": 0
+    "priority": 7
   },
   "amenity=parking": {
     "zoom": 15,
@@ -189,12 +189,12 @@
   "landuse=village_green": {
     "zoom": 14,
     "color": "#cdebb0",
-    "priority": 0
+    "priority": 7
   },
   "leisure=common": {
     "zoom": 14,
     "color": "#c8facc",
-    "priority": 0
+    "priority": 7
   },
   "natural=peak": {
     "zoom": 14,
