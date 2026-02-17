@@ -1,7 +1,7 @@
 /**
  * @file osmium_handler.hpp
  * @author Jordi Gauchía (jgauchia @jgauchia.com)
- * @brief OSM PBF extractor using Osmium library.
+ * @brief OSM PBF extractor using Osmium library with mapped storage support.
  * @version 0.4.0
  * @date 2026-02
  */
@@ -16,19 +16,16 @@
 #include <string>
 #include <vector>
 #include <algorithm>
-
 #include "nav_types.hpp"
 #include "config_manager.hpp"
 #include "utils.hpp"
+#include "mapped_store.hpp"
 
 namespace nav {
 
 /**
  * @class OSMHandler
- * @brief Processes OSM entities (Ways and Areas) and stores them as Features.
- * 
- * This class inherits from osmium::handler::Handler and implements the
- * way() and area() callbacks required by osmium::apply.
+ * @brief Processes OSM entities and stores them as offsets in a MappedStore.
  */
 class OSMHandler : public osmium::handler::Handler
 {
@@ -36,11 +33,12 @@ public:
     /**
      * @brief Constructor
      * @param cfg Style configuration manager.
+     * @param st Reference to the memory-mapped storage.
      * @param min_z Global minimum zoom level.
      * @param max_z Global maximum zoom level.
      */
-    OSMHandler(const ConfigManager& cfg, int min_z, int max_z) 
-        : config(cfg), min_zoom_range(min_z), max_zoom_range(max_z) {}
+    OSMHandler(const ConfigManager& cfg, MappedStore& st, int min_z, int max_z) 
+        : config(cfg), store(st), min_zoom_range(min_z), max_zoom_range(max_z) {}
 
     /** @brief Callback for OSM Nodes (currently only counts them) */
     void node(const osmium::Node&)
@@ -55,7 +53,6 @@ public:
     void way(const osmium::Way& w)
     {
         stats_ways++;
-        
         std::unordered_map<std::string, std::string> tags;
         bool interesting = false;
         for (const auto& t : w.tags())
@@ -64,54 +61,43 @@ public:
             if (config.is_interesting(t.key(), t.value()))
                 interesting = true;
         }
-
         if (!interesting)
         {
             stats_filtered++;
             return;
         }
-
         std::string layer = get_layer(tags);
         if (layer.empty())
         {
             stats_filtered++;
             return;
         }
-
         FeatureConfig f_cfg = config.get_config(tags);
-
         Feature feat;
         feat.id = w.id();
         feat.color_rgb565 = f_cfg.color_rgb565;
-
         std::vector<Point> way_points;
         for (const auto& n : w.nodes())
         {
             if (n.location().valid())
                 way_points.push_back(Point{n.lon(), n.lat()});
         }
-
         if (way_points.size() < 2)
         {
             stats_filtered++;
             return;
         }
-
         bool is_closed = way_points.size() >= 4 && 
                          way_points.front().lon == way_points.back().lon && 
                          way_points.front().lat == way_points.back().lat;
-        
         bool has_area_tag = tags.count("building") || tags.count("landuse") || 
                            tags.count("water") || tags.count("amenity") || 
                            tags.count("leisure") || tags.count("natural") ||
                            tags.count("waterway") || tags.count("man_made") ||
                            tags.count("aeroway");
-
         bool is_area = is_closed && (has_area_tag || (tags.count("area") && tags.at("area") == "yes"));
-
         int layer_base = get_layer_priority(layer);
         int combined_priority;
-
         if (is_area && !tags.count("highway") && !tags.count("place"))
         {
             feat.geom_type = GEOM_POLYGON;
@@ -123,19 +109,16 @@ public:
         {
             feat.geom_type = GEOM_LINESTRING;
             feat.width_meters = get_width(tags);
-            
-            // Lower priority for centerlines in water layer to stay behind polygons
             if (layer == "water")
                 combined_priority = layer_base + (f_cfg.priority % 5);
             else
                 combined_priority = layer_base + (f_cfg.priority % 10);
         }
-
         feat.points = std::move(way_points);
         feat.ring_ends.push_back(static_cast<uint32_t>(feat.points.size()));
         feat.zoom_priority = utils::pack_zoom_priority(f_cfg.min_zoom, combined_priority);
-        feat.zoom_widths = f_cfg.zoom_widths; // Transfer dynamic widths
-        features_by_zoom[f_cfg.min_zoom].push_back(std::move(feat));
+        feat.zoom_widths = f_cfg.zoom_widths;
+        features_by_zoom[f_cfg.min_zoom].push_back(store.append(feat));
     }
 
     /**
@@ -147,7 +130,6 @@ public:
         stats_areas++;
         if (a.from_way() && processed_areas.count(a.orig_id()))
             return;
-        
         std::unordered_map<std::string, std::string> tags;
         bool interesting = false;
         for (const auto& t : a.tags())
@@ -156,20 +138,14 @@ public:
             if (config.is_interesting(t.key(), t.value()))
                 interesting = true;
         }
-
         if (!interesting || tags.count("highway") || tags.count("place"))
             return;
-
         std::string layer = get_layer(tags);
         if (layer.empty())
             return;
-
         FeatureConfig f_cfg = config.get_config(tags);
         int layer_base = get_layer_priority(layer);
         uint8_t zoom_prio = utils::pack_zoom_priority(f_cfg.min_zoom, layer_base + (f_cfg.priority % 10));
-
-        // In Osmium, an area can have multiple outer rings (MultiPolygon)
-        // We separate them into distinct features to simplify processing
         for (const auto& outer_ring : a.outer_rings())
         {
             Feature feat;
@@ -178,41 +154,36 @@ public:
             feat.color_rgb565 = f_cfg.color_rgb565;
             feat.zoom_priority = zoom_prio;
             feat.width_meters = 0;
-            feat.zoom_widths = f_cfg.zoom_widths; // Transfer dynamic widths
-
+            feat.zoom_widths = f_cfg.zoom_widths;
             for (const auto& n : outer_ring)
                 feat.points.push_back(Point{n.lon(), n.lat()});
-            
             if (feat.points.size() < 3)
                 continue;
-            
             feat.ring_ends.push_back(static_cast<uint32_t>(feat.points.size()));
-
             for (const auto& inner_ring : a.inner_rings(outer_ring))
             {
                 size_t pts_before = feat.points.size();
                 for (const auto& n : inner_ring)
                     feat.points.push_back(Point{n.lon(), n.lat()});
-                
                 if (feat.points.size() - pts_before >= 3)
                     feat.ring_ends.push_back(static_cast<uint32_t>(feat.points.size()));
                 else
-                    feat.points.resize(pts_before); // Rollback invalid small ring
+                    feat.points.resize(pts_before);
             }
-
-            features_by_zoom[f_cfg.min_zoom].push_back(std::move(feat));
+            features_by_zoom[f_cfg.min_zoom].push_back(store.append(feat));
         }
     }
 
-    std::vector<Feature> features_by_zoom[18]; ///< Features grouped by minimum visibility zoom level (0-17)
-    std::unordered_set<int64_t> processed_areas; ///< IDs of ways already processed as polygons
-    size_t stats_nodes = 0;     ///< Total nodes visited
-    size_t stats_ways = 0;      ///< Total ways processed
-    size_t stats_areas = 0;     ///< Total areas processed
-    size_t stats_filtered = 0;  ///< Total features filtered out
+    std::vector<size_t> features_by_zoom[18];
+    std::unordered_set<int64_t> processed_areas;
+    size_t stats_nodes = 0;
+    size_t stats_ways = 0;
+    size_t stats_areas = 0;
+    size_t stats_filtered = 0;
 
 private:
     const ConfigManager& config;
+    MappedStore& store;
     int min_zoom_range, max_zoom_range;
 
     std::string get_layer(const std::unordered_map<std::string, std::string>& tags)
@@ -238,15 +209,24 @@ private:
 
     int get_layer_priority(const std::string& layer)
     {
-        if (layer == "landuse") return 10;
-        if (layer == "terrain") return 20;
-        if (layer == "water") return 30;
-        if (layer == "amenities") return 35;
-        if (layer == "railways") return 40;
-        if (layer == "roads") return 50;
-        if (layer == "infrastructure") return 60;
-        if (layer == "buildings") return 70;
-        if (layer == "places") return 90;
+        if (layer == "landuse")
+            return 10;
+        if (layer == "terrain")
+            return 20;
+        if (layer == "water")
+            return 30;
+        if (layer == "amenities")
+            return 35;
+        if (layer == "railways")
+            return 40;
+        if (layer == "roads")
+            return 50;
+        if (layer == "infrastructure")
+            return 60;
+        if (layer == "buildings")
+            return 70;
+        if (layer == "places")
+            return 90;
         return 50;
     }
 

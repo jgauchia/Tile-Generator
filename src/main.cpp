@@ -18,7 +18,6 @@
 #include <osmium/visitor.hpp>
 #include <osmium/index/map/flex_mem.hpp>
 #include <osmium/handler/node_locations_for_ways.hpp>
-#include <osmium/area/assembler.hpp>
 #include <osmium/area/multipolygon_manager.hpp>
 
 #include "nav_types.hpp"
@@ -114,7 +113,10 @@ int main(int argc, char* argv[])
     {
         index_type index;
         location_handler_type location_handler{index};
-        nav::OSMHandler osm_handler{config, min_zoom, max_zoom};
+        
+        // Setup memory-mapped storage for features
+        nav::MappedStore store("nav_features.tmp");
+        nav::OSMHandler osm_handler{config, store, min_zoom, max_zoom};
 
         std::cout << "  Pass 1: Scanning relations..." << std::endl;
         osmium::area::MultipolygonManager<osmium::area::Assembler> mp_manager{osmium::area::Assembler::config_type{}};
@@ -151,7 +153,7 @@ int main(int argc, char* argv[])
         std::cout << "Generating tiles for zooms " << min_zoom << " to " << max_zoom << "..." << std::endl;
         
         nav::TileProcessor processor{output_dir};
-        processor.process_all(osm_handler.features_by_zoom, min_zoom, max_zoom);
+        processor.process_all(osm_handler.features_by_zoom, store, min_zoom, max_zoom);
 
         auto end_all = std::chrono::steady_clock::now();
         std::chrono::duration<double> total_elapsed = end_all - start_time;
