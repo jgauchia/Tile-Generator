@@ -1,6 +1,6 @@
 # NAV Tile Format Specification
 
-This document describes the optimized NAV binary format produced by `tile_generator.py`. The format is specifically designed for ultra-fast vector map rendering on ESP32 embedded systems by using pre-projected, compact relative coordinates and hardware-friendly data alignment.
+This document describes the optimized NAV binary format. The format is specifically designed for ultra-fast vector map rendering on ESP32 embedded systems by using pre-projected, compact relative coordinates and hardware-friendly data alignment.
 
 ---
 
@@ -83,8 +83,8 @@ NAV stores coordinates already projected using the Web Mercator projection. Valu
 
 ## Rendering Rules
 
-### Line Width Damping
-To prevent roads from obscuring the map at high detail levels, the generator applies a **damping factor of 0.7x** to the calculated pixel width for all features at **Zoom 13 and above**.
+### Line Width Logic
+The generator uses a **Manual Width Scaling** approach. Line widths are strictly defined in `features.json` via the `widths` table for each zoom level, ensuring precise visual control on small embedded screens.
 
 ### Delta Reset Logic
 - **Linestrings**: The delta accumulator (lastX, lastY) is reset to (0,0) at the start of each feature.

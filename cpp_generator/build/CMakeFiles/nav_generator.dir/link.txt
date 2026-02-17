@@ -1,1 +1,0 @@
-/usr/bin/c++ CMakeFiles/nav_generator.dir/src/main.cpp.o -o nav_generator  /usr/lib/x86_64-linux-gnu/libgeos_c.so /usr/lib/x86_64-linux-gnu/libz.so /usr/lib/x86_64-linux-gnu/libexpat.so /usr/lib/x86_64-linux-gnu/libbz2.so 

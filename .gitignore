@@ -1,5 +1,5 @@
 .gemini/
-cpp_generator/build/
+build/
 *.pbf
 .gitignore
 rsync_copy.sh
