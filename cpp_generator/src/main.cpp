@@ -86,15 +86,20 @@ int main(int argc, char* argv[])
     std::cout << "Zoom range: " << min_zoom << "-" << max_zoom << std::endl;
     std::cout << "Output format: NAV binary tiles (.nav)" << std::endl;
 
-    // Create output directory (cleaning it first if it exists)
     try
     {
-        if (std::filesystem::exists(output_dir))
+        std::error_code ec;
+        if (std::filesystem::exists(output_dir, ec))
         {
             std::cout << "Cleaning output directory: " << output_dir << "..." << std::endl;
-            std::filesystem::remove_all(output_dir);
+            std::filesystem::remove_all(output_dir, ec);
         }
-        std::filesystem::create_directories(output_dir);
+        std::filesystem::create_directories(output_dir, ec);
+        if (!std::filesystem::exists(output_dir, ec))
+        {
+            std::cerr << "Error: Could not create output directory " << output_dir << std::endl;
+            return 1;
+        }
     }
     catch (const std::exception& e)
     {

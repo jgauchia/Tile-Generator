@@ -362,19 +362,20 @@ private:
             uint16_t count = 0;
             for (const auto& pf : final_features)
             {
-                uint8_t final_width = utils::meters_to_pixels(pf.width, z);
+                uint8_t final_width = 1;
                 if (!pf.zoom_widths.empty())
                 {
-                    uint8_t dynamic_w = 0;
-                    for (auto const& [w_zoom, w_pixels] : pf.zoom_widths) if (z >= w_zoom) dynamic_w = w_pixels;
-                    final_width = std::max(final_width, dynamic_w);
+                    for (auto const& [w_zoom, w_pixels] : pf.zoom_widths)
+                    {
+                        if (z >= w_zoom) final_width = w_pixels;
+                    }
                 }
-                if (z >= 13)
+                else if (pf.width > 0)
                 {
-                    float damped = final_width * 0.7f;
-                    final_width = static_cast<uint8_t>(damped + 0.5f);
+                    final_width = utils::meters_to_pixels(pf.width, z);
                 }
                 if (final_width == 0) final_width = 1;
+                if (final_width > 15) final_width = 15;
                 std::vector<uint8_t> payload; int16_t minx=4096, maxx=0, miny=4096, maxy=0; size_t pts=0;
                 for (const auto& r : pf.rings)
                 {

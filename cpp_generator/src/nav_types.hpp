@@ -13,9 +13,6 @@
 
 namespace nav {
 
-/** @brief Scale factor for coordinate conversion (OSM precision) */
-const uint32_t COORD_SCALE = 10000000;
-
 /** @brief NAV geometry types */
 const uint8_t GEOM_LINESTRING = 2;
 const uint8_t GEOM_POLYGON = 3;
@@ -28,15 +25,6 @@ struct Point
 {
     double lon;
     double lat;
-};
-
-/**
- * @struct Ring
- * @brief A sequence of points forming a geometric ring.
- */
-struct Ring
-{
-    std::vector<Point> points;
 };
 
 /**

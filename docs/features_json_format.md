@@ -50,10 +50,10 @@ Each feature definition object includes:
 ### Width Calculation Rules
 
 The final rendered width in pixels is determined by:
-1. Calculating the pixel equivalent of the physical `width` (if provided).
-2. Selecting the maximum value between that and any value in the `widths` table for the current zoom.
-3. **Automatic Damping**: For Zoom 13 and above, the calculated width is multiplied by **0.7** to prevent roads from overcrowding the map display.
-4. Clamping the result between **1 and 15 pixels**.
+1. If the `widths` table is present, the generator uses the exact value defined for the current zoom level (or the latest defined zoom level below the current one). This provides **total control** over the visual representation.
+2. If `widths` is NOT present but a physical `width` (in meters) is provided, the generator calculates the pixel equivalent based on zoom and latitude.
+3. If neither is present, it defaults to **1 pixel**.
+4. The result is clamped between **1 and 15 pixels**.
 
 ### Static vs. Dynamic Widths
 
