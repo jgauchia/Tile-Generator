@@ -1,12 +1,14 @@
 CONTEXT_SESSION.md
+Claude.md
+complexity_analysis.html
 __pycache__/
 *.png
 *.pbf
 *.geojson
 *.bin
 *.tmp
-.gitignore
 *.gz
+*.log
 ESP32
 tile_generator_gzip.py
 tile_viewer_gzip.py
@@ -19,6 +21,9 @@ migracion.md
 venv/
 CHANGELOG_FGB_MIGRATION.md
 fgb_output/
-rsync_copy.sh
 FGBMAP/
 NAVMAP/
+.aider*
+output_test/
+output_vect/
+cpp_generator/

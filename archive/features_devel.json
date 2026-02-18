@@ -1,7 +1,6 @@
 {
   "_comment": "OSM-style colors in RGB565 format. Priority: layer_base + (priority % 10).",
   "_layers": "landuse:10, terrain:20, water:30, amenities:35, railways:40, roads:50, infrastructure:60, buildings:70, places:90",
-
   "natural=coastline": {
     "zoom": 6,
     "color": "#aad3df",
@@ -57,7 +56,6 @@
     "color": "#aad3df",
     "priority": 16
   },
-
   "natural=beach": {
     "zoom": 12,
     "color": "#fff1ba",
@@ -73,7 +71,6 @@
     "color": "#add19e",
     "priority": 21
   },
-
   "natural=wood": {
     "zoom": 12,
     "color": "#add19e",
@@ -179,7 +176,6 @@
     "color": "#c8facc",
     "priority": 25
   },
-
   "amenity=parking": {
     "zoom": 15,
     "color": "#eeeeee",
@@ -200,7 +196,6 @@
     "color": "#c8facc",
     "priority": 26
   },
-
   "natural=peak": {
     "zoom": 14,
     "color": "#8b4513",
@@ -216,7 +211,6 @@
     "color": "#999999",
     "priority": 31
   },
-
   "railway=rail": {
     "zoom": 8,
     "color": "#888888",
@@ -232,13 +226,11 @@
     "color": "#888888",
     "priority": 41
   },
-
   "tunnel=yes": {
     "zoom": 14,
     "color": "#aaaaaa",
     "priority": 50
   },
-
   "highway=motorway": {
     "zoom": 6,
     "color": "#e990a0",
@@ -339,7 +331,6 @@
     "color": "#fa8072",
     "priority": 68
   },
-
   "bridge=yes": {
     "zoom": 12,
     "color": "#b8b8b8",
@@ -350,7 +341,6 @@
     "color": "#b8b8b8",
     "priority": 70
   },
-
   "aeroway=runway": {
     "zoom": 12,
     "color": "#bbbbcc",
@@ -363,10 +353,14 @@
   },
   "aeroway=apron": {
     "zoom": 14,
-    "color": "#dadae0",
+    "color": "#eeeeee",
     "priority": 74
   },
-
+  "aeroway=hangar": {
+    "zoom": 15,
+    "color": "#d9d0c9",
+    "priority": 85
+  },
   "building": {
     "zoom": 15,
     "color": "#d9d0c9",
@@ -397,7 +391,6 @@
     "color": "#88e0be",
     "priority": 79
   },
-
   "amenity=hospital": {
     "zoom": 14,
     "color": "#f0c0c0",
@@ -413,7 +406,6 @@
     "color": "#f0f0d8",
     "priority": 80
   },
-
   "place=state": {
     "zoom": 6,
     "color": "#000000",
