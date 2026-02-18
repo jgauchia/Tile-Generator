@@ -1,0 +1,109 @@
+● Problème                                                                                                                                                                                                                                                                                 
+                                                                                                                                                                                                                                                                                           
+  La Garonne n'apparaît PAS dans le viewer de tuiles NAV. On voit seulement de petits fragments de polygones water (5 points chacun) qui ne représentent pas la rivière.                                                                                                                   
+                 
+  Données OSM                                                                                                                                                                                                                                                                              
+                                                                                                                                                                                                                                                                                           
+  - La Garonne est mappée dans OSM comme relation multipolygon 18448299
+  - Tags : natural=water, type=multipolygon, water=river
+  - 24 ways membres (inner/outer)
+  - Lien : https://www.openstreetmap.org/api/0.6/relation/18448299
+
+  Ce qu'on a découvert
+
+  Au zoom 15 (tuile 16511/11962 - Toulouse) :
+  - 38 polygones water dans la tuile
+  - Le plus gros : 87 points (X=-409 to 1902, Y=2572 to 4017)
+  - Beaucoup de petits fragments de 5 points
+  - Logs extraction : polygone de 197 points entré au clipping, réduit à 87 points en sortie
+  - Ces polygones ne sont PAS la Garonne
+
+  Au zoom 12 :
+  - Le plus gros polygone water extrait : 1040 points
+  - Pas de polygone beaucoup plus gros qui indiquerait l'assemblage des 24 ways de la relation 18448299
+  - La relation couvre plusieurs centaines de km donc s'étend sur de nombreuses tuiles
+
+  Code du générateur
+
+  - Méthode area() ligne 897 traite les multipolygons via self.wkbfab.create_multipolygon(a) ligne 935
+  - Si MultiPolygon, éclate en polygones séparés (ligne 965-966)
+  - apply_file() ligne 1570 avec locations=True, idx='flex_mem'
+
+  Question non résolue
+
+  La relation multipolygon 18448299 (Garonne) n'est pas extraite par le générateur. Les logs d'extraction ne montrent aucun polygone qui correspondrait à cette relation assemblée.
+
+  À investiguer
+
+  Vérifier si le générateur active correctement le traitement des relations multipolygon dans osmium.
+  
+  
+  
+  TOPO - Problème du rendu de la Garonne                                                                                                                                                                                                                                                   
+                                                                                                                                                                                                                                                                                           
+  1. STRUCTURE OSM                                                                                                                                                                                                                                                                         
+                                                                                                                                                                                                                                                                                           
+  Relation 18448299 (multipolygon Garonne):                                                                                                                                                                                                                                                
+  - Type: multipolygon, natural=water, water=river                                                                                                                                                                                                                                         
+  - 24 members:                                                                                                                                                                                                                                                                            
+    - 1 member "outer": way 208270938 (surface de la rivière)
+    - 23 members "inner": îles dans la rivière
+  - Way 208270938: 1574 nodes couvrant lat 43.545-43.751, lon 1.310-1.442
+
+  Relation 70423 (linestring Garonne):
+  - Type: waterway, waterway=river
+  - 252 members (ligne centrale du fleuve)
+  - Couvre toute la Garonne source → mer
+
+  2. EXTRACTION PAR LE GÉNÉRATEUR
+
+  Tuile 16511/11962 (zoom 15):
+  - Way 208270938 (1574 nodes) → 197 points extraits
+  - Après clipping: → 87 points
+  - Coordonnées dans .nav: X: -409 à 1902, Y: 2572 à 4017
+  - Soit 2311x1445 unités (56% largeur × 35% hauteur de tuile)
+
+  Logs de génération:
+  [EXTRACT] Water polygon: pts=197
+  [CLIP_IN z15] Water 16511/11962: pts=197, lon=1.38923 to 1.40037, lat=43.61554 to 43.62313
+  [CLIP_OUT z15] Water 16511/11962: 197 pts -> 1 parts, types=['Polygon']
+  [NO_SIMP] Water polygon: 87 points NOT simplified
+  [PROJ z15] Water 16511/11962: pts=87, px_range=2311, py_range=1445
+
+  3. CONTENU DU FICHIER .NAV
+
+  Fichier 16511/11962.nav:
+  - 2014 features total
+  - 38 polygones d'eau
+  - Feature [940]: 87 points, rgb565=0xae9b (couleur eau)
+    - X: -409 à 1902 (span=2311)
+    - Y: 2572 à 4017 (span=1445)
+
+  4. RENDU PAR LE VIEWER
+
+  Le polygone de 87 points EST chargé:
+  DEBUG POLYGON water: tile=16511/11962, rgb565=0xae9b, pts_first_ring=87, min_zoom=8, priority=3
+  RAW coords: first=(-377, 3938), second=(-311, 3959), last=(-377, 3938)
+  -> SCREEN coords: (187, 400) to (191, 402)
+
+  PROBLÈME: Le polygone qui fait 2311×1445 unités (56% × 35% de tuile) est rendu en 4×2 pixels seulement!
+
+  5. ÉTAT ACTUEL
+
+  ✅ Multipolygon Garonne extrait correctement du PBF
+  ✅ Clipping et simplification fonctionnent
+  ✅ Données correctes dans le fichier .nav
+  ✅ Viewer charge et rend le polygone
+  ❌ Rendu microscopique (4×2 px) au lieu de couvrir une grande partie de l'écran
+
+  6. QUESTION NON RÉSOLUE
+
+  Pourquoi un polygone de 2311×1445 unités tile-coord est-il rendu en 4×2 pixels?
+
+  Hypothèses possibles:
+  - Problème de transformation _tile_coord_to_screen
+  - Viewport mal positionné
+  - Zoom viewer différent du zoom des tuiles
+  - Bug dans le calcul des coordonnées écran
+
+  À vérifier: Position exacte du viewport et zoom du viewer au moment du rendu.

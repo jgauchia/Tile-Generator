@@ -1,0 +1,173 @@
+  "railway=rail": {
+    "zoom": 10,
+    "color": "#888888",
+    "priority": 46
+  },
+  "railway=subway": {
+    "zoom": 12,
+    "color": "#999999",
+    "priority": 47
+  },
+  "railway=tram": {
+    "zoom": 12,
+    "color": "#888888",
+    "priority": 47
+  },
+  "railway=abandoned": {
+    "zoom": 12,
+    "color": "#777777",
+    "priority": 48
+  },
+  "railway=disused": {
+    "zoom": 12,
+    "color": "#888888",
+    "priority": 48
+  },
+  "railway=funicular": {
+    "zoom": 11,
+    "color": "#888888",
+    "priority": 48
+  },
+  "railway=narrow_gauge": {
+    "zoom": 11,
+    "color": "#888888",
+    "priority": 48
+  },
+  "railway=platform": {
+    "zoom": 12,
+    "color": "#bbbbbb",
+    "priority": 48
+  },
+
+  "highway=motorway": {
+    "zoom": 6,
+    "color": "#e990a0",
+    "priority": 50
+  },
+  "highway=trunk": {
+    "zoom": 6,
+    "color": "#f9b29c",
+    "priority": 51
+  },
+  "highway=primary": {
+    "zoom": 7,
+    "color": "#fcd6a4",
+    "priority": 52
+  },
+  "highway=secondary": {
+    "zoom": 9,
+    "color": "#f7fabf",
+    "priority": 53
+  },
+  "highway=tertiary": {
+    "zoom": 12,
+    "color": "#ffffff",
+    "priority": 54
+  },
+  "highway=construction": {
+    "zoom": 13,
+    "color": "#aaaaaa",
+    "priority": 55
+  },
+  "highway=living_street": {
+    "zoom": 13,
+    "color": "#ededed",
+    "priority": 55
+  },
+  "highway=motorway_link": {
+    "zoom": 10,
+    "color": "#e990a0",
+    "priority": 55
+  },
+  "highway=platform": {
+    "zoom": 13,
+    "color": "#bbbbbb",
+    "priority": 55
+  },
+  "highway=primary_link": {
+    "zoom": 11,
+    "color": "#fcd6a4",
+    "priority": 55
+  },
+  "highway=residential": {
+    "zoom": 12,
+    "color": "#ffffff",
+    "priority": 55
+  },
+  "highway=secondary_link": {
+    "zoom": 12,
+    "color": "#f7f496",
+    "priority": 55
+  },
+  "highway=tertiary_link": {
+    "zoom": 12,
+    "color": "#ffffff",
+    "priority": 55
+  },
+  "highway=trunk_link": {
+    "zoom": 10,
+    "color": "#f9b29c",
+    "priority": 55
+  },
+  "highway=unclassified": {
+    "zoom": 12,
+    "color": "#ffffff",
+    "priority": 55
+  },
+  "highway=service": {
+    "zoom": 15,
+    "color": "#ffffff",
+    "priority": 56
+  },
+  "highway=track": {
+    "zoom": 14,
+    "color": "#996600",
+    "priority": 57
+  },
+
+# ============================================================================
+# TRADUCTION DES TERMES OSM - ROUTES ET VOIES FERRÉES
+# ============================================================================
+
+## RAILWAY (Voies ferrées) :
+
+| Tag OSM                  | Traduction FR                              | Zoom | Priority | Couleur              |
+|--------------------------|--------------------------------------------|------|----------|----------------------|
+| railway=rail             | Voie ferrée principale                     | z10  | 46       | Gris moyen (#888888) |
+| railway=subway           | Métro                                      | z12  | 47       | Gris clair (#999999) |
+| railway=tram             | Tramway                                    | z12  | 47       | Gris moyen (#888888) |
+| railway=abandoned        | Voie ferrée abandonnée                     | z12  | 48       | Gris foncé (#777777) |
+| railway=disused          | Voie ferrée désaffectée                    | z12  | 48       | Gris moyen (#888888) |
+| railway=funicular        | Funiculaire                                | z11  | 48       | Gris moyen (#888888) |
+| railway=narrow_gauge     | Voie étroite                               | z11  | 48       | Gris moyen (#888888) |
+| railway=platform         | Quai de gare                               | z12  | 48       | Gris très clair (#bbbbbb) |
+
+## HIGHWAY (Routes) :
+
+| Tag OSM              | Traduction FR                          | Zoom | Priority | Couleur                   |
+|----------------------|----------------------------------------|------|----------|---------------------------|
+| highway=motorway     | Autoroute                              | z6   | 50       | Rose (#e990a0)            |
+| highway=trunk        | Voie express/Rocade                    | z6   | 51       | Orange clair (#f9b29c)    |
+| highway=primary      | Route nationale                        | z7   | 52       | Jaune clair (#fcd6a4)     |
+| highway=secondary    | Route départementale                   | z9   | 53       | Jaune pâle (#f7fabf)      |
+| highway=tertiary     | Route secondaire                       | z12  | 54       | Blanc (#ffffff)           |
+| highway=construction | Route en construction                  | z13  | 55       | Gris (#aaaaaa)            |
+| highway=living_street| Zone résidentielle                     | z13  | 55       | Gris très clair (#ededed) |
+| highway=motorway_link| Bretelle autoroute                     | z10  | 55       | Rose (#e990a0)            |
+| highway=platform     | Quai de bus                            | z13  | 55       | Gris très clair (#bbbbbb) |
+| highway=primary_link | Bretelle nationale                     | z11  | 55       | Jaune clair (#fcd6a4)     |
+| highway=residential  | Rue résidentielle                      | z12  | 55       | Blanc (#ffffff)           |
+| highway=secondary_link| Bretelle départementale               | z12  | 55       | Jaune/vert (#f7f496)      |
+| highway=tertiary_link| Bretelle secondaire                    | z12  | 55       | Blanc (#ffffff)           |
+| highway=trunk_link   | Bretelle voie express                  | z10  | 55       | Orange clair (#f9b29c)    |
+| highway=unclassified | Route non classée                      | z12  | 55       | Blanc (#ffffff)           |
+| highway=service      | Voie de service                        | z15  | 56       | Blanc (#ffffff)           |
+| highway=track        | Chemin agricole                        | z14  | 57       | Marron (#996600)          |
+
+## NOTES :
+
+- Priority : ordre de rendu (46-57). Plus élevé = dessiné par-dessus.
+- Zoom : niveau de zoom minimal où la route apparaît.
+- Problème actuel : toutes les routes ont priority 50-57 → mauvais Z-order.
+  Les autoroutes devraient avoir priority PLUS HAUTE que les rues.
+

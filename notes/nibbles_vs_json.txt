@@ -1,0 +1,134 @@
+Comparaison des deux systèmes
+
+  AVANT nibbles (commit a8fc3da)
+
+  Système de priorité :
+  LAYER_PRIORITY = {
+      'landuse': 10, 'terrain': 20, 'water': 30, 'islands': 35,
+      'amenities': 40, 'railways': 45, 'roads': 55,
+      'infrastructure': 65, 'buildings': 75, 'leisure': 80,
+      'boundaries': 85, 'places': 90
+  }
+
+  # Formule :
+  priority = cfg.get('priority', 85)  # Du JSON
+  layer_base_priority = LAYER_PRIORITY.get(layer, 50)
+
+  # Cas général :
+  combined_priority = layer_base_priority + (priority % 10)
+
+  # Cas spécial water centerlines :
+  if layer == 'water' and not is_area:
+      combined_priority = layer_base_priority + (priority % 5)
+
+  # Pack avec clamp :
+  pack_zoom_priority(min_zoom, min(combined_priority, 15))
+
+  Caractéristiques :
+  - Utilise le JSON pour les priorities (0-99)
+  - LAYER_PRIORITY fournit la base (0-90)
+  - Le modulo % 10 (ou % 5) ajoute de la variabilité intra-couche
+  - Clamp final à 15 → peut dépasser et se faire tronquer
+
+  Exemples :
+  - waterway=river (JSON priority=43, layer=water base=30) → 30 + (43 % 5) = 33 → clamp à 15
+  - highway=motorway (JSON priority=50, layer=roads base=55) → 55 + (50 % 10) = 55 → clamp à 15
+  - Problème : tous les layer_base >= 15 donnent priority=15 après clamp
+
+  APRÈS nibbles (commit actuel)
+
+  Système de priorité :
+  # Polygons :
+  layer_to_nibble = {
+      'landuse': 2, 'terrain': 2,
+      'water': 3,
+      'leisure': 4, 'amenities': 4,
+      'buildings': 5
+  }
+
+  # Lines :
+  priority_map = {
+      'motorway': 13, 'trunk': 13, 'primary': 13,
+      'secondary': 12, 'tertiary': 12,
+      'residential': 11, 'unclassified': 11,
+      'motorway_link': 9, 'trunk_link': 9,
+      'service': 8, 'track': 8
+  }
+
+  # Water lines :
+  if layer == 'water': nibble = 5
+
+  # Cas spéciaux :
+  if tags.get('bridge'): nibble = 15
+  if tags.get('tunnel'): nibble = 1
+
+  Caractéristiques :
+  - Ignore complètement le JSON
+  - Nibbles fixes hardcodés (0-15)
+  - Pas de calcul, pas de modulo, pas de clamp
+  - Bridge/tunnel gérés explicitement
+
+  Exemples :
+  - waterway=river (line) → nibble=5
+  - highway=motorway → nibble=13
+  - natural=water (polygon) → nibble=3
+
+  Différences majeures
+  ┌───────────────────┬───────────────────────┬─────────────────────┐
+  │      Aspect       │     AVANT nibbles     │    APRÈS nibbles    │
+  ├───────────────────┼───────────────────────┼─────────────────────┤
+  │ Source priority   │ JSON + LAYER_PRIORITY │ Hardcodé dans code  │
+  ├───────────────────┼───────────────────────┼─────────────────────┤
+  │ Calcul            │ Formule avec modulo   │ Lookup direct       │
+  ├───────────────────┼───────────────────────┼─────────────────────┤
+  │ Flexibilité       │ Configurable JSON     │ Nécessite edit code │
+  ├───────────────────┼───────────────────────┼─────────────────────┤
+  │ Bugs              │ Overflow → clamp à 15 │ Pas de calcul       │
+  ├───────────────────┼───────────────────────┼─────────────────────┤
+  │ Lisibilité        │ Formule complexe      │ Table explicite     │
+  ├───────────────────┼───────────────────────┼─────────────────────┤
+  │ Water centerlines │ base + (p % 5)        │ Hardcodé nibble=5   │
+  ├───────────────────┼───────────────────────┼─────────────────────┤
+  │ Bridge/tunnel     │ Pas géré              │ Hardcodé 15/1       │
+  └───────────────────┴───────────────────────┴─────────────────────┘
+  Incohérences actuelles
+
+  APRÈS nibbles :
+  - Ligne 756 (polygons water) → nibble=3 ✓ (corrigé)
+  - Ligne 804 (lines water) → nibble=5 ✓
+  - Pas d'autre incohérence détectée
+
+  AVANT nibbles :
+  - Tous les layers avec LAYER_PRIORITY >= 15 étaient clampés à 15 (roads=55, infrastructure=65, buildings=75, etc.)
+  - Pas de gestion explicite bridge/tunnel
+
+  Constat factuel
+
+  APRÈS nibbles est plus simple et évite les bugs de calcul, mais moins flexible. AVANT nibbles permettait d'ajuster via JSON mais avait un bug de clamp (tout >= 15 écrasé à 15).
+
+✻ Cogitated for 4m 12s
+
+❯ alors nibblesq ou pas nibbles*? 
+
+● Nibbles.
+
+  Le système AVANT a un bug critique : tous les layers avec LAYER_PRIORITY >= 15 sont clampés à 15 après le calcul.
+
+  Exemples AVANT nibbles :
+  - roads (base=55) + priority → clamped à 15
+  - buildings (base=75) + priority → clamped à 15
+  - boundaries (base=85) + priority → clamped à 15
+
+  Résultat : toutes les routes, tous les bâtiments, toutes les frontières ont la même priority=15. Pas de Z-order entre eux.
+
+  Le système APRÈS nibbles :
+  - Nibbles explicites 0-15 sans calcul
+  - Pas de clamp foireux
+  - Bridge=15, tunnel=1 gérés
+  - Plus simple et lisible
+
+  Le bug du clamp rendait le système AVANT non fonctionnel pour le Z-order.
+
+❯ donc nibbles est + solide? 
+
+● Oui. Le système AVANT nibbles avait un bug de clamp qui cassait le Z-order pour la majorité des features (roads, buildings, boundaries tous écrasés à 15). Le système APRÈS nibbles fonctionne correctement avec des priorités explicites 0-15 sans calcul foireux.
