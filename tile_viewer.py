@@ -20,6 +20,7 @@ from typing import Dict, List, Tuple, Optional, Set
 
 try:
     import pygame
+    from pygame import gfxdraw
     PYGAME_AVAILABLE = True
 except ImportError:
     PYGAME_AVAILABLE = False
@@ -31,7 +32,7 @@ logger = logging.getLogger(__name__)
 # UI Constants
 TILE_SIZE = 256
 VIEWPORT_SIZE = 768
-TOOLBAR_WIDTH = 200
+TOOLBAR_WIDTH = 350  # Increased for better stats/legend visibility
 STATUSBAR_HEIGHT = 60
 WINDOW_WIDTH = VIEWPORT_SIZE + TOOLBAR_WIDTH
 WINDOW_HEIGHT = VIEWPORT_SIZE + STATUSBAR_HEIGHT
@@ -41,6 +42,7 @@ NAV_MAGIC = b'NAV1'
 GEOM_POINT = 1
 GEOM_LINESTRING = 2
 GEOM_POLYGON = 3
+GEOM_TEXT = 4
 
 
 def deg2num(lat_deg: float, lon_deg: float, zoom: int) -> Tuple[float, float]:
@@ -81,11 +83,14 @@ class NavFeature:
         self.color_rgb565 = 0xFFFF
         self.zoom_priority = 0
         self.width = 1
+        self.needs_casing = False  # Bit 7 of width byte - for two-pass rendering
         self.bbox = (0, 0, 0, 0)
         self.coords: List[Tuple[int, int]] = []  # All points for all rings
         self.ring_ends: List[int] = []  # Indices where each ring ends
         self.tile_x = 0
         self.tile_y = 0
+        self.text: str = ''  # For GEOM_TEXT features
+        self.font_size: int = 0  # 0=small, 1=medium, 2=large
 
     @property
     def min_zoom(self) -> int:
@@ -127,19 +132,34 @@ def read_nav_tile(path: str, tile_x: int, tile_y: int) -> List[NavFeature]:
                 feature.geom_type = struct.unpack('<B', f.read(1))[0]
                 feature.color_rgb565 = struct.unpack('<H', f.read(2))[0]
                 feature.zoom_priority = struct.unpack('<B', f.read(1))[0]
-                feature.width = struct.unpack('<B', f.read(1))[0]
+
+                # Width byte encoding: bit 7 = casing flag, bits 0-6 = actual width
+                width_byte = struct.unpack('<B', f.read(1))[0]
+                feature.needs_casing = (width_byte & 0x80) != 0
+                feature.width = width_byte & 0x7F
+
                 feature.bbox = struct.unpack('<BBBB', f.read(4))
                 coord_count = struct.unpack('<H', f.read(2))[0]
                 f.read(1)
 
-                for _ in range(coord_count):
-                    px, py = struct.unpack('<hh', f.read(4))
-                    feature.coords.append((px, py))
+                if feature.geom_type == GEOM_TEXT:
+                    # Read raw data block (coord_count * 4 bytes)
+                    data = f.read(coord_count * 4)
+                    if len(data) >= 5:
+                        px, py = struct.unpack('<hh', data[0:4])
+                        feature.coords.append((px, py))
+                        text_len = data[4]
+                        feature.text = data[5:5 + text_len].decode('utf-8', errors='replace')
+                        feature.font_size = feature.width
+                else:
+                    for _ in range(coord_count):
+                        px, py = struct.unpack('<hh', f.read(4))
+                        feature.coords.append((px, py))
 
-                if feature.geom_type == GEOM_POLYGON:
-                    ring_count = struct.unpack('<B', f.read(1))[0]
-                    for _ in range(ring_count):
-                        feature.ring_ends.append(struct.unpack('<H', f.read(2))[0])
+                    if feature.geom_type == GEOM_POLYGON:
+                        ring_count = struct.unpack('<H', f.read(2))[0]
+                        for _ in range(ring_count):
+                            feature.ring_ends.append(struct.unpack('<H', f.read(2))[0])
 
                 features.append(feature)
     except Exception as e:
@@ -149,7 +169,7 @@ def read_nav_tile(path: str, tile_x: int, tile_y: int) -> List[NavFeature]:
 
 class NAVViewer:
     """Main viewer application logic."""
-    def __init__(self, nav_dir: str):
+    def __init__(self, nav_dir: str, config_file: Optional[str] = None):
         self.nav_dir = nav_dir
         self.available_zooms: Set[int] = set()
         self._index_tiles()
@@ -160,12 +180,21 @@ class NAVViewer:
         self.background_color = (255, 255, 255)
         self.fill_polygons = True
         self.show_tile_grid = False
-        
+
         self.last_query_stats = {}
         self.cached_features: Optional[List[NavFeature]] = None
         self.selected_feature = None
         self.last_viewport_key = None
         self.cached_query_features: List[NavFeature] = []
+
+        # New: Priority filter
+        self.priority_filter_min = 0
+        self.priority_filter_max = 15
+
+        # New: Color to OSM tag mapping
+        self.color_to_tags: Dict[str, List[str]] = {}
+        if config_file:
+            self._load_config(config_file)
 
     def _index_tiles(self):
         """Build an index of available zoom levels on disk."""
@@ -174,6 +203,33 @@ class NAVViewer:
         for name in os.listdir(self.nav_dir):
             if name.isdigit() and os.path.isdir(os.path.join(self.nav_dir, name)):
                 self.available_zooms.add(int(name))
+
+    def _load_config(self, config_file: str):
+        """Load features.json and build color to tag mapping."""
+        try:
+            import json
+            with open(config_file, 'r') as f:
+                config = json.load(f)
+
+            # Build reverse mapping: RGB565 hex → OSM tags
+            for tag, props in config.items():
+                if isinstance(props, dict) and 'color' in props:
+                    hex_color = props['color']
+                    # Convert to RGB565 hex
+                    r = int(hex_color[1:3], 16)
+                    g = int(hex_color[3:5], 16)
+                    b = int(hex_color[5:7], 16)
+                    rgb565 = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3)
+                    rgb888 = rgb565_to_rgb888(rgb565)
+                    color_key = f"#{rgb888[0]:02x}{rgb888[1]:02x}{rgb888[2]:02x}"
+
+                    if color_key not in self.color_to_tags:
+                        self.color_to_tags[color_key] = []
+                    self.color_to_tags[color_key].append(tag)
+
+            logger.info(f"Loaded {len(self.color_to_tags)} unique colors from config")
+        except Exception as e:
+            logger.warning(f"Could not load config file: {e}")
 
     def _get_tiles_for_viewport(self) -> List[Tuple[int, int]]:
         """Identify which tiles are needed to cover the 768x768 viewport."""
@@ -249,31 +305,45 @@ class NAVViewer:
 
         self.cached_features = features # Update for identify_feature_at
 
-        # Group features by tile for clipped rendering
-        features_by_tile = {}
-        for f in features:
-            tile_key = (f.tile_x, f.tile_y)
-            if tile_key not in features_by_tile:
-                features_by_tile[tile_key] = []
-            features_by_tile[tile_key].append(f)
+        # New: Apply priority filter
+        features = [f for f in features if self.priority_filter_min <= f.priority <= self.priority_filter_max]
 
-        center_x, center_y = deg2num(self.center_lat, self.center_lon, self.zoom)
-        tl_x, tl_y = center_x - 1.5, center_y - 1.5
+        # CRITICAL FIX: Sort ALL features globally by priority before rendering
+        # This ensures proper Z-order (landuse/forests below, roads above)
+        features.sort(key=lambda f: f.priority)
 
-        # Render each tile with its own clipping rect
-        for (tx, ty), tile_features in features_by_tile.items():
-            # Calculate tile viewport position
-            sx = int((tx - tl_x) * TILE_SIZE)
-            sy = int((ty - tl_y) * TILE_SIZE)
-            
-            # Set clip to this tile's 256x256 area
-            surface.set_clip(pygame.Rect(sx, sy, TILE_SIZE, TILE_SIZE))
-            
-            tile_features.sort(key=lambda f: f.priority)
-            for feature in tile_features:
+        # FOUR-PASS RENDERING for bridges over roads
+        # Bridge features (nibble 15 + casing) must be drawn AFTER all at-grade road cores,
+        # otherwise the at-grade road cores cover the bridge casings.
+        BRIDGE_NIBBLE = 15
+
+        # Pass 1: At-grade road casings (priority < BRIDGE_NIBBLE)
+        for feature in features:
+            if feature.geom_type == GEOM_LINESTRING and feature.needs_casing and feature.priority < BRIDGE_NIBBLE:
+                self._render_road_casing(surface, feature)
+
+        # Pass 2: All non-text, non-bridge features (polygons + at-grade road cores + railways without casing)
+        for feature in features:
+            if feature.geom_type == GEOM_TEXT:
+                continue
+            if feature.geom_type == GEOM_LINESTRING and feature.needs_casing and feature.priority == BRIDGE_NIBBLE:
+                continue  # Skip bridges, rendered in pass 3-4
+            self._render_feature(surface, feature)
+
+        # Pass 3: Bridge casings (priority == BRIDGE_NIBBLE with casing flag)
+        for feature in features:
+            if feature.geom_type == GEOM_LINESTRING and feature.needs_casing and feature.priority == BRIDGE_NIBBLE:
+                self._render_road_casing(surface, feature)
+
+        # Pass 4: Bridge cores (priority == BRIDGE_NIBBLE with casing flag)
+        for feature in features:
+            if feature.geom_type == GEOM_LINESTRING and feature.needs_casing and feature.priority == BRIDGE_NIBBLE:
                 self._render_feature(surface, feature)
-            
-            surface.set_clip(None)
+
+        # Pass 5: Text labels on top of everything
+        for feature in features:
+            if feature.geom_type == GEOM_TEXT:
+                self._render_feature(surface, feature)
 
         if self.show_tile_grid:
             self._draw_tile_grid(surface)
@@ -289,11 +359,84 @@ class NAVViewer:
         
         return int(fx * TILE_SIZE), int(fy * TILE_SIZE)
 
+    def _draw_smooth_line(self, surface: pygame.Surface, color: Tuple[int, int, int],
+                          points: List[Tuple[int, int]], width: int):
+        """Draw line using oriented rectangles for square ends, no AA, no joints."""
+        if len(points) < 2:
+            return
+
+        # Very thin lines: use simple line
+        if width <= 1:
+            pygame.draw.lines(surface, color, False, points, 1)
+            return
+
+        half_w = width / 2.0
+
+        # Draw each segment as an oriented rectangle
+        for i in range(len(points) - 1):
+            p1 = points[i]
+            p2 = points[i + 1]
+
+            dx = p2[0] - p1[0]
+            dy = p2[1] - p1[1]
+            dist = math.hypot(dx, dy)
+
+            if dist == 0:
+                continue
+
+            # Perpendicular unit vector
+            nx = -dy / dist
+            ny = dx / dist
+
+            # Rectangle corners
+            poly_pts = [
+                (p1[0] + nx * half_w, p1[1] + ny * half_w),
+                (p1[0] - nx * half_w, p1[1] - ny * half_w),
+                (p2[0] - nx * half_w, p2[1] - ny * half_w),
+                (p2[0] + nx * half_w, p2[1] + ny * half_w)
+            ]
+
+            # Draw filled polygon only (no AA, no joints)
+            pygame.gfxdraw.filled_polygon(surface, poly_pts, color)
+
+    def _render_road_casing(self, surface: pygame.Surface, feature: NavFeature):
+        """Render road casing (border) for two-pass rendering - Pass 1 only."""
+        if not feature.coords or len(feature.coords) < 2:
+            return
+
+        # Convert coordinates to screen space
+        pts = [self._tile_coord_to_screen(feature.tile_x, feature.tile_y, x, y)
+               for x, y in feature.coords]
+
+        # Get road color and darken it for the casing
+        road_color = rgb565_to_rgb888(feature.color_rgb565)
+        casing_color = darken_color(road_color, amount=0.3)  # 30% darker than road color
+
+        # Draw casing: wider than the road core with smooth joins
+        casing_width = feature.width + 2
+        self._draw_smooth_line(surface, casing_color, pts, casing_width)
+
     def _render_feature(self, surface: pygame.Surface, feature: NavFeature):
         if not feature.coords: return
         color = rgb565_to_rgb888(feature.color_rgb565)
 
-        if feature.geom_type == GEOM_POINT:
+        if feature.geom_type == GEOM_TEXT:
+            px, py = feature.coords[0]
+            sx, sy = self._tile_coord_to_screen(feature.tile_x, feature.tile_y, px, py)
+            if 0 <= sx < VIEWPORT_SIZE and 0 <= sy < VIEWPORT_SIZE and feature.text:
+                font_sizes = {0: 15, 1: 17, 2: 20}
+                size = font_sizes.get(feature.font_size, 15)
+                text_font = pygame.font.SysFont(None, size)
+                lines = feature.text.split('\n')
+                line_height = text_font.get_linesize()
+                total_height = line_height * len(lines)
+                y_start = sy - total_height // 2
+                for i, line in enumerate(lines):
+                    rendered = text_font.render(line, True, color)
+                    surface.blit(rendered, (sx - rendered.get_width() // 2, y_start + i * line_height))
+            return
+
+        elif feature.geom_type == GEOM_POINT:
             px, py = feature.coords[0]
             sx, sy = self._tile_coord_to_screen(feature.tile_x, feature.tile_y, px, py)
             if 0 <= sx < VIEWPORT_SIZE and 0 <= sy < VIEWPORT_SIZE:
@@ -302,23 +445,83 @@ class NAVViewer:
         elif feature.geom_type == GEOM_LINESTRING:
             pts = [self._tile_coord_to_screen(feature.tile_x, feature.tile_y, x, y) for x, y in feature.coords]
             if len(pts) >= 2:
-                pygame.draw.lines(surface, color, False, pts, max(1, feature.width))
+                # DEBUG: Log roads with priority >= 11 being drawn
+                if feature.priority >= 11:
+                    # Check if any point is in viewport
+                    in_viewport = any(0 <= x < VIEWPORT_SIZE and 0 <= y < VIEWPORT_SIZE for x, y in pts)
+                    print(f"[DRAW LINE] tile={feature.tile_x}/{feature.tile_y}, priority={feature.priority}, "
+                          f"screen_pts={len(pts)}, in_viewport={in_viewport}, first_pt={pts[0]}, width={feature.width}")
+                # Draw road core with smooth joins (casing already drawn in pass 1 for roads with needs_casing flag)
+                self._draw_smooth_line(surface, color, pts, max(1, feature.width))
 
         elif feature.geom_type == GEOM_POLYGON:
             rings = feature.get_rings()
-            if not rings: return
-            
-            # First ring is exterior, others are holes
+            if not rings:
+                print(f"[POLYGON EMPTY] No rings for priority={feature.priority}, color=#{color[0]:02x}{color[1]:02x}{color[2]:02x}")
+                return
+
+            # DEBUG: Print info for green-ish polygons (grassland #cdebb0 = RGB 205,235,176)
+            if 195 <= color[0] <= 210 and 225 <= color[1] <= 240 and 170 <= color[2] <= 185:
+                first_ring = rings[0] if rings else []
+                print(f"[DEBUG GRASSLAND] tile={feature.tile_x}/{feature.tile_y}, color={color}, "
+                      f"rgb565=0x{feature.color_rgb565:04x}, rings={len(rings)}, "
+                      f"pts_first_ring={len(first_ring)}, "
+                      f"min_zoom={feature.min_zoom}, priority={feature.priority}")
+                if first_ring and len(first_ring) >= 3:
+                    # Convert to screen coords to check visibility
+                    screen_pts = [self._tile_coord_to_screen(feature.tile_x, feature.tile_y, x, y) for x, y in first_ring]
+                    xs = [p[0] for p in screen_pts]
+                    ys = [p[1] for p in screen_pts]
+                    print(f"  SCREEN: X=[{min(xs)}, {max(xs)}], Y=[{min(ys)}, {max(ys)}], "
+                          f"viewport=[0, {VIEWPORT_SIZE}]")
+
+            # DEBUG: Print info for blue-ish polygons (water)
+            if 150 <= color[2] <= 235 and 160 <= color[1] <= 220 and 150 <= color[0] <= 180:
+                first_ring = rings[0] if rings else []
+                print(f"DEBUG POLYGON water: tile={feature.tile_x}/{feature.tile_y}, color={color}, "
+                      f"rgb565=0x{feature.color_rgb565:04x}, rings={len(rings)}, "
+                      f"pts_first_ring={len(first_ring)}, "
+                      f"min_zoom={feature.min_zoom}, priority={feature.priority}")
+                if first_ring and len(first_ring) >= 3:
+                    print(f"  RAW coords: first={first_ring[0]}, second={first_ring[1]}, last={first_ring[-1]}")
+
+            # Only draw exterior ring (first ring)
+            # Inner rings (holes) are NOT drawn - they stay transparent
+            # This allows features below to show through (e.g., islands in rivers)
             for i, ring in enumerate(rings):
+                if i > 0 and self.fill_polygons:
+                    continue  # Skip holes when filling (keep transparent)
+
                 pts = [self._tile_coord_to_screen(feature.tile_x, feature.tile_y, x, y) for x, y in ring]
+
+                # DEBUG grassland rendering
+                if 195 <= color[0] <= 210 and 225 <= color[1] <= 240 and 170 <= color[2] <= 185:
+                    xs = [p[0] for p in pts] if pts else []
+                    ys = [p[1] for p in pts] if pts else []
+                    print(f"  [RENDER ATTEMPT] ring {i}, raw_pts={len(ring)}, screen_pts={len(pts)}, tile={feature.tile_x}/{feature.tile_y}")
+                    if len(pts) >= 3:
+                        print(f"    COORDS: X=[{min(xs)}, {max(xs)}], Y=[{min(ys)}, {max(ys)}], viewport=[0, {VIEWPORT_SIZE}]")
+                    else:
+                        print(f"    SKIPPED: not enough screen points!")
+
                 if len(pts) >= 3:
+                    # DEBUG grassland drawing
+                    if 195 <= color[0] <= 210 and 225 <= color[1] <= 240 and 170 <= color[2] <= 185:
+                        mode = "FILLED" if self.fill_polygons else "OUTLINE"
+                        print(f"    DRAWING {mode}: color={color}")
+
+                    # DEBUG: Print when drawing water polygon
+                    if 150 <= color[2] <= 235 and 160 <= color[1] <= 220 and 150 <= color[0] <= 180:
+                        if len(pts) >= 80:  # Large polygons - show full extent
+                            xs = [p[0] for p in pts]
+                            ys = [p[1] for p in pts]
+                            print(f"  -> SCREEN coords ring {i}: first={pts[0]}, second={pts[1]}, last={pts[-1]}")
+                            print(f"     ALL {len(pts)} points: X=[{min(xs)}, {max(xs)}] ({max(xs)-min(xs)} px), Y=[{min(ys)}, {max(ys)}] ({max(ys)-min(ys)} px)")
+                        else:
+                            print(f"  -> SCREEN coords ring {i}: first={pts[0]}, second={pts[1]}, last={pts[-1]}")
+
                     if self.fill_polygons:
-                        # Draw exterior with feature color, holes with background color
-                        ring_color = color if i == 0 else self.background_color
-                        pygame.draw.polygon(surface, ring_color, pts)
-                        # Only outline the exterior ring, and only if it's not a hole
-                        if i == 0:
-                            pygame.draw.polygon(surface, darken_color(color), pts, 1)
+                        pygame.draw.polygon(surface, color, pts, 0)  # 0 = filled
                     else:
                         pygame.draw.polygon(surface, color, pts, 1)
 
@@ -345,17 +548,51 @@ class NAVViewer:
         tl_x, tl_y = center_x - 1.5, center_y - 1.5
         fx, fy = tl_x + (pixel_x / TILE_SIZE), tl_y + (pixel_y / TILE_SIZE)
 
-        for feature in reversed(self.cached_features):
+        # Test features in priority order (highest first) for correct hit-testing
+        sorted_features = sorted(self.cached_features, key=lambda f: f.priority, reverse=True)
+        for feature in sorted_features:
             if self._point_in_feature(fx, fy, feature):
                 bx1, by1, bx2, by2 = feature.bbox
+                color_hex = f"#{rgb565_to_rgb888(feature.color_rgb565)[0]:02x}{rgb565_to_rgb888(feature.color_rgb565)[1]:02x}{rgb565_to_rgb888(feature.color_rgb565)[2]:02x}"
+
+                # Find OSM tags from color
+                osm_tags = self.color_to_tags.get(color_hex, ['unknown'])
+
                 return {
-                    'type': ['?', 'Point', 'Line', 'Polygon'][feature.geom_type],
-                    'color': f"#{rgb565_to_rgb888(feature.color_rgb565)[0]:02x}{rgb565_to_rgb888(feature.color_rgb565)[1]:02x}{rgb565_to_rgb888(feature.color_rgb565)[2]:02x}",
+                    'type': ['?', 'Point', 'Line', 'Polygon', 'Text'][feature.geom_type if feature.geom_type < 5 else 0],
+                    'color': color_hex,
+                    'tags': ', '.join(osm_tags[:3]),  # Show up to 3 tags
                     'zoom': feature.min_zoom,
+                    'priority': feature.priority,
                     'pts': len(feature.coords),
                     'bbox': f"({bx1},{by1})-({bx2},{by2})"
                 }
         return None
+
+    def get_feature_stats(self) -> Dict:
+        """Calculate detailed statistics about loaded features."""
+        if not self.cached_features:
+            return {}
+
+        stats = {
+            'by_type': {},
+            'by_priority': {},
+            'by_color': {},
+        }
+
+        for f in self.cached_features:
+            # By type
+            type_name = ['?', 'Point', 'Line', 'Polygon', 'Text'][f.geom_type if f.geom_type < 5 else 0]
+            stats['by_type'][type_name] = stats['by_type'].get(type_name, 0) + 1
+
+            # By priority
+            stats['by_priority'][f.priority] = stats['by_priority'].get(f.priority, 0) + 1
+
+            # By color
+            color_hex = f"#{rgb565_to_rgb888(f.color_rgb565)[0]:02x}{rgb565_to_rgb888(f.color_rgb565)[1]:02x}{rgb565_to_rgb888(f.color_rgb565)[2]:02x}"
+            stats['by_color'][color_hex] = stats['by_color'].get(color_hex, 0) + 1
+
+        return stats
 
     def _point_in_feature(self, fx: float, fy: float, feature: NavFeature) -> bool:
         # Convert feature to global tile units for intersection test
@@ -395,6 +632,7 @@ def main():
     parser.add_argument('--lat', type=float, required=True, help='Center latitude')
     parser.add_argument('--lon', type=float, required=True, help='Center longitude')
     parser.add_argument('--zoom', type=int, default=14, help='Zoom level')
+    parser.add_argument('--config', type=str, help='Features JSON config file (optional, for OSM tag mapping)')
 
     args = parser.parse_args()
 
@@ -402,7 +640,7 @@ def main():
         logger.error("pygame required")
         sys.exit(1)
 
-    viewer = NAVViewer(args.nav_dir)
+    viewer = NAVViewer(args.nav_dir, args.config)
     viewer.set_center(args.lat, args.lon, args.zoom)
 
     pygame.init()
@@ -422,6 +660,17 @@ def main():
     bg_button_rect = pygame.Rect(VIEWPORT_SIZE + 10, button_margin, button_width, button_height)
     fill_button_rect = pygame.Rect(VIEWPORT_SIZE + 10, button_margin * 2 + button_height, button_width, button_height)
     grid_button_rect = pygame.Rect(VIEWPORT_SIZE + 10, button_margin * 3 + button_height * 2, button_width, button_height)
+    stats_button_rect = pygame.Rect(VIEWPORT_SIZE + 10, button_margin * 4 + button_height * 3, button_width, button_height)
+    legend_button_rect = pygame.Rect(VIEWPORT_SIZE + 10, button_margin * 5 + button_height * 4, button_width, button_height)
+
+    # Priority filter sliders
+    slider_y_base = button_margin * 6 + button_height * 5 + 40
+    slider_height = 20
+    min_priority_slider_rect = pygame.Rect(VIEWPORT_SIZE + 10, slider_y_base, button_width, slider_height)
+    max_priority_slider_rect = pygame.Rect(VIEWPORT_SIZE + 10, slider_y_base + 40, button_width, slider_height)
+
+    show_stats_window = False
+    show_legend_window = False
 
     dragging = False
     drag_start = None
@@ -469,6 +718,18 @@ def main():
                 elif event.key == pygame.K_g:
                     viewer.show_tile_grid = not viewer.show_tile_grid
                     need_redraw = True
+                elif event.key == pygame.K_r:
+                    # Force reload tiles (clear cache)
+                    viewer.last_viewport_key = None
+                    need_redraw = True
+                elif event.key == pygame.K_s:
+                    show_stats_window = not show_stats_window
+                    show_legend_window = False  # Close legend if stats opened
+                    need_redraw = True
+                elif event.key == pygame.K_l:
+                    show_legend_window = not show_legend_window
+                    show_stats_window = False  # Close stats if legend opened
+                    need_redraw = True
                 elif event.key in (pygame.K_q, pygame.K_ESCAPE):
                     running = False
 
@@ -484,6 +745,22 @@ def main():
                         need_redraw = True
                     elif grid_button_rect.collidepoint(mx, my):
                         viewer.show_tile_grid = not viewer.show_tile_grid
+                        need_redraw = True
+                    elif stats_button_rect.collidepoint(mx, my):
+                        show_stats_window = not show_stats_window
+                        need_redraw = True
+                    elif legend_button_rect.collidepoint(mx, my):
+                        show_legend_window = not show_legend_window
+                        need_redraw = True
+                    elif min_priority_slider_rect.collidepoint(mx, my):
+                        # Set min priority from slider position
+                        ratio = (mx - min_priority_slider_rect.x) / min_priority_slider_rect.width
+                        viewer.priority_filter_min = int(ratio * 15)
+                        need_redraw = True
+                    elif max_priority_slider_rect.collidepoint(mx, my):
+                        # Set max priority from slider position
+                        ratio = (mx - max_priority_slider_rect.x) / max_priority_slider_rect.width
+                        viewer.priority_filter_max = int(ratio * 15)
                         need_redraw = True
                     elif mx < VIEWPORT_SIZE and my < VIEWPORT_SIZE:
                         dragging = True
@@ -548,8 +825,31 @@ def main():
             grid_text = f"Grid: {'ON' if viewer.show_tile_grid else 'OFF'}"
             draw_button(screen, grid_text, grid_button_rect, button_bg, button_fg, button_border, font_small)
 
-            info_y = button_margin * 4 + button_height * 3 + 20
+            stats_text = "Stats" + (" ✓" if show_stats_window else "")
+            draw_button(screen, stats_text, stats_button_rect, button_bg, button_fg, button_border, font_small)
+
+            legend_text = "Legend" + (" ✓" if show_legend_window else "")
+            draw_button(screen, legend_text, legend_button_rect, button_bg, button_fg, button_border, font_small)
+
             info_color = (200, 200, 200)
+
+            # Priority filter sliders
+            slider_label_y = slider_y_base - 25
+            screen.blit(font_small.render("Priority Filter:", True, info_color), (VIEWPORT_SIZE + 10, slider_label_y))
+
+            # Min slider
+            pygame.draw.rect(screen, (60, 60, 60), min_priority_slider_rect)
+            min_handle_x = VIEWPORT_SIZE + 10 + int((viewer.priority_filter_min / 15) * button_width)
+            pygame.draw.circle(screen, (150, 150, 255), (min_handle_x, slider_y_base + slider_height // 2), 8)
+            screen.blit(font_small.render(f"Min: {viewer.priority_filter_min}", True, (150, 150, 150)), (VIEWPORT_SIZE + 10, slider_y_base + 22))
+
+            # Max slider
+            pygame.draw.rect(screen, (60, 60, 60), max_priority_slider_rect)
+            max_handle_x = VIEWPORT_SIZE + 10 + int((viewer.priority_filter_max / 15) * button_width)
+            pygame.draw.circle(screen, (255, 150, 150), (max_handle_x, slider_y_base + 40 + slider_height // 2), 8)
+            screen.blit(font_small.render(f"Max: {viewer.priority_filter_max}", True, (150, 150, 150)), (VIEWPORT_SIZE + 10, slider_y_base + 62))
+
+            info_y = slider_y_base + 100
 
             screen.blit(font_small.render(f"Lat: {viewer.center_lat:.6f}", True, info_color), (VIEWPORT_SIZE + 10, info_y))
             screen.blit(font_small.render(f"Lon: {viewer.center_lon:.6f}", True, info_color), (VIEWPORT_SIZE + 10, info_y + 18))
@@ -566,15 +866,58 @@ def main():
 
             # Feature Identification (Right-click)
             feature_y = stats_y + 80
-            screen.blit(font_small.render("Selected Feature:", True, info_color), (VIEWPORT_SIZE + 10, feature_y))
-            if viewer.selected_feature:
-                line_y = feature_y + 18
-                for key, value in viewer.selected_feature.items():
-                    text = f"  {key}: {value}"
-                    screen.blit(font_small.render(text, True, (100, 200, 100)), (VIEWPORT_SIZE + 10, line_y))
+            if not show_stats_window and not show_legend_window:
+                screen.blit(font_small.render("Selected Feature:", True, info_color), (VIEWPORT_SIZE + 10, feature_y))
+                if viewer.selected_feature:
+                    line_y = feature_y + 18
+                    for key, value in viewer.selected_feature.items():
+                        text = f"  {key}: {value}"
+                        screen.blit(font_small.render(text, True, (100, 200, 100)), (VIEWPORT_SIZE + 10, line_y))
+                        line_y += 14
+                else:
+                    screen.blit(font_small.render("  (Right-click to select)", True, (100, 100, 100)), (VIEWPORT_SIZE + 10, feature_y + 18))
+
+            # Stats window
+            elif show_stats_window:
+                feature_stats = viewer.get_feature_stats()
+                screen.blit(font_small.render("Feature Statistics:", True, (255, 255, 100)), (VIEWPORT_SIZE + 10, feature_y))
+                line_y = feature_y + 20
+
+                screen.blit(font_small.render("By Type:", True, info_color), (VIEWPORT_SIZE + 10, line_y))
+                line_y += 15
+                for type_name, count in sorted(feature_stats.get('by_type', {}).items()):
+                    screen.blit(font_small.render(f"  {type_name}: {count}", True, (150, 150, 150)), (VIEWPORT_SIZE + 15, line_y))
+                    line_y += 13
+
+                line_y += 5
+                screen.blit(font_small.render("By Priority:", True, info_color), (VIEWPORT_SIZE + 10, line_y))
+                line_y += 15
+                for priority, count in sorted(feature_stats.get('by_priority', {}).items()):
+                    screen.blit(font_small.render(f"  P{priority}: {count}", True, (150, 150, 150)), (VIEWPORT_SIZE + 15, line_y))
+                    line_y += 13
+                    if line_y > VIEWPORT_SIZE - 20: break
+
+            # Legend window
+            elif show_legend_window:
+                screen.blit(font_small.render("Color Legend:", True, (255, 255, 100)), (VIEWPORT_SIZE + 10, feature_y))
+                line_y = feature_y + 20
+
+                feature_stats = viewer.get_feature_stats()
+                sorted_colors = sorted(feature_stats.get('by_color', {}).items(), key=lambda x: -x[1])[:15]  # Top 15
+
+                for color_hex, count in sorted_colors:
+                    # Draw color swatch
+                    r = int(color_hex[1:3], 16)
+                    g = int(color_hex[3:5], 16)
+                    b = int(color_hex[5:7], 16)
+                    pygame.draw.rect(screen, (r, g, b), (VIEWPORT_SIZE + 10, line_y, 15, 12))
+
+                    # Draw tags
+                    tags = viewer.color_to_tags.get(color_hex, ['?'])
+                    tag_text = tags[0] if len(tags) == 1 else f"{tags[0]}..."
+                    screen.blit(font_small.render(f"{tag_text} ({count})", True, (150, 150, 150)), (VIEWPORT_SIZE + 30, line_y))
                     line_y += 14
-            else:
-                screen.blit(font_small.render("  (Right-click to select)", True, (100, 100, 100)), (VIEWPORT_SIZE + 10, feature_y + 18))
+                    if line_y > VIEWPORT_SIZE - 20: break
 
             # Status Bar
             pygame.draw.rect(screen, (30, 30, 30), (0, VIEWPORT_SIZE, WINDOW_WIDTH, STATUSBAR_HEIGHT))
