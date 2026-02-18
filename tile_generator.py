@@ -355,41 +355,57 @@ def convert_pbf_to_nav(input_pbf: str, output_dir: str, config_file: str,
         tiles_written = 0
         print() # New line after preparation phase
 
-        num_workers = min(4, num_tiles)  # Limit to 4 workers to avoid OOM on complex tiles
-        tile_jobs = []
-        for y in range(min_ty, max_ty + 1):
-            for x in range(min_tx, max_tx + 1):
-                features = tile_features.get((x, y), [])
-                if not features:
-                    continue
-                tile_dir = os.path.join(output_dir, str(zoom), str(x))
-                tile_path = os.path.join(tile_dir, f"{y}.nav")
-                features.sort(key=lambda f: f['zoom_priority'] & 0x0F)
-                tile_jobs.append((features, tile_path, zoom, x, y, tolerance))
+        num_workers = min(os.cpu_count() or 1, 4, num_tiles)
+        BATCH_SIZE = 2000  # Process tiles in batches to limit memory usage
+
+        # Build jobs as a generator to avoid holding all features in memory
+        def tile_job_iter():
+            for y in range(min_ty, max_ty + 1):
+                for x in range(min_tx, max_tx + 1):
+                    features = tile_features.get((x, y))
+                    if not features:
+                        continue
+                    tile_dir = os.path.join(output_dir, str(zoom), str(x))
+                    tile_path = os.path.join(tile_dir, f"{y}.nav")
+                    features.sort(key=lambda f: f['zoom_priority'] & 0x0F)
+                    yield (features, tile_path, zoom, x, y, tolerance)
 
         completed = 0
+        job_iter = tile_job_iter()
         with ProcessPoolExecutor(max_workers=num_workers) as executor:
-            futures = {executor.submit(write_nav_tile, *job): job for job in tile_jobs}
-            for future in as_completed(futures):
-                completed += 1
-                progress = completed / num_tiles
-                bar_width = 25
-                filled = int(bar_width * progress)
-                bar = '\u2588' * filled + '\u2591' * (bar_width - filled)
-                print(f"\r  Zoom {zoom:2d}: Tiles [{bar}] {completed}/{num_tiles}", end='', flush=True)
+            while True:
+                batch = []
+                for job in job_iter:
+                    batch.append(job)
+                    if len(batch) >= BATCH_SIZE:
+                        break
+                if not batch:
+                    break
 
-                result = future.result()
-                if result:
-                    tiles_written += 1
-                    tile_path = futures[future][1]
-                    try:
-                        total_size += os.path.getsize(tile_path)
-                    except OSError:
-                        pass
+                futures = {executor.submit(write_nav_tile, *job): job for job in batch}
+                batch.clear()  # Free batch memory, futures hold refs now
+
+                for future in as_completed(futures):
+                    completed += 1
+                    progress = completed / num_tiles
+                    bar_width = 25
+                    filled = int(bar_width * progress)
+                    bar = '\u2588' * filled + '\u2591' * (bar_width - filled)
+                    print(f"\r  Zoom {zoom:2d}: Tiles [{bar}] {completed}/{num_tiles}", end='', flush=True)
+
+                    result = future.result()
+                    if result:
+                        tiles_written += 1
+                        tile_path = futures[future][1]
+                        try:
+                            total_size += os.path.getsize(tile_path)
+                        except OSError:
+                            pass
+
+                futures.clear()  # Free completed futures before next batch
 
         # Clear memory before next zoom level
         tile_features.clear()
-        tile_jobs.clear()
 
         zoom_elapsed = time.time() - zoom_start
         print(f"\r  Zoom {zoom:2d}: {tiles_written} tiles written. ({zoom_elapsed:.1f}s)" + " " * 20)
