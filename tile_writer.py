@@ -249,9 +249,14 @@ def write_nav_tile(features: List[Dict], output_path: str, zoom: int, tile_x: in
         f.write(struct.pack('<H', 5))                   # ring end at point 5
         written_features += 1
 
+        MAX_TILE_BYTES = 256 * 1024  # 256 KB max per tile for ESP32 read performance
+
         for feature in features:
             if written_features >= 65534:
-                logger.warning(f"  Tile {tile_x},{tile_y} z{zoom}: HIT FEATURE LIMIT (65534)! Truncating rest of tile.")
+                logger.warning(f"  Tile {tile_x},{tile_y} z{zoom}: HIT FEATURE LIMIT (65534)! Truncating.")
+                break
+            if f.tell() >= MAX_TILE_BYTES:
+                logger.info(f"  Tile {tile_x},{tile_y} z{zoom}: Size cap ({MAX_TILE_BYTES//1024} KB) at {written_features} features.")
                 break
             # Handle text features separately
             if feature['geom_type'] == GEOM_TEXT:
