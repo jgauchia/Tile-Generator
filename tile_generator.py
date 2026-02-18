@@ -9,6 +9,10 @@ NAV format optimized for ESP32:
 - int16 relative coordinates (0-4096 range with safety margin)
 - ~50% size reduction vs previous version
 
+Width field encoding (1 byte):
+- Bit 7 (0x80): Casing flag for two-pass rendering (motorway/trunk/primary)
+- Bits 0-6 (0x7F): Actual width in pixels (0-127)
+
 Usage:
     python tile_generator.py input.pbf output_dir features.json [--zoom 6-17]
 """
@@ -19,720 +23,29 @@ import json
 import argparse
 import logging
 import math
-import struct
-from typing import Dict, List, Tuple, Set, Any, Optional
-from collections import defaultdict
 import time
+from typing import Dict, List, Tuple
+from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 try:
     import osmium
-    from osmium import osm
-    import osmium.geom
+    import osmium.area
+    import osmium.index
 except ImportError:
     print("Error: osmium not found. Install with: pip install osmium")
     sys.exit(1)
 
-try:
-    from shapely.geometry import Polygon
-    import shapely.wkb
-    SHAPELY_AVAILABLE = True
-except ImportError:
-    SHAPELY_AVAILABLE = False
-    print("Warning: shapely not found. Multipolygon support disabled.")
+from constants import GEOM_POINT, GEOM_POLYGON, GEOM_TEXT, LINE_COLOR_PER_ZOOM
+from geo_utils import (
+    get_simplify_tolerance, get_feature_tiles,
+    lon_to_tile_x, lat_to_tile_y, hex_to_rgb565,
+)
+from osm_handlers import BoundaryScanner, OSMHandler
+from tile_writer import write_nav_tile
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
-
-# NAV format constants
-NAV_MAGIC = b'NAV1'
-COORD_SCALE = 10000000  # 1e7 for ~1cm precision
-
-# Geometry types
-GEOM_LINESTRING = 2
-GEOM_POLYGON = 3
-
-# Tags that support width (LineStrings only)
-WIDTH_TAGS = {'highway', 'railway', 'waterway'}
-
-# Cache for zoom level parameters
-_ZOOM_PARAMS_CACHE = {}
-
-
-def _get_zoom_params(zoom: int) -> Dict:
-    """Get cached zoom parameters or compute them."""
-    if zoom not in _ZOOM_PARAMS_CACHE:
-        n = 2.0 ** zoom
-        _ZOOM_PARAMS_CACHE[zoom] = {
-            'n': n,
-            'lon_scale': n / 360.0,
-            'lon_offset': 180.0
-        }
-    return _ZOOM_PARAMS_CACHE[zoom]
-
-
-def meters_to_pixels(width_meters: float, zoom: int, lat: float = 45.0) -> int:
-    """Convert width in meters to pixels at given zoom level.
-
-    Uses approximation for given latitude (default 45° for Europe).
-    Formula: meters_per_pixel ≈ 156543 * cos(lat) / 2^zoom
-    """
-    meters_per_pixel = 156543.0 * math.cos(math.radians(lat)) / (2 ** zoom)
-    pixels = int(width_meters / meters_per_pixel + 0.5)
-    return max(1, min(15, pixels))  # Clamp to 1-15
-
-
-# Layer rendering priority (lower = rendered first = behind)
-LAYER_PRIORITY = {
-    'landuse': 10,
-    'terrain': 20,
-    'water': 30,
-    'amenities': 35,
-    'railways': 40,
-    'roads': 50,
-    'infrastructure': 60,
-    'buildings': 70,
-    'places': 90
-}
-
-# Layer definitions based on feature types
-LAYER_MAPPING = {
-    'water': [
-        'natural=water', 'natural=coastline', 'natural=bay',
-        'waterway=riverbank', 'waterway=dock', 'waterway=boatyard',
-        'waterway=river', 'waterway=stream', 'waterway=canal',
-        'natural=spring', 'natural=wetland',
-        'water=river', 'water=canal', 'water=reservoir'
-    ],
-    'landuse': [
-        'natural=beach', 'natural=sand', 'natural=wood',
-        'landuse=forest', 'natural=forest', 'natural=scrub',
-        'natural=heath', 'natural=grassland', 'landuse=meadow',
-        'landuse=grass', 'landuse=orchard', 'landuse=vineyard',
-        'landuse=farmland', 'landuse=park', 'leisure=park',
-        'leisure=nature_reserve', 'leisure=garden', 'leisure=pitch',
-        'leisure=golf_course', 'leisure=recreation_ground', 'landuse=recreation_ground',
-        'landuse=residential', 'place=suburb',
-        'landuse=commercial', 'landuse=retail', 'landuse=industrial',
-        'landuse=construction', 'landuse=cemetery', 'landuse=allotments',
-        'leisure=stadium', 'leisure=sports_centre', 'leisure=playground',
-        'amenity=parking', 'leisure=common', 'landuse=village_green',
-        'landuse=grass'
-    ],
-    'roads': [
-        'highway=motorway', 'highway=motorway_link',
-        'highway=trunk', 'highway=trunk_link',
-        'highway=primary', 'highway=primary_link',
-        'highway=secondary', 'highway=secondary_link',
-        'highway=tertiary', 'highway=tertiary_link',
-        'highway=residential', 'highway=living_street',
-        'highway=unclassified', 'highway=service',
-        'highway=pedestrian', 'highway=track',
-        'highway=path', 'highway=footway',
-        'highway=cycleway', 'highway=steps',
-        'highway=crossing', 'highway=bus_stop'
-    ],
-    'railways': [
-        'railway=rail', 'railway=subway', 'railway=tram'
-    ],
-    'buildings': [
-        'building', 'man_made=tower'
-    ],
-    'amenities': [
-        'amenity=hospital',
-        'amenity=school', 'amenity=university',
-        'amenity=place_of_worship'
-    ],
-    'infrastructure': [
-        'bridge=yes', 'man_made=bridge',
-        'aeroway=runway', 'aeroway=taxiway', 'aeroway=apron',
-        'tunnel=yes'
-    ],
-    'terrain': [
-        'natural=peak', 'natural=ridge',
-        'natural=volcano', 'natural=cliff',
-        'natural=tree_row', 'natural=tree'
-    ],
-    'places': [
-        'place=state', 'place=town',
-        'place=village', 'place=hamlet'
-    ]
-}
-
-
-def lon_to_tile_x(lon: float, zoom: int) -> int:
-    """Convert longitude to tile X coordinate."""
-    params = _get_zoom_params(zoom)
-    return int((lon + params['lon_offset']) * params['lon_scale'])
-
-
-def lat_to_tile_y(lat: float, zoom: int) -> int:
-    """Convert latitude to tile Y coordinate."""
-    params = _get_zoom_params(zoom)
-    lat_rad = math.radians(lat)
-    return int((1.0 - math.asinh(math.tan(lat_rad)) / math.pi) / 2.0 * params['n'])
-
-
-def get_feature_tiles(coords: List[Tuple[float, float]], zoom: int, is_polygon: bool = False) -> Set[Tuple[int, int]]:
-    """Get all tiles that a feature intersects at given zoom level."""
-    tiles = set()
-
-    if is_polygon and len(coords) >= 3:
-        # Calculate min/max without creating intermediate lists
-        min_lon = max_lon = coords[0][0]
-        min_lat = max_lat = coords[0][1]
-        
-        for lon, lat in coords[1:]:
-            if lon < min_lon: min_lon = lon
-            elif lon > max_lon: max_lon = lon
-            if lat < min_lat: min_lat = lat
-            elif lat > max_lat: max_lat = lat
-
-        min_x = lon_to_tile_x(min_lon, zoom)
-        max_x = lon_to_tile_x(max_lon, zoom)
-        min_y = lat_to_tile_y(max_lat, zoom)
-        max_y = lat_to_tile_y(min_lat, zoom)
-
-        for x in range(min_x, max_x + 1):
-            for y in range(min_y, max_y + 1):
-                tiles.add((x, y))
-    else:
-        for lon, lat in coords:
-            x = lon_to_tile_x(lon, zoom)
-            y = lat_to_tile_y(lat, zoom)
-            tiles.add((x, y))
-
-    return tiles
-
-
-def get_layer_for_tags(tags: Dict[str, str]) -> Optional[str]:
-    """Determine which layer a feature belongs to based on its tags."""
-    for layer_name, feature_keys in LAYER_MAPPING.items():
-        for feature_key in feature_keys:
-            if '=' in feature_key:
-                key, value = feature_key.split('=', 1)
-                if key in tags and tags[key] == value:
-                    return layer_name
-            else:
-                if feature_key in tags:
-                    return layer_name
-    return None
-
-
-def get_config_value_for_tags(
-    tags: Dict[str, str], 
-    config: Dict, 
-    attribute: str, 
-    default: Any
-) -> Any:
-    """
-    Generic helper to get configuration values for feature tags.
-    
-    Args:
-        tags: Dictionary of OSM tags (key: value pairs)
-        config: Configuration dictionary with feature settings
-        attribute: The attribute to retrieve from config (e.g., 'zoom', 'color', 'priority')
-        default: Default value if nothing found
-        
-    Returns:
-        The configured value for attribute, or default if not found
-    """
-    for key, value in tags.items():
-        # Try exact match first (key=value)
-        feature_key = f"{key}={value}"
-        if feature_key in config and isinstance(config[feature_key], dict):
-            return config[feature_key].get(attribute, default)
-        
-        # Then try key-only match
-        if key in config and isinstance(config[key], dict):
-            return config[key].get(attribute, default)
-    
-    return default
-
-
-def get_zoom_for_tags(tags: Dict[str, str], config: Dict) -> int:
-    """Get minimum zoom level for feature based on config."""
-    return get_config_value_for_tags(tags, config, 'zoom', 6)
-
-
-def get_color_for_tags(tags: Dict[str, str], config: Dict) -> str:
-    """Get color for feature based on config."""
-    return get_config_value_for_tags(tags, config, 'color', '#FFFFFF')
-
-
-def get_priority_for_tags(tags: Dict[str, str], config: Dict) -> int:
-    """Get rendering priority for feature based on config."""
-    return get_config_value_for_tags(tags, config, 'priority', 50)
-
-
-def hex_to_rgb565(hex_color: str) -> int:
-    """Convert hex color to RGB565 format."""
-    try:
-        if not hex_color or not hex_color.startswith("#"):
-            return 0xFFFF
-        r = int(hex_color[1:3], 16)
-        g = int(hex_color[3:5], 16)
-        b = int(hex_color[5:7], 16)
-        return ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3)
-    except (ValueError, IndexError):
-        logger.warning(f"Invalid hex color format: {hex_color}, using default")
-        return 0xFFFF
-
-
-def pack_zoom_priority(min_zoom: int, priority: int) -> int:
-    """Pack min_zoom and priority into a single byte."""
-    zoom_nibble = min(min_zoom, 15) & 0x0F
-    priority_nibble = min(priority // 7, 15) & 0x0F
-    return (zoom_nibble << 4) | priority_nibble
-
-
-def get_simplify_tolerance(zoom: int) -> float:
-    """Calculate simplification tolerance based on zoom level."""
-    tile_width_degrees = 360.0 / (2.0 ** zoom)
-    pixel_size_degrees = tile_width_degrees / 256.0
-    return pixel_size_degrees
-
-
-class OSMHandler(osmium.SimpleHandler):
-    """Handler for processing OSM data from PBF files."""
-
-    def __init__(self, config: Dict, zoom_range: Tuple[int, int]):
-        super().__init__()
-        self.config = config
-        self.min_zoom, self.max_zoom = zoom_range
-        self.features: List[Dict] = []
-        self.stats = {
-            'ways_processed': 0,
-            'areas_processed': 0,
-            'features_extracted': 0,
-            'features_filtered': 0
-        }
-        self.start_time = time.time()
-        self.last_progress_time = time.time()
-        self.progress_interval = 5
-        self.interesting_tags = self._build_interesting_tags()
-        self.processed_way_ids: Set[int] = set()
-        self.wkbfab = osmium.geom.WKBFactory()
-
-    def _build_interesting_tags(self) -> Set[str]:
-        """Build set of tag keys we're interested in."""
-        tags = set()
-        for key in self.config:
-            if isinstance(self.config[key], dict):
-                if '=' in key:
-                    tag_key = key.split('=')[0]
-                    tags.add(tag_key)
-                else:
-                    tags.add(key)
-        return tags
-
-    def _log_progress(self):
-        """Log progress periodically."""
-        current_time = time.time()
-        if current_time - self.last_progress_time >= self.progress_interval:
-            self.last_progress_time = current_time
-            ways = self.stats['ways_processed']
-            extracted = self.stats['features_extracted']
-            elapsed = current_time - self.start_time
-            mins, secs = divmod(int(elapsed), 60)
-            print(f"\r  Progress: {ways:,} ways, {extracted:,} features [{mins}m {secs:02d}s]", end='', flush=True)
-
-    def _has_interesting_tags(self, tags) -> bool:
-        """Check if tags contain any interesting keys."""
-        for tag in tags:
-            if tag.k in self.interesting_tags:
-                return True
-        return False
-
-    def _tags_to_dict(self, tags) -> Dict[str, str]:
-        """Convert osmium tags to dictionary."""
-        return {tag.k: tag.v for tag in tags}
-
-    def _is_feature_in_config(self, tags: Dict[str, str]) -> bool:
-        """Check if feature matches any entry in config."""
-        for key, value in tags.items():
-            feature_key = f"{key}={value}"
-            if feature_key in self.config and isinstance(self.config[feature_key], dict):
-                return True
-            if key in self.config and isinstance(self.config[key], dict):
-                return True
-        return False
-
-    def way(self, w):
-        """Process way - extract roads and linear features."""
-        self.stats['ways_processed'] += 1
-        self._log_progress()
-
-        if not self._has_interesting_tags(w.tags):
-            self.stats['features_filtered'] += 1
-            return
-
-        tags = self._tags_to_dict(w.tags)
-
-        if not self._is_feature_in_config(tags):
-            self.stats['features_filtered'] += 1
-            return
-
-        layer = get_layer_for_tags(tags)
-        if layer is None:
-            self.stats['features_filtered'] += 1
-            return
-
-        min_zoom = get_zoom_for_tags(tags, self.config)
-        if min_zoom > self.max_zoom:
-            self.stats['features_filtered'] += 1
-            return
-
-        coords = []
-        for node in w.nodes:
-            if node.location.valid():
-                coords.append((node.location.lon, node.location.lat))
-
-        if len(coords) < 2:
-            self.stats['features_filtered'] += 1
-            return
-
-        is_closed = len(coords) >= 4 and coords[0] == coords[-1]
-        
-        # Tags that automatically qualify a closed way as an area/polygon
-        area_qualifiers = {
-            'building', 'landuse', 'water', 'amenity', 'leisure', 'natural',
-            'waterway', 'man_made', 'aeroway', 'historic', 'military'
-        }
-        
-        has_area_tag = any(k in tags for k in area_qualifiers)
-        is_area_tags = is_closed and (has_area_tag or tags.get('area') == 'yes')
-
-        color = get_color_for_tags(tags, self.config)
-        priority = get_priority_for_tags(tags, self.config)
-        color_rgb565 = hex_to_rgb565(color)
-        layer_base_priority = LAYER_PRIORITY.get(layer, 50)
-        
-        # Ensure linestrings for waterways are behind areas (polygons)
-        if layer == 'water' and not (is_closed and is_area_tags):
-            combined_priority = layer_base_priority + (priority % 5) # Lower priority for centerlines
-        else:
-            combined_priority = layer_base_priority + (priority % 10)
-
-        if is_closed and is_area_tags and 'highway' not in tags:
-            feature = {
-                'id': w.id,
-                'geom_type': GEOM_POLYGON,
-                'coords': coords,
-                'color_rgb565': color_rgb565,
-                'zoom_priority': pack_zoom_priority(min_zoom, combined_priority),
-                'width_meters': 0.0  # Polygons don't use width
-            }
-            self.features.append(feature)
-            self.stats['features_extracted'] += 1
-            self.processed_way_ids.add(w.id)
-            return
-
-        # Extract width in meters for roads/railways/waterways
-        width_meters = 0.0
-        if any(tag in tags for tag in WIDTH_TAGS):
-            width_meters = self._get_width_meters(tags)
-
-        feature = {
-            'id': w.id,
-            'geom_type': GEOM_LINESTRING,
-            'coords': coords,
-            'color_rgb565': color_rgb565,
-            'zoom_priority': pack_zoom_priority(min_zoom, combined_priority),
-            'width_meters': width_meters
-        }
-        self.features.append(feature)
-        self.stats['features_extracted'] += 1
-
-    def _get_width_meters(self, tags: Dict[str, str]) -> float:
-        """Extract width in meters from OSM tags.
-
-        Priority:
-        1. width=* tag (meters)
-        2. lanes=* tag (lanes × 3.5m)
-        3. Return 0 (will become 1 pixel default)
-        """
-        # Check for explicit width tag
-        if 'width' in tags:
-            try:
-                width_str = tags['width'].replace('m', '').replace(' ', '').strip()
-                return float(width_str)
-            except (ValueError, TypeError):
-                pass
-
-        # Check for lanes tag
-        if 'lanes' in tags:
-            try:
-                lanes = int(tags['lanes'])
-                return lanes * 3.5  # Standard lane width
-            except (ValueError, TypeError):
-                pass
-
-        return 0.0
-
-    def area(self, a):
-        """Process area - handles multipolygon relations."""
-        self.stats['areas_processed'] += 1
-        self._log_progress()
-
-        if not self._has_interesting_tags(a.tags):
-            self.stats['features_filtered'] += 1
-            return
-
-        tags = self._tags_to_dict(a.tags)
-
-        if not self._is_feature_in_config(tags):
-            self.stats['features_filtered'] += 1
-            return
-
-        layer = get_layer_for_tags(tags)
-        if layer is None:
-            self.stats['features_filtered'] += 1
-            return
-
-        if 'highway' in tags:
-            self.stats['features_filtered'] += 1
-            return
-
-        min_zoom = get_zoom_for_tags(tags, self.config)
-        if min_zoom > self.max_zoom:
-            self.stats['features_filtered'] += 1
-            return
-
-        if a.from_way() and a.orig_id() in self.processed_way_ids:
-            return
-
-        try:
-            wkb = self.wkbfab.create_multipolygon(a)
-            geom = shapely.wkb.loads(wkb, hex=True)
-
-            color = get_color_for_tags(tags, self.config)
-            priority = get_priority_for_tags(tags, self.config)
-            color_rgb565 = hex_to_rgb565(color)
-            layer_base_priority = LAYER_PRIORITY.get(layer, 50)
-            combined_priority = layer_base_priority + (priority % 10)
-
-            polygons = []
-            if geom.geom_type == 'Polygon':
-                polygons = [geom]
-            elif geom.geom_type == 'MultiPolygon':
-                polygons = list(geom.geoms)
-
-            for poly in polygons:
-                if poly.is_empty or not poly.exterior:
-                    continue
-
-                coords = list(poly.exterior.coords)
-                if len(coords) < 4:
-                    continue
-
-                feature = {
-                    'geom_type': GEOM_POLYGON,
-                    'coords': coords,
-                    'color_rgb565': color_rgb565,
-                    'zoom_priority': pack_zoom_priority(min_zoom, combined_priority),
-                    'width_meters': 0.0  # Polygons don't use width
-                }
-                self.features.append(feature)
-                self.stats['features_extracted'] += 1
-
-        except Exception as e:
-            self.stats['features_filtered'] += 1
-
-
-def simplify_coords(coords: List[Tuple[float, float]], tolerance: float) -> List[Tuple[float, float]]:
-    """Simple Douglas-Peucker-like simplification."""
-    if len(coords) <= 2:
-        return coords
-
-    # Use shapely for simplification if available
-    if SHAPELY_AVAILABLE:
-        from shapely.geometry import LineString
-        line = LineString(coords)
-        simplified = line.simplify(tolerance, preserve_topology=True)
-        return list(simplified.coords)
-
-    return coords
-
-
-def write_nav_tile(features: List[Dict], output_path: str, zoom: int, tile_x: int, tile_y: int) -> bool:
-    """
-    Write features to NAV binary tile format using relative coordinates.
-    """
-    if not features:
-        return False
-
-    # Calculate tile bounds
-    n = 2.0 ** zoom
-    lon_deg_per_tile = 360.0 / n
-    tile_min_lon = -180.0 + tile_x * lon_deg_per_tile
-    tile_max_lon = tile_min_lon + lon_deg_per_tile
-    
-    def lat_to_merc(l):
-        r = math.radians(l)
-        r = max(-0.999 * math.pi / 2, min(0.999 * math.pi / 2, r))
-        return math.log(math.tan(r) + (1.0 / math.cos(r)))
-
-    def lat_from_tile_y(y, z):
-        n = 2.0 ** z
-        lat_rad = math.atan(math.sinh(math.pi * (1 - 2 * y / n)))
-        return math.degrees(lat_rad)
-
-    tile_max_lat = lat_from_tile_y(tile_y, zoom)
-    tile_min_lat = lat_from_tile_y(tile_y + 1, zoom)
-    
-    t_max_merc = lat_to_merc(tile_max_lat)
-    t_min_merc = lat_to_merc(tile_min_lat)
-    merc_range = t_max_merc - t_min_merc
-
-    # Clipping box with 10% margin to avoid artifacts and ensure overlap
-    margin = 0.10
-    lon_margin = (tile_max_lon - tile_min_lon) * margin
-    lat_margin = (tile_max_lat - tile_min_lat) * margin
-    
-    clip_box = None
-    if SHAPELY_AVAILABLE:
-        from shapely.geometry import box, Polygon, MultiPolygon, LineString, MultiLineString, GeometryCollection
-        clip_box = box(tile_min_lon - lon_margin, tile_min_lat - lat_margin, 
-                       tile_max_lon + lon_margin, tile_max_lat + lat_margin)
-
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-
-    written_features = 0
-    with open(output_path, 'wb') as f:
-        f.write(struct.pack('<4sHiiii', NAV_MAGIC, 0, 
-                           int(tile_min_lon * COORD_SCALE), 
-                           int(tile_min_lat * COORD_SCALE), 
-                           int(tile_max_lon * COORD_SCALE), 
-                           int(tile_max_lat * COORD_SCALE)))
-
-        for feature in features:
-            orig_coords = feature['coords']
-            is_polygon = feature['geom_type'] == GEOM_POLYGON
-            
-            # Each entry will be a list of rings: [ [ext_pts], [hole1_pts], ... ]
-            final_features_data = []
-            
-            # Clip geometry if shapely is available
-            if clip_box:
-                try:
-                    # Simplify slightly to avoid tiny artifacts before clipping
-                    geom = Polygon(orig_coords) if is_polygon else LineString(orig_coords)
-                    if not geom.is_valid:
-                        geom = geom.buffer(0)
-                    
-                    clipped = geom.intersection(clip_box)
-                    if clipped.is_empty:
-                        continue
-                        
-                    # Extract parts of the correct type
-                    parts = []
-                    if isinstance(clipped, GeometryCollection):
-                        parts = list(clipped.geoms)
-                    else:
-                        parts = [clipped]
-                        
-                    for part in parts:
-                        if is_polygon:
-                            if isinstance(part, (Polygon, MultiPolygon)):
-                                polys = [part] if isinstance(part, Polygon) else list(part.geoms)
-                                for p in polys:
-                                    if not p.is_empty and p.exterior and len(p.exterior.coords) >= 4:
-                                        rings = [list(p.exterior.coords)]
-                                        for interior in p.interiors:
-                                            if len(interior.coords) >= 4:
-                                                rings.append(list(interior.coords))
-                                        final_features_data.append(rings)
-                        else:
-                            if isinstance(part, LineString) and len(part.coords) >= 2:
-                                final_features_data.append([list(part.coords)])
-                            elif isinstance(part, MultiLineString):
-                                for l in part.geoms:
-                                    if len(l.coords) >= 2:
-                                        final_features_data.append([list(l.coords)])
-                except:
-                    continue
-            else:
-                final_features_data = [[orig_coords]]
-
-            for feature_rings in final_features_data:
-                # Project all rings for this feature part
-                projected_rings = []
-                total_points = 0
-                f_min_x, f_min_y = 4096, 4096
-                f_max_x, f_max_y = 0, 0
-                is_visible = False
-
-                for ring in feature_rings:
-                    projected_ring = []
-                    for lon, lat in ring:
-                        px = int((lon - tile_min_lon) / (tile_max_lon - tile_min_lon) * 4096)
-                        m_y = lat_to_merc(lat)
-                        py = int((t_max_merc - m_y) / merc_range * 4096)
-                        
-                        if -8192 < px < 12288 and -8192 < py < 12288:
-                            is_visible = True
-                        
-                        projected_ring.append((px, py))
-                        
-                        c_px, c_py = max(0, min(4096, px)), max(0, min(4096, py))
-                        f_min_x, f_min_y = min(f_min_x, c_px), min(f_min_y, c_py)
-                        f_max_x, f_max_y = max(f_max_x, c_px), max(f_max_y, c_py)
-                    
-                    if len(projected_ring) >= (3 if is_polygon else 2):
-                        projected_rings.append(projected_ring)
-                        total_points += len(projected_ring)
-
-                if is_polygon:
-                    # Minimum area filter: discard polygons smaller than 4 pixels squared
-                    if len(projected_rings[0]) >= 3:
-                        area = 0.0
-                        pts = projected_rings[0]
-                        for i in range(len(pts)):
-                            x1, y1 = pts[i]
-                            x2, y2 = pts[(i + 1) % len(pts)]
-                            area += (x1 * y2 - x2 * y1)
-                        if abs(area) < 32: # Area in coordinate units (4096 scale), 4px^2 * (4096/256)^2 = 1024. Wait, let's use a simpler pixel-based check.
-                            pass # We'll check actual pixel area below
-
-                # Simple bounding box area check in pixels (more efficient)
-                pixel_area = (f_max_x - f_min_x) * (f_max_y - f_min_y) / (16 * 16)
-                if is_polygon and pixel_area < 4:
-                    continue
-
-                width_meters = feature.get('width_meters', 0.0)
-                width_pixels = meters_to_pixels(width_meters, zoom) if width_meters > 0 else 1
-                
-                bx1, by1 = max(0, min(255, f_min_x >> 4)), max(0, min(255, f_min_y >> 4))
-                bx2, by2 = max(0, min(255, f_max_x >> 4)), max(0, min(255, f_max_y >> 4))
-
-                # Feature Header
-                f.write(struct.pack('<B', feature['geom_type']))
-                f.write(struct.pack('<H', feature['color_rgb565']))
-                f.write(struct.pack('<B', feature['zoom_priority']))
-                f.write(struct.pack('<B', width_pixels))
-                f.write(struct.pack('<BBBB', bx1, by1, bx2, by2))
-                f.write(struct.pack('<H', total_points))
-                f.write(b'\x00')
-
-                # Points for all rings
-                for ring in projected_rings:
-                    for px, py in ring:
-                        f.write(struct.pack('<hh', px, py))
-
-                if is_polygon:
-                    # Write ring ends
-                    f.write(struct.pack('<B', len(projected_rings)))
-                    current_end = 0
-                    for ring in projected_rings:
-                        current_end += len(ring)
-                        f.write(struct.pack('<H', current_end))
-
-                written_features += 1
-
-        f.seek(4)
-        f.write(struct.pack('<H', written_features))
-
-    return True
 
 
 def convert_pbf_to_nav(input_pbf: str, output_dir: str, config_file: str,
@@ -752,18 +65,60 @@ def convert_pbf_to_nav(input_pbf: str, output_dir: str, config_file: str,
 
     start_time = time.time()
 
+    # First pass: scan for boundary relations (fast, no locations needed)
+    logger.info("Pass 1: Scanning boundary relations...")
+    scanner = BoundaryScanner(config, zoom_range[1])
+    scanner.apply_file(input_pbf)
+    logger.info(f"  Boundary ways found: {len(scanner.boundary_ways):,}")
+
+    # Second pass: extract all features (including multipolygon relations)
     handler = OSMHandler(config, zoom_range)
-    logger.info("Processing OSM data...")
-    handler.apply_file(input_pbf, locations=True, idx='flex_mem')
+    handler.boundary_ways = scanner.boundary_ways
+
+    area_manager = osmium.area.AreaManager()
+
+    # AreaManager requires TWO passes:
+    logger.info("Pass 2a: Scanning multipolygon relations...")
+    osmium.apply(input_pbf, area_manager.first_pass_handler())
+
+    logger.info("Pass 2b: Building areas and extracting features...")
+    idx = osmium.index.create_map('flex_mem')
+    nlw = osmium.NodeLocationsForWays(idx)
+    nlw.apply_nodes_to_ways = True
+    # Chain handlers: nlw -> handler (nodes/ways) -> area_manager.second_pass (areas)
+    osmium.apply(input_pbf, nlw, handler, area_manager.second_pass_handler(handler))
     print()
 
     elapsed = time.time() - start_time
     logger.info(f"Processing completed in {elapsed:.2f}s")
     logger.info(f"Statistics:")
+    logger.info(f"  Nodes (peaks): {handler.stats['nodes_processed'] - handler.stats['text_labels']:,}")
+    logger.info(f"  Text labels (places): {handler.stats['text_labels']:,}")
     logger.info(f"  Ways processed: {handler.stats['ways_processed']:,}")
     logger.info(f"  Areas processed: {handler.stats['areas_processed']:,}")
+    logger.info(f"  Boundary ways extracted: {handler.stats['boundary_ways_extracted']:,}")
     logger.info(f"  Features extracted: {handler.stats['features_extracted']:,}")
     logger.info(f"  Features filtered: {handler.stats['features_filtered']:,}")
+    logger.info(f"  Area filter breakdown:")
+    logger.info(f"    - Boundary admin: {handler.stats['area_boundary']:,}")
+    logger.info(f"    - Not in config: {handler.stats['area_no_config']:,}")
+    logger.info(f"    - No layer mapping: {handler.stats['area_no_layer']:,}")
+    logger.info(f"    - Zoom filtered: {handler.stats['area_zoom_filtered']:,}")
+    logger.info(f"    - Exceptions: {handler.stats['area_exception']:,}")
+
+    logger.info("Calculating bounding box from ALL features...")
+    min_lon, max_lon = 180.0, -180.0
+    min_lat, max_lat = 90.0, -90.0
+    feature_count = 0
+    for feature in handler.features:
+        feature_count += 1
+        for lon, lat in feature['coords']:
+            min_lon = min(min_lon, lon)
+            max_lon = max(max_lon, lon)
+            min_lat = min(min_lat, lat)
+            max_lat = max(max_lat, lat)
+    logger.info(f"  BBox from {feature_count:,} features")
+    logger.info(f"  BBox: lon=[{min_lon:.4f}, {max_lon:.4f}], lat=[{min_lat:.4f}, {max_lat:.4f}]")
 
     logger.info("Generating NAV tile files...")
 
@@ -771,54 +126,273 @@ def convert_pbf_to_nav(input_pbf: str, output_dir: str, config_file: str,
     total_size = 0
 
     for zoom in range(zoom_range[0], zoom_range[1] + 1):
-        tile_features: Dict[Tuple[int, int], List[Dict]] = defaultdict(list)
+        tile_features = defaultdict(list)
         tolerance = get_simplify_tolerance(zoom)
+
+        # Phase 1: Prepare and filter features for this zoom level
+        zoom_start = time.time()
+        prepared_count = 0
+        total_to_process = len(handler.features)
+
+        # Collect text labels for collision detection
+        text_candidates = []
 
         for feature in handler.features:
             min_zoom = feature['zoom_priority'] >> 4
             if min_zoom > zoom:
                 continue
 
-            # Simplify once per zoom level
+            # Filter secondary roads without ref at z9 (keep only numbered departmental roads)
+            if zoom == 9 and feature.get('highway_type') == 'secondary' and not feature.get('has_ref'):
+                continue
+
+            # NOTE: Simplification moved AFTER clipping to avoid inter-tile gaps
             coords = feature['coords']
-            if len(coords) > 2:
-                coords = simplify_coords(coords, tolerance)
-            
-            # Create a shallow copy with simplified coords for this zoom
-            zoom_feature = feature.copy()
-            zoom_feature['coords'] = coords
 
-            is_polygon = zoom_feature['geom_type'] == GEOM_POLYGON
-            tiles = get_feature_tiles(zoom_feature['coords'], zoom, is_polygon)
+            if not coords:
+                continue
 
-            for tile in tiles:
-                tile_features[tile].append(zoom_feature)
+            # Convert point features to symbol polygons
+            if feature['geom_type'] == GEOM_POINT:
+                lon, lat = coords[0]
+                tile_width_deg = 360.0 / (2.0 ** zoom)
+                pixel_deg = tile_width_deg / 256.0
+                size = pixel_deg * 3  # 3 pixel radius
 
-        if not tile_features:
+                shape = feature.get('shape', 'circle')
+                # Correct for Mercator distortion
+                lat_size = size / math.cos(math.radians(lat))
+
+                if shape == 'triangle':
+                    # Equilateral triangle: height = size * sqrt(3)/2 ≈ size * 0.866
+                    h = lat_size * 0.866
+                    sym_coords = [
+                        (lon, lat + h * 0.667),             # top (1/3 above center)
+                        (lon - size, lat - h * 0.333),      # bottom-left
+                        (lon + size, lat - h * 0.333),      # bottom-right
+                        (lon, lat + h * 0.667),
+                    ]
+                else:  # square dot (2x2 pixels)
+                    s = pixel_deg  # 1 pixel
+                    ls = s / math.cos(math.radians(lat))
+                    sym_coords = [
+                        (lon - s, lat + ls),
+                        (lon + s, lat + ls),
+                        (lon + s, lat - ls),
+                        (lon - s, lat - ls),
+                        (lon - s, lat + ls),
+                    ]
+
+                zoom_feature = {
+                    'geom_type': GEOM_POLYGON,
+                    'coords': sym_coords,
+                    'color_rgb565': feature['color_rgb565'],
+                    'zoom_priority': feature['zoom_priority'],
+                    'width_meters': 0.0
+                }
+            elif feature['geom_type'] == GEOM_TEXT:
+                zoom_feature = {
+                    'geom_type': GEOM_TEXT,
+                    'coords': coords,
+                    'color_rgb565': feature['color_rgb565'],
+                    'zoom_priority': feature['zoom_priority'],
+                    'font_size': feature.get('font_size', 0),
+                    'text': feature['text'],
+                }
+            else:
+                # Create a lightweight record for this zoom
+                color_rgb565 = feature['color_rgb565']
+                # Override color per zoom if defined
+                hw_type = feature.get('highway_type', '')
+                if hw_type and hw_type in LINE_COLOR_PER_ZOOM:
+                    color_override = LINE_COLOR_PER_ZOOM[hw_type].get(zoom)
+                    if color_override:
+                        color_rgb565 = hex_to_rgb565(color_override)
+
+                zoom_feature = {
+                    'geom_type': feature['geom_type'],
+                    'coords': coords,
+                    'color_rgb565': color_rgb565,
+                    'zoom_priority': feature['zoom_priority'],
+                    'width_meters': feature.get('width_meters', 0.0),
+                    'width_pixels': feature.get('width_pixels', 0),
+                    'highway_type': hw_type,
+                    'inner_rings': feature.get('inner_rings', []),
+                    'layer': feature.get('layer', ''),  # Preserve layer for water detection
+                    'is_bridge': feature.get('is_bridge', False),  # Preserve for casing
+                    'is_building': feature.get('is_building', False),  # Preserve for outline
+                    'name': feature.get('name', ''),  # Preserve name for debugging
+                    'id': feature.get('id', 0),  # Preserve OSM ID for debugging
+                }
+
+            # Text labels: collect for collision detection
+            if zoom_feature['geom_type'] == GEOM_TEXT:
+                text_candidates.append(zoom_feature)
+            else:
+                is_polygon = zoom_feature['geom_type'] == GEOM_POLYGON
+                tiles = get_feature_tiles(zoom_feature['coords'], zoom, is_polygon)
+
+                for tile in tiles:
+                    tile_features[tile].append(zoom_feature)
+
+            prepared_count += 1
+            if prepared_count % 25000 == 0:
+                print(f"\r  Zoom {zoom:2d}: Preparing features... {prepared_count:,} / {total_to_process:,}", end='', flush=True)
+
+        # Phase 1b: Text label collision detection
+        # PRIORITY: Place names (fixed) > Road labels (moveable)
+        if text_candidates:
+            tile_width_deg = 360.0 / (2.0 ** zoom)
+            pixel_deg = tile_width_deg / 256.0
+            char_w = pixel_deg * 7  # half-width per char in degrees (1.75x for actual render size)
+            label_h = pixel_deg * 11  # half-height in degrees (1.375x for actual render size)
+
+            # Separate place names from road labels
+            place_names = [f for f in text_candidates if 'coords_candidates' not in f]
+            road_labels = [f for f in text_candidates if 'coords_candidates' in f]
+
+            # STEP 1: Place names - sorted by population, place if no visual overlap
+            # Population hierarchy: highest population wins in case of label collision
+            place_names.sort(key=lambda f: -f.get('population', 0))
+
+            placed_boxes = []
+            places_placed = 0
+            places_dropped_overlap = 0
+
+            for pf in place_names:
+                text_len = len(pf['text'])
+                half_w = char_w * text_len / 2
+                half_h = label_h
+                lon, lat = pf['coords'][0]
+                box = (lon - half_w, lat - half_h, lon + half_w, lat + half_h)
+
+                # Check for visual overlap with already placed labels
+                overlap = False
+                for pb in placed_boxes:
+                    if (box[0] < pb[2] and box[2] > pb[0] and
+                        box[1] < pb[3] and box[3] > pb[1]):
+                        overlap = True
+                        break
+
+                if not overlap:
+                    # No visual collision - place this label
+                    placed_boxes.append(box)
+                    places_placed += 1
+
+                    # Distribute to tiles
+                    tiles = get_feature_tiles(pf['coords'], zoom, False)
+                    expanded = set()
+                    for (tx, ty) in tiles:
+                        for dx in range(-1, 2):
+                            for dy in range(-1, 2):
+                                expanded.add((tx + dx, ty + dy))
+                    for tile in expanded:
+                        tile_features[tile].append(pf)
+                else:
+                    # Label overlaps with higher-population city - drop
+                    places_dropped_overlap += 1
+
+            # STEP 2: Road labels - try candidate positions, avoid place names
+            roads_placed = 0
+            roads_dropped = 0
+
+            for rf in road_labels:
+                text_len = len(rf['text'])
+                half_w = char_w * text_len / 2
+                half_h = label_h
+
+                # Try 3 candidate positions along the road
+                candidates_to_try = rf.get('coords_candidates', [rf['coords'][0]])
+                placed = False
+
+                for candidate_pos in candidates_to_try:
+                    lon, lat = candidate_pos
+                    box = (lon - half_w, lat - half_h, lon + half_w, lat + half_h)
+
+                    # Check overlap with ALL placed labels (places + roads)
+                    overlap = False
+                    for pb in placed_boxes:
+                        if (box[0] < pb[2] and box[2] > pb[0] and
+                            box[1] < pb[3] and box[3] > pb[1]):
+                            overlap = True
+                            break
+
+                    if not overlap:
+                        # Found position without collision
+                        rf['coords'] = [(lon, lat)]
+                        placed_boxes.append(box)
+                        roads_placed += 1
+                        placed = True
+
+                        # Distribute to tiles
+                        tiles = get_feature_tiles(rf['coords'], zoom, False)
+                        expanded = set()
+                        for (tx, ty) in tiles:
+                            for dx in range(-1, 2):
+                                for dy in range(-1, 2):
+                                    expanded.add((tx + dx, ty + dy))
+                        for tile in expanded:
+                            tile_features[tile].append(rf)
+                        break
+
+                if not placed:
+                    roads_dropped += 1
+
+            if places_dropped_overlap > 0 or roads_dropped > 0:
+                print(f"\r  Zoom {zoom:2d}: Labels: {places_placed} places, {roads_placed} roads, {places_dropped_overlap} places dropped (overlap), {roads_dropped} roads dropped")
+
+        # Phase 2: Calculate tile grid from global bbox and write all tiles
+        min_tx = lon_to_tile_x(min_lon, zoom)
+        max_tx = lon_to_tile_x(max_lon, zoom)
+        min_ty = lat_to_tile_y(max_lat, zoom)  # lat is inverted for Y
+        max_ty = lat_to_tile_y(min_lat, zoom)
+
+        num_tiles = (max_tx - min_tx + 1) * (max_ty - min_ty + 1)
+        if num_tiles <= 0:
+            print(f"\r  Zoom {zoom:2d}: No tiles to generate for this area.")
             continue
 
-        num_tiles = len(tile_features)
         tiles_written = 0
-        tile_items = list(tile_features.items())
+        print() # New line after preparation phase
 
-        for i, ((x, y), features) in enumerate(tile_items):
-            progress = (i + 1) / num_tiles
-            bar_width = 30
-            filled = int(bar_width * progress)
-            bar = '█' * filled + '░' * (bar_width - filled)
-            print(f"\r  Zoom {zoom:2d}: [{bar}] {i+1}/{num_tiles} tiles", end='', flush=True)
+        num_workers = min(4, num_tiles)  # Limit to 4 workers to avoid OOM on complex tiles
+        tile_jobs = []
+        for y in range(min_ty, max_ty + 1):
+            for x in range(min_tx, max_tx + 1):
+                features = tile_features.get((x, y), [])
+                if not features:
+                    continue
+                tile_dir = os.path.join(output_dir, str(zoom), str(x))
+                tile_path = os.path.join(tile_dir, f"{y}.nav")
+                features.sort(key=lambda f: f['zoom_priority'] & 0x0F)
+                tile_jobs.append((features, tile_path, zoom, x, y, tolerance))
 
-            tile_dir = os.path.join(output_dir, str(zoom), str(x))
-            tile_path = os.path.join(tile_dir, f"{y}.nav")
+        completed = 0
+        with ProcessPoolExecutor(max_workers=num_workers) as executor:
+            futures = {executor.submit(write_nav_tile, *job): job for job in tile_jobs}
+            for future in as_completed(futures):
+                completed += 1
+                progress = completed / num_tiles
+                bar_width = 25
+                filled = int(bar_width * progress)
+                bar = '\u2588' * filled + '\u2591' * (bar_width - filled)
+                print(f"\r  Zoom {zoom:2d}: Tiles [{bar}] {completed}/{num_tiles}", end='', flush=True)
 
-            # Pre-sort by priority (low nibble) for streaming render on ESP32
-            features.sort(key=lambda f: f['zoom_priority'] & 0x0F)
+                result = future.result()
+                if result:
+                    tiles_written += 1
+                    tile_path = futures[future][1]
+                    try:
+                        total_size += os.path.getsize(tile_path)
+                    except OSError:
+                        pass
 
-            if write_nav_tile(features, tile_path, zoom, x, y):
-                tiles_written += 1
-                total_size += os.path.getsize(tile_path)
+        # Clear memory before next zoom level
+        tile_features.clear()
+        tile_jobs.clear()
 
-        print(f"\r  Zoom {zoom:2d}: {tiles_written} tiles written" + " " * 30)
+        zoom_elapsed = time.time() - zoom_start
+        print(f"\r  Zoom {zoom:2d}: {tiles_written} tiles written. ({zoom_elapsed:.1f}s)" + " " * 20)
         total_tiles += tiles_written
 
     total_time = time.time() - start_time
@@ -863,8 +437,13 @@ NAV Format - IceNav Navigation Tiles:
     parser.add_argument('config_file', help='Features configuration JSON file')
     parser.add_argument('--zoom', default='6-17',
                         help='Zoom level range (e.g., "6-17" or "12")')
+    parser.add_argument('-v', '--verbose', action='store_true',
+                        help='Verbose logging (show per-tile filtering stats)')
 
     args = parser.parse_args()
+
+    if args.verbose:
+        logger.setLevel(logging.DEBUG)
 
     if not os.path.exists(args.input_pbf):
         logger.error(f"Input file not found: {args.input_pbf}")
