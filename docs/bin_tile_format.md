@@ -1,153 +1,108 @@
-# NAV Tile Format Specification
+# NAV-PACK Format Specification (v1)
 
-This document describes the optimized NAV binary format. The format is specifically designed for ultra-fast vector map rendering on ESP32 embedded systems by using pre-projected, compact relative coordinates and hardware-friendly data alignment.
+This document describes the **NAV-PACK** container format, a high-performance binary storage system for vector map tiles designed specifically for the IceNav ESP32 navigator. 
 
----
-
-## File Overview
-
-Each file represents a single tile for a given zoom level (`z`), x coordinate (`x`), and y coordinate (`y`).  
-The directory structure follows the standard XYZ tile scheme:  
-```
-{output_dir}/{z}/{x}/{y}.nav
-```
-
-The format uses **tile-relative coordinates** (mapped to a 0-4096 range) with a pre-applied Mercator projection.
+NAV-PACK eliminates the overhead of traditional file systems on SD cards by consolidating millions of tiles into single files per zoom level, optimized for 20MHz SPI access and sub-millisecond lookups.
 
 ---
 
-## File Structure
+## 1. Storage Architecture
 
-The file is a single binary blob consisting of a global header followed by sequential feature records.
+Map data is organized into consolidated binary files, one for each zoom level:  
+`Z{zoom}.nav` (e.g., `Z14.nav`, `Z17.nav`).
 
-### 1. Tile Header (22 bytes)
+Each Pack file consists of a **Global Header**, a **Fixed-Size Index Table**, and the **Tile Data Block**.
+
+---
+
+## 2. File Structure
+
+### 2.1. Global Pack Header (9 bytes)
+
+The header identifies the file and provides basic metadata.
+
+| Offset | Field          | Type      | Size  | Value / Description                       |
+|--------|----------------|-----------|--------|-------------------------------------------|
+| 0      | magic          | bytes[4]  | 4      | "NPK1" (Nav Pack version 1)               |
+| 4      | zoom           | uint8     | 1      | The zoom level of all tiles in this pack |
+| 5      | tile_count     | uint32    | 4      | Total number of tiles in the pack (LE)   |
+
+### 2.2. Index Table (tile_count * 16 bytes)
+
+The Index Table allows the renderer to find the exact byte offset of any tile in $O(\log N)$ time using binary search. Entries are **sorted by Y then X coordinate** (Row-Major) to optimize spatial locality and scroll performance.
 
 | Offset | Field          | Type      | Size  | Description                               |
 |--------|----------------|-----------|--------|-------------------------------------------|
-| 0      | magic          | bytes[4]  | 4      | Format identifier ("NAV1")               |
-| 4      | feature_count  | uint16    | 2      | Number of features in the tile (LE)      |
+| 0      | tileX          | uint32    | 4      | Tile X coordinate (LE)                   |
+| 4      | tileY          | uint32    | 4      | Tile Y coordinate (LE)                   |
+| 8      | offset         | uint32    | 4      | Absolute byte offset of the tile data    |
+| 12     | size           | uint32    | 4      | Size of the tile data in bytes           |
+
+---
+
+## 3. Internal Tile Format (NAV1)
+
+Each entry in the Data Block starting at `offset` contains a single tile with the following structure:
+
+### 3.1. Tile Header (22 bytes)
+
+| Offset | Field          | Type      | Size  | Description                               |
+|--------|----------------|-----------|--------|-------------------------------------------|
+| 0      | magic          | bytes[4]  | 4      | "NAV1" (Internal tile identifier)        |
+| 4      | feature_count  | uint16    | 2      | Number of features in the tile           |
 | 6      | min_lon        | int32     | 4      | Tile min longitude (scaled 1e7)           |
 | 10     | min_lat        | int32     | 4      | Tile min latitude (scaled 1e7)            |
 | 14     | max_lon        | int32     | 4      | Tile max longitude (scaled 1e7)           |
 | 18     | max_lat        | int32     | 4      | Tile max latitude (scaled 1e7)            |
 
-### 2. Feature Records (Sequential)
+### 3.2. Feature Records
 
-Each feature consists of a **13-byte header**, followed by coordinate data, and optional ring information for polygons.
-
-#### Feature Header (13 bytes)
-
-| Offset | Field            | Type   | Size | Description                                  |
-|--------|------------------|--------|-------|----------------------------------------------|
-| 0      | geom_type        | uint8  | 1     | 1=Point, 2=LineString, 3=Polygon             |
-| 1      | color_rgb565     | uint16 | 2     | RGB565 color (Little-Endian)                 |
-| 3      | zoom_priority    | uint8  | 1     | High nibble: min_zoom, Low nibble: priority  |
-| 4      | width_pixels     | uint8  | 1     | Rendered line width in pixels (1-15)         |
-| 5      | bbox             | uint8[4]| 4     | Object BBox [x1, y1, x2, y2] normalized 0-255|
-| 9      | coord_count      | uint16 | 2     | Total number of points (across all rings)    |
-| 11     | payload_size     | uint16 | 2     | Size of coordinates + ring data in bytes     |
-
-#### Coordinate Data
-
-Follows the header immediately. Coordinates are stored using **Delta Encoding** with **VarInt** and **ZigZag** compression.
-
-- **Delta Encoding**: Each point $(x_n, y_n)$ is stored as a difference from the previous point: $dx = x_n - x_{n-1}$, $dy = y_n - y_{n-1}$. The first point of each feature uses $(0,0)$ as the reference.
-- **ZigZag**: Signed integers (deltas) are mapped to unsigned integers ($0 \to 0, -1 \to 1, 1 \to 2, -2 \to 3 \dots$).
-- **VarInt**: Unsigned integers are stored using a variable number of bytes (7 bits per byte + 1 continuation bit).
-
-| Field            | Type   | Size | Description                                  |
-|------------------|--------|-------|----------------------------------------------|
-| coordinates[]    | VarInt[]| Variable | Pairs of (dx, dy) encoded as VarInts        |
-
-#### Polygon Ring Information (Polygons Only)
-
-Only present if `geom_type == 3`. Located at the end of the coordinate data block (within the `payload_size`).
-
-| Field          | Type   | Size | Description                    |
-|----------------|--------|-------|--------------------------------|
-| ring_count     | uint16 | 2     | Total number of rings (exterior + holes) |
-| ring_ends[]    | uint16 | 2×R   | Cumulative end index for each ring |
+Features are stored sequentially. Each feature has a **13-byte header** followed by compressed coordinates.
 
 ---
 
-## Coordinate System
+## 4. Coordinate System & Compression
 
-### Tile-Relative Projection
-NAV stores coordinates already projected using the Web Mercator projection. Values are mapped to a 12-bit space (0-4096) relative to the tile's top-left corner.
-
-- **Range**: The standard tile extent is 0-4096. To ensure seamless rendering across tiles, features are clipped with a **20% safety margin**, allowing coordinates to range from approximately -820 to 4916.
-- **Precision**: 1 unit = 1/16th of a pixel (assuming a 256px tile).
-- **Complexity**: While the format supports up to 65535 points per feature, the standard v0.4.0 generator limits features to **2000 points** to ensure stability on ESP32 hardware.
+- **Projection**: Web Mercator coordinates mapped to a 12-bit tile-relative space (0-4096).
+- **Safety Margin**: 20% clipping margin (approx. -820 to 4916) ensures seamless connections between tiles.
+- **Encoding**: **Delta VarInt/ZigZag**. Each point is stored as a difference from the previous one. Accumulators are reset to (0,0) at the start of each feature and each polygon ring.
 
 ---
 
-## Rendering Rules
+## 5. Implementation Example (C++)
 
-### Line Width Logic
-The generator uses a **Manual Width Scaling** approach. Line widths are strictly defined in `features.json` via the `widths` table for each zoom level, ensuring precise visual control on small embedded screens.
-
-### Delta Reset Logic
-- **Linestrings**: The delta accumulator (lastX, lastY) is reset to (0,0) at the start of each feature.
-- **Polygons**: The delta accumulator is reset to (0,0) at the start of the feature **and at the start of every interior ring (hole)**. This ensures that errors don't propagate between separate geometric rings.
-
----
-
-## Implementation Example (C++)
-
-### 1. Decoding Helpers
+The following code demonstrates how to perform an efficient binary search to find a tile offset without loading the entire index into RAM.
 
 ```cpp
-int32_t zigzag_decode(uint32_t n) {
-    return (n >> 1) ^ -(int32_t)(n & 1);
-}
+struct IndexEntry {
+    uint32_t x, y, offset, size;
+};
 
-uint32_t read_varint(uint8_t** ptr) {
-    uint32_t result = 0;
-    int shift = 0;
-    while (true) {
-        uint8_t byte = **ptr;
-        (*ptr)++;
-        result |= (byte & 0x7F) << shift;
-        if (!(byte & 0x80)) return result;
-        shift += 7;
+// Returns offset and size of tile (x, y) from an open Pack file
+bool findTile(FILE* f, uint32_t x, uint32_t y, uint32_t& out_offset, uint32_t& out_size) {
+    uint32_t tileCount;
+    fseek(f, 5, SEEK_SET);
+    fread(&tileCount, 4, 1, f);
+
+    int low = 0, high = tileCount - 1;
+    while (low <= high) {
+        int mid = low + (high - low) / 2;
+        IndexEntry entry;
+        fseek(f, 9 + (mid * 16), SEEK_SET);
+        fread(&entry, 16, 1, f);
+
+        if (entry.x == x && entry.y == y) {
+            out_offset = entry.offset;
+            out_size = entry.size;
+            return true;
+        }
+        // Row-Major sort: Y is primary, X is secondary
+        if (entry.y < y || (entry.y == y && entry.x < x)) {
+            low = mid + 1;
+        } else {
+            high = mid - 1;
+        }
     }
+    return false;
 }
-```
-
-### 2. Rendering Loop
-
-```cpp
-NavFeatureHeader feat;
-file.read(&feat, sizeof(feat));
-
-// Fast BBox Culling
-if (!viewport.intersects(feat.bbox)) {
-    file.seek(feat.payload_size, SEEK_CUR); // Fast skip
-    continue;
-}
-
-// Read payload into buffer
-uint8_t* buffer = (uint8_t*)malloc(feat.payload_size);
-file.read(buffer, feat.payload_size);
-uint8_t* ptr = buffer;
-
-int32_t last_x = 0, last_y = 0;
-Point pts[feat.coord_count];
-
-for (int j = 0; j < feat.coord_count; j++) {
-    last_x += zigzag_decode(read_varint(&ptr));
-    last_y += zigzag_decode(read_varint(&ptr));
-    
-    pts[j].x = (last_x * screen_tile_size) >> 12;
-    pts[j].y = (last_y * screen_tile_size) >> 12;
-}
-
-// Render...
-if (feat.geom_type == 3) {
-    uint16_t ring_count = *((uint16_t*)ptr); ptr += 2;
-    uint16_t* ring_ends = (uint16_t*)ptr;
-    fillPolygon(pts, ring_count, ring_ends, feat.color);
-}
-
-free(buffer);
 ```
