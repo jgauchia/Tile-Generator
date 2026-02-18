@@ -501,9 +501,9 @@ def write_nav_tile(features: List[Dict], output_path: str, zoom: int, tile_x: in
                 needs_casing = priority_nibble in (13, 14) or feature.get('is_bridge', False)
 
                 # Encode width/flags byte (fp[4]):
-                # Lines: bits 0-6 = width in pixels, bit 7 = hasCasing
+                # Lines: bits 0-6 = width in half-pixels (firmware divides by 2.0f)
                 # Polygons: bit 7 = hasOutline (buildings)
-                width_byte = min(width_pixels, 127)  # Clamp to 7 bits
+                width_byte = min(width_pixels, 127)  # Clamp to 7 bits (0-63.5px range)
                 if is_polygon:
                     width_byte = 0
                     if feature.get('is_building', False):

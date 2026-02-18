@@ -59,6 +59,13 @@ def lat_to_tile_y(lat: float, zoom: int) -> int:
     return int((1.0 - math.asinh(math.tan(lat_rad)) / math.pi) / 2.0 * params['n'])
 
 
+def tile_y_to_lat(ty: int, zoom: int) -> float:
+    """Convert tile Y coordinate to latitude (north edge of tile)."""
+    n = 2.0 ** zoom
+    lat_rad = math.atan(math.sinh(math.pi * (1.0 - 2.0 * ty / n)))
+    return math.degrees(lat_rad)
+
+
 def get_feature_tiles(coords: List[Tuple[float, float]], zoom: int, is_polygon: bool = False) -> Set[Tuple[int, int]]:
     """Get all tiles that a feature intersects at given zoom level."""
     tiles = set()
