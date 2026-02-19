@@ -1,67 +1,57 @@
 # IceNav Tile-Generator
 
-High-performance C++ toolset for generating custom binary map tiles (NAV format) from OpenStreetMap PBF files. Designed specifically for the [IceNav](https://github.com/jgauchia/IceNav-v3) ESP32-based GPS navigator.
+Industrial-grade C++ toolset for generating optimized vector map tiles from OpenStreetMap PBF files. Specifically designed for the [IceNav](https://github.com/jgauchia/IceNav-v3) ESP32-based GPS navigator.
 
-## Key Components
+## Features
 
-- **NAV Generator (C++)**: An industrial-grade engine that converts OSM PBF files into optimized binary tiles. Features multi-core processing, GEOS-based geometry merging/clipping, and hardware-aware simplification.
-- **Tile Viewer (Python)**: A Pygame-based desktop application to preview and validate the generated NAV tiles on a PC.
-- **features.json**: Centralized configuration for styling, zoom levels, and rendering priorities.
-
-## Technologies Used
-
-- **C++17**: Core generator implementation.
-- **libosmium**: Fast OSM PBF parsing.
-- **GEOS**: Robust geometry operations (merging, clipping, simplification).
-- **nlohmann-json**: Configuration management.
-- **Python 3.8+ & Pygame**: PC tile viewer.
+- **High-Performance C++ Engine**: Optimized OSM PBF parsing and tile generation using GEOS and Osmium.
+- **Packed Binary Containers**: Tiles are consolidated into single `Zxx.nav` files per zoom level, eliminating SD card file system overhead and cluster waste.
+- **Memory Optimized**: Uses POSIX `mmap` for feature storage, allowing country-scale processing with a low RAM footprint (~1GB for Catalonia).
+- **Professional Aesthetics**:
+    - **Multi-Level Boundaries**: Advanced two-pass extraction of international, regional, and municipal borders.
+    - **Smart Filtering**: Automatic removal of tunnels and subway lines for superior urban map clarity.
+    - **Dynamic Styles**: Total control over line widths and layer-based priorities via `features.json`.
+- **ESP32 Ready**: Produces hardware-friendly data using VarInt/ZigZag delta encoding.
+- **PC Simulator**: Pygame-based viewer with instant offset-based loading for rapid map validation.
 
 ---
 
 ## Getting Started
 
 ### 1. Requirements
-
-Install the necessary development libraries (Ubuntu/Debian example):
+Install the necessary libraries (Ubuntu/Debian):
 ```bash
 sudo apt-get install libosmium2-dev libgeos-dev nlohmann-json3-dev libgdal-dev libboost-dev
 ```
-For detailed requirements, see [DEPENDENCIES.md](DEPENDENCIES.md).
 
 ### 2. Building the Generator
-
 ```bash
 mkdir build && cd build
 cmake ..
 make -j$(nproc)
 ```
 
-### 3. Generating Tiles
-
+### 3. Generating Maps
+Generates packed containers in the output directory:
 ```bash
 ./nav_generator <input.pbf> <output_dir> features.json [--zoom 6-17]
 ```
 
-### 4. Viewing Tiles (PC)
-
-Install Python dependencies:
+### 4. Viewing Maps (PC)
 ```bash
-pip install pygame
-```
-Run the viewer:
-```bash
-python tile_viewer.py <nav_dir> --lat <latitude> --lon <longitude> [--zoom <level>]
+python tile_viewer.py <output_dir> --lat <latitude> --lon <longitude> [--zoom <level>]
 ```
 
 ---
 
-## Development Standards
+## Technical Standards
 
-- **Binary Format**: The NAV format uses Delta Encoding with VarInt/ZigZag compression for maximum SD card efficiency.
-- **Simplification**: 2000 points per feature limit to ensure stability on ESP32 streaming renderers.
-- **Styling**: Absolute priority given to the `widths` table in `features.json` for precise visual control.
+- **Binary Format**: NPK1 (Container) + NAV1 (Tile) using Delta Encoding.
+- **Precision**: 12-bit tile-relative coordinate space (0-4096).
+- **Safety**: 2000 points per feature limit for ESP32 stability.
+- **Style**: Manual Width Scaling and Layer-based priority system.
 
-For more details on the binary spec, see [docs/bin_tile_format.md](docs/bin_tile_format.md).
+For detailed specifications, see the `docs/` directory.
 
 ---
 
