@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-NAV Tile Viewer - ESP32 Map Simulator (NAV-PACK Version)
+NAV Tile Viewer - ESP32 Map Simulator (Packed Containers Version)
 
-Displays map tiles from consolidated Zxx.nav pack files.
+Displays map tiles from consolidated Zxx.nav packed files.
 Simulates the ESP32 rendering pipeline with offset-based lookup.
 
 Usage:
@@ -354,7 +354,7 @@ def main():
     viewer.set_center(args.lat, args.lon, args.zoom)
     pygame.init()
     screen = pygame.display.set_mode((WINDOW_WIDTH, WINDOW_HEIGHT))
-    pygame.display.set_caption(f"NAV-PACK Viewer - {os.path.basename(args.nav_dir)}")
+    pygame.display.set_caption(f"Packed Tiles Viewer - {os.path.basename(args.nav_dir)}")
     font_small = pygame.font.SysFont(None, 14)
     clock = pygame.time.Clock()
     viewport_surface = pygame.Surface((VIEWPORT_SIZE, VIEWPORT_SIZE))
@@ -422,7 +422,7 @@ def main():
                     line_y += 14
             else: screen.blit(font_small.render("  (Right-click to select)", True, (100, 100, 100)), (VIEWPORT_SIZE + 10, feature_y + 18))
             pygame.draw.rect(screen, (30, 30, 30), (0, VIEWPORT_SIZE, WINDOW_WIDTH, STATUSBAR_HEIGHT))
-            screen.blit(font_small.render("NAV-PACK Format - Optimized ESP32 Maps", True, (200, 200, 200)), (10, VIEWPORT_SIZE + 10))
+            screen.blit(font_small.render("Packed Format - Optimized ESP32 Maps", True, (200, 200, 200)), (10, VIEWPORT_SIZE + 10))
             if viewer.packs: screen.blit(font_small.render(f"Available Zooms: {min(viewer.packs.keys())}-{max(viewer.packs.keys())}", True, (150, 150, 150)), (10, VIEWPORT_SIZE + 30))
             pygame.display.flip()
             need_redraw = False

@@ -1,6 +1,30 @@
 {
   "_comment": "OSM-style colors in RGB565 format. Priority: layer_base + (priority / 7) clamped to 15.",
-  "_layers": "landuse:10, terrain:20, water:30, amenities:35, railways:40, roads:50, infrastructure:60, buildings:70, places:90",
+  "_layers": "landuse:10, boundaries:20, terrain:25, water:30, railways:35, amenities:38, roads:50, infrastructure:60, buildings:70, places:90",
+  "admin_level=2": {
+    "zoom": 6,
+    "color": "#ac46ac",
+    "priority": 14,
+    "widths": {
+      "6": 2
+    }
+  },
+  "admin_level=4": {
+    "zoom": 8,
+    "color": "#ac46ac",
+    "priority": 10,
+    "widths": {
+      "8": 1
+    }
+  },
+  "admin_level=6": {
+    "zoom": 10,
+    "color": "#c070c0",
+    "priority": 7,
+    "widths": {
+      "10": 1
+    }
+  },
   "natural=coastline": {
     "zoom": 6,
     "color": "#aad3df",
@@ -611,5 +635,21 @@
     "zoom": 15,
     "color": "#aacbaf",
     "priority": 0
+  },
+  "admin_level=7": {
+    "zoom": 10,
+    "color": "#c0b0c0",
+    "priority": 7,
+    "widths": {
+      "10": 1
+    }
+  },
+  "admin_level=8": {
+    "zoom": 13,
+    "color": "#e0c0e0",
+    "priority": 14,
+    "widths": {
+      "13": 1
+    }
   }
 }

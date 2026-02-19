@@ -30,35 +30,33 @@ namespace nav {
 class OSMHandler : public osmium::handler::Handler
 {
 public:
-    /**
-     * @brief Constructor
-     * @param cfg Style configuration manager.
-     * @param st Reference to the memory-mapped storage.
-     * @param min_z Global minimum zoom level.
-     * @param max_z Global maximum zoom level.
-     */
     OSMHandler(const ConfigManager& cfg, MappedStore& st, int min_z, int max_z) 
         : config(cfg), store(st), min_zoom_range(min_z), max_zoom_range(max_z) {}
 
-    /** @brief Callback for OSM Nodes (currently only counts them) */
     void node(const osmium::Node&)
     {
         stats_nodes++;
     }
 
-    /**
-     * @brief Callback for OSM Ways. Extracts linear features and simple polygons.
-     * @param w The OSM way to process.
-     */
     void way(const osmium::Way& w)
     {
         stats_ways++;
         std::unordered_map<std::string, std::string> tags;
-        bool interesting = false;
+        bool is_boundary = false;
+        int boundary_level = 0;
+        if (way_to_boundary.count(w.id()))
+        {
+            boundary_level = way_to_boundary.at(w.id());
+            tags["admin_level"] = std::to_string(boundary_level);
+            is_boundary = true;
+        }
+        bool interesting = is_boundary;
         for (const auto& t : w.tags())
         {
+            if (std::string(t.key()) == "boundary")
+                continue;
             tags[t.key()] = t.value();
-            if (config.is_interesting(t.key(), t.value()))
+            if (!interesting && config.is_interesting(t.key(), t.value()))
                 interesting = true;
         }
         if (!interesting)
@@ -66,13 +64,38 @@ public:
             stats_filtered++;
             return;
         }
-        std::string layer = get_layer(tags);
+        if (!is_boundary)
+        {
+            if (tags.count("tunnel") && tags.at("tunnel") == "yes")
+            {
+                stats_filtered++;
+                return;
+            }
+            if (tags.count("railway") && tags.at("railway") == "subway")
+            {
+                stats_filtered++;
+                return;
+            }
+        }
+        std::string layer;
+        if (is_boundary)
+            layer = (boundary_level >= 8) ? "places" : "boundaries";
+        else
+            layer = get_layer(tags);
         if (layer.empty())
         {
             stats_filtered++;
             return;
         }
-        FeatureConfig f_cfg = config.get_config(tags);
+        FeatureConfig f_cfg;
+        if (is_boundary)
+        {
+            std::unordered_map<std::string, std::string> b_tags;
+            b_tags["admin_level"] = tags["admin_level"];
+            f_cfg = config.get_config(b_tags);
+        }
+        else
+            f_cfg = config.get_config(tags);
         Feature feat;
         feat.id = w.id();
         feat.color_rgb565 = f_cfg.color_rgb565;
@@ -98,7 +121,7 @@ public:
         bool is_area = is_closed && (has_area_tag || (tags.count("area") && tags.at("area") == "yes"));
         int layer_base = get_layer_priority(layer);
         int combined_priority;
-        if (is_area && !tags.count("highway") && !tags.count("place"))
+        if (is_area && !tags.count("highway") && !tags.count("place") && layer != "boundaries" && layer != "places")
         {
             feat.geom_type = GEOM_POLYGON;
             feat.width_meters = 0;
@@ -121,10 +144,6 @@ public:
         features_by_zoom[f_cfg.min_zoom].push_back(store.append(feat));
     }
 
-    /**
-     * @brief Callback for OSM Areas. Handles complex multipolygons.
-     * @param a The OSM area to process.
-     */
     void area(const osmium::Area& a)
     {
         stats_areas++;
@@ -138,10 +157,10 @@ public:
             if (config.is_interesting(t.key(), t.value()))
                 interesting = true;
         }
-        if (!interesting || tags.count("highway") || tags.count("place"))
+        if (!interesting || tags.count("highway") || tags.count("place") || tags.count("boundary"))
             return;
         std::string layer = get_layer(tags);
-        if (layer.empty())
+        if (layer.empty() || layer == "boundaries")
             return;
         FeatureConfig f_cfg = config.get_config(tags);
         int layer_base = get_layer_priority(layer);
@@ -176,6 +195,7 @@ public:
 
     std::vector<size_t> features_by_zoom[18];
     std::unordered_set<int64_t> processed_areas;
+    std::unordered_map<osmium::unsigned_object_id_type, uint8_t> way_to_boundary;
     size_t stats_nodes = 0;
     size_t stats_ways = 0;
     size_t stats_areas = 0;
@@ -215,10 +235,12 @@ private:
             return 20;
         if (layer == "water")
             return 30;
-        if (layer == "amenities")
+        if (layer == "boundaries")
             return 35;
         if (layer == "railways")
             return 40;
+        if (layer == "amenities")
+            return 42;
         if (layer == "roads")
             return 50;
         if (layer == "infrastructure")

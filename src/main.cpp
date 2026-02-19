@@ -1,7 +1,7 @@
 /**
  * @file main.cpp
  * @author Jordi Gauchía (jgauchia @jgauchia.com)
- * @brief Entry point for the NAV Tile Generator C++ implementation with NAV-PACK support.
+ * @brief Entry point for the NAV Tile Generator C++ implementation with packed container support.
  * @version 0.4.0
  * @date 2026-02
  */
@@ -29,15 +29,11 @@
 using index_type = osmium::index::map::FlexMem<osmium::unsigned_object_id_type, osmium::Location>;
 using location_handler_type = osmium::handler::NodeLocationsForWays<index_type>;
 
-/** @brief Prints the command line usage information. */
 void print_usage()
 {
     std::cout << "Usage: nav_generator <input.pbf> <output_dir> <features.json> [--zoom min-max]" << std::endl;
 }
 
-/**
- * @brief Main application entry point. 
- */
 int main(int argc, char* argv[])
 {
     if (argc < 4)
@@ -75,7 +71,7 @@ int main(int argc, char* argv[])
     std::cout << "Processing PBF file: " << input_pbf << " (" 
               << std::fixed << std::setprecision(1) << (std::filesystem::file_size(input_pbf) / 1024.0 / 1024.0) << " MB)" << std::endl;
     std::cout << "Zoom range: " << min_zoom << "-" << max_zoom << std::endl;
-    std::cout << "Output format: NAV-PACK binary containers (Zxx.nav)" << std::endl;
+    std::cout << "Output format: packed binary containers (Zxx.nav)" << std::endl;
     try
     {
         std::error_code ec;
@@ -87,6 +83,34 @@ int main(int argc, char* argv[])
         std::cerr << "Error preparing output directory: " << e.what() << std::endl;
         return 1;
     }
+    class BoundaryScanner : public osmium::handler::Handler
+    {
+    public:
+        BoundaryScanner(std::unordered_map<osmium::unsigned_object_id_type, uint8_t>& w2b) : way_to_boundary(w2b) {}
+        void relation(const osmium::Relation& rel)
+        {
+            const char* boundary = rel.tags().get_value_by_key("boundary");
+            if (boundary && std::string(boundary) == "administrative")
+            {
+                const char* level_str = rel.tags().get_value_by_key("admin_level");
+                int level = level_str ? std::atoi(level_str) : 10;
+                if (level <= 8)
+                {
+                    for (const auto& member : rel.members())
+                    {
+                        if (member.type() == osmium::item_type::way)
+                        {
+                            auto it = way_to_boundary.find(member.ref());
+                            if (it == way_to_boundary.end() || level < it->second)
+                                way_to_boundary[member.ref()] = (uint8_t)level;
+                        }
+                    }
+                }
+            }
+        }
+    private:
+        std::unordered_map<osmium::unsigned_object_id_type, uint8_t>& way_to_boundary;
+    };
     std::cout << "Processing OSM data..." << std::endl;
     auto start_time = std::chrono::steady_clock::now();
     try
@@ -97,8 +121,9 @@ int main(int argc, char* argv[])
         nav::OSMHandler osm_handler{config, store, min_zoom, max_zoom};
         std::cout << "  Pass 1: Scanning relations..." << std::endl;
         osmium::area::MultipolygonManager<osmium::area::Assembler> mp_manager{osmium::area::Assembler::config_type{}};
+        BoundaryScanner boundary_scanner(osm_handler.way_to_boundary);
         osmium::io::Reader reader1{input_pbf, osmium::osm_entity_bits::relation};
-        osmium::apply(reader1, mp_manager);
+        osmium::apply(reader1, mp_manager, boundary_scanner);
         reader1.close();
         std::cout << "  Preparing relations..." << std::endl;
         mp_manager.prepare_for_lookup();
@@ -119,7 +144,7 @@ int main(int argc, char* argv[])
             total_features += osm_handler.features_by_zoom[i].size();
         std::cout << "  Features extracted: " << total_features << std::endl;
         std::cout << "  Features filtered:  " << osm_handler.stats_filtered << std::endl;
-        std::cout << "Generating NAV-PACK files..." << std::endl;
+        std::cout << "Generating packed binary containers..." << std::endl;
         nav::TileProcessor processor{output_dir};
         processor.process_all(osm_handler.features_by_zoom, store, min_zoom, max_zoom);
         auto end_all = std::chrono::steady_clock::now();
@@ -131,7 +156,7 @@ int main(int argc, char* argv[])
         std::cout << std::string(50, '=') << std::endl;
         std::cout << "Input:            " << input_pbf << std::endl;
         std::cout << "Output directory: " << output_dir << std::endl;
-        std::cout << "Format:           NAV-PACK binary containers (Zxx.nav)" << std::endl;
+        std::cout << "Format:           packed binary containers (Zxx.nav)" << std::endl;
         std::cout << "Total packs:      " << file_count << std::endl;
         std::cout << "Total size:       " << std::fixed << std::setprecision(2) << (total_bytes / 1024.0 / 1024.0) << " MB" << std::endl;
         int total_sec = static_cast<int>(total_elapsed.count());
@@ -139,8 +164,10 @@ int main(int argc, char* argv[])
         int m = (total_sec % 3600) / 60;
         int s = total_sec % 60;
         std::cout << "Total time:       ";
-        if (h > 0) std::cout << h << "h ";
-        if (m > 0 || h > 0) std::cout << m << "m ";
+        if (h > 0)
+            std::cout << h << "h ";
+        if (m > 0 || h > 0)
+            std::cout << m << "m ";
         std::cout << s << "s" << std::endl;
         std::cout << std::string(50, '=') << std::endl;
     }

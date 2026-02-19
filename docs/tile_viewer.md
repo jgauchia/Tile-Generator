@@ -1,10 +1,10 @@
-# NAV Tile Viewer - ESP32 Map Simulator (NAV-PACK Version)
+# NAV Tile Viewer - ESP32 Map Simulator (Packed Containers Version)
 
-`tile_viewer.py` is a specialized simulator for the **NAV-PACK** binary format. It is designed to preview and debug consolidated vector map data before deployment to the IceNav ESP32 navigator. It displays a 768x768 viewport using the same offset-based lookup and coordinate math as the hardware.
+`tile_viewer.py` is a specialized simulator for the **packed binary format**. It is designed to preview and debug consolidated vector map data before deployment to the IceNav ESP32 navigator. It displays a 768x768 viewport using the same offset-based lookup and coordinate math as the hardware.
 
 ## Features
 
-- **NAV-PACK Support**: Directly reads consolidated `Zxx.nav` files, parsing their index tables for instant tile access.
+- **Packed Container Support**: Directly reads consolidated `Zxx.nav` files, parsing their index tables for instant tile access.
 - **ESP32 Rendering Simulation**: Mirrors the bit-shift pixel calculation and tile-relative coordinate space used in the ESP32 firmware.
 - **Adaptive Tile Loading**: Loads tiles surrounding the current position to ensure the 768x768 viewport is always fully covered.
 - **Feature Identification**: Right-click any object to see its type, color, zoom level, and pre-calculated BBox.
