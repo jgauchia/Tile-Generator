@@ -33,9 +33,9 @@ The file is a single binary blob consisting of a global header followed by seque
 
 ### 2. Feature Records (Sequential)
 
-Each feature consists of a **13-byte header**, followed by coordinate data, and optional ring information for polygons.
+Each feature consists of a **12-byte aligned header**, followed by coordinate data, and optional ring information for polygons.
 
-#### Feature Header (13 bytes)
+#### Feature Header (12 bytes)
 
 | Offset | Field            | Type   | Size | Description                                  |
 |--------|------------------|--------|-------|----------------------------------------------|
@@ -45,23 +45,19 @@ Each feature consists of a **13-byte header**, followed by coordinate data, and 
 | 4      | width_pixels     | uint8  | 1     | Rendered line width in pixels (1-15)         |
 | 5      | bbox             | uint8[4]| 4     | Object BBox [x1, y1, x2, y2] normalized 0-255|
 | 9      | coord_count      | uint16 | 2     | Total number of points (across all rings)    |
-| 11     | payload_size     | uint16 | 2     | Size of coordinates + ring data in bytes     |
+| 11     | padding          | uint8  | 1     | Alignment padding (always 0x00)              |
 
 #### Coordinate Data
 
-Follows the header immediately. Coordinates are stored using **Delta Encoding** with **VarInt** and **ZigZag** compression.
-
-- **Delta Encoding**: Each point $(x_n, y_n)$ is stored as a difference from the previous point: $dx = x_n - x_{n-1}$, $dy = y_n - y_{n-1}$. The first point of each feature uses $(0,0)$ as the reference.
-- **ZigZag**: Signed integers (deltas) are mapped to unsigned integers ($0 \to 0, -1 \to 1, 1 \to 2, -2 \to 3 \dots$).
-- **VarInt**: Unsigned integers are stored using a variable number of bytes (7 bits per byte + 1 continuation bit).
+Follows the header immediately. Each point is a pair of signed 16-bit integers.
 
 | Field            | Type   | Size | Description                                  |
 |------------------|--------|-------|----------------------------------------------|
-| coordinates[]    | VarInt[]| Variable | Pairs of (dx, dy) encoded as VarInts        |
+| coordinates[]    | int16[]| 4×N   | x, y pairs relative to tile origin (0-4096)  |
 
 #### Polygon Ring Information (Polygons Only)
 
-Only present if `geom_type == 3`. Located at the end of the coordinate data block (within the `payload_size`).
+Only present if `geom_type == 3`. Follows the coordinate data.
 
 | Field          | Type   | Size | Description                    |
 |----------------|--------|-------|--------------------------------|
@@ -77,6 +73,7 @@ NAV stores coordinates already projected using the Web Mercator projection. Valu
 
 - **Range**: The standard tile extent is 0-4096. To ensure seamless rendering across tiles, features are clipped with a **10% safety margin**, allowing coordinates to range from approximately -410 to 4506.
 - **Precision**: 1 unit = 1/16th of a pixel (assuming a 256px tile).
+- **Format**: Signed `int16`.
 
 ### ESP32 Rendering Math
 Conversion to screen pixels is extremely efficient:
@@ -89,86 +86,109 @@ pixel_y = (nav_y * screen_tile_size) >> 12;
 
 ## Optimizations
 
-### Payload-Based Culling
-The `payload_size` field in the header allows the renderer to skip the entire coordinate block with a single `seek()` operation if the feature's `bbox` is outside the current viewport. This significantly improves performance when navigating through dense areas.
-
-### Delta VarInt Compression
-By storing differences instead of absolute coordinates, most values fit into a single byte. This reduces file size by **30-50%** compared to fixed 16-bit coordinates, leading to faster SD card reads.
-
 ### BBox Culling
-The 4-byte `bbox` field stores normalized extents (`tile_coord >> 4`). The renderer can reconstruct the pixel bounds (`bbox[i] << 4`) and skip features before reading any payload data.
+The 4-byte `bbox` field stores normalized extents (`tile_coord >> 4`). The renderer can reconstruct the pixel bounds (`bbox[i] << 4`) and skip features that do not intersect the current viewport before reading any coordinate data.
 
-### Geometry Clipping & Simplification
-All features are clipped and simplified during generation, reducing the workload for the ESP32.
+### Geometry Clipping
+All features are clipped using `shapely` during generation. This reduces the number of points processed by the ESP32 and ensures that only relevant geometry is loaded from the SD card.
+
+### Minimum Area Filter
+Polygons whose bounding box area is smaller than 4 pixels squared at the target zoom level are discarded. This significantly reduces file size and visual noise in dense areas.
+
+### Data Alignment
+The 12-byte feature header ensures efficient memory access and simplified struct mapping in C/C++ environments.
 
 ---
 
 ## Color & Priority Encoding
 
 ### RGB565
-Colors are stored in the native 16-bit format used by most ESP32 displays (`RRRRRGGGGGGBBBBB`).
+Colors are stored in the native 16-bit format used by most ESP32 displays (`RRRRRGGGGGGBBBBB`), allowing direct buffer injection.
 
 ### Zoom Priority
-Packed into a single byte: `min_zoom` (4 bits) + `priority` (4 bits).
+Packed into a single byte:
+- `min_zoom`: `zoom_priority >> 4` (High 4 bits).
+- `priority`: `zoom_priority & 0x0F` (Low 4 bits). 
+Features are pre-sorted by this priority during generation to ensure correct draw order.
 
 ---
 
 ## Implementation Example (C++)
 
-### 1. Decoding Helpers
+### 1. Data Structures
+
+The 12-byte aligned header allows direct mapping to C structs:
 
 ```cpp
-int32_t zigzag_decode(uint32_t n) {
-    return (n >> 1) ^ -(int32_t)(n & 1);
-}
+#pragma pack(push, 1)
+struct NavTileHeader {
+    char magic[4];          // "NAV1"
+    uint16_t feature_count; // Little-Endian
+    int32_t min_lon;        // scaled 1e7
+    int32_t min_lat;
+    int32_t max_lon;
+    int32_t max_lat;
+};
 
-uint32_t read_varint(uint8_t** ptr) {
-    uint32_t result = 0;
-    int shift = 0;
-    while (true) {
-        uint8_t byte = **ptr;
-        (*ptr)++;
-        result |= (byte & 0x7F) << shift;
-        if (!(byte & 0x80)) return result;
-        shift += 7;
-    }
-}
+struct NavFeatureHeader {
+    uint8_t geom_type;      // 1=Point, 2=LineString, 3=Polygon
+    uint16_t color_rgb565;  // Little-Endian
+    uint8_t zoom_priority;  // High: min_zoom, Low: priority
+    uint8_t width_pixels;   // 1-15
+    uint8_t bbox[4];        // [x1, y1, x2, y2] normalized 0-255
+    uint16_t coord_count;   // Total points
+    uint8_t padding;        // Always 0x00
+};
+#pragma pack(pop)
 ```
 
-### 2. Rendering Loop
+### 2. Rendering Pseudo-code
 
 ```cpp
-NavFeatureHeader feat;
-file.read(&feat, sizeof(feat));
+// 1. Read Tile Header
+NavTileHeader tile;
+file.read(&tile, sizeof(tile));
 
-// Fast BBox Culling
-if (!viewport.intersects(feat.bbox)) {
-    file.seek(feat.payload_size, SEEK_CUR); // Fast skip
-    continue;
+// 2. Iterate Features
+for (int i = 0; i < tile.feature_count; i++) {
+    NavFeatureHeader feat;
+    file.read(&feat, sizeof(feat));
+
+    // Fast BBox Culling
+    // Reconstruct tile coords (0-4096) from normalized bbox (0-255)
+    Rect object_rect = { feat.bbox[0] << 4, feat.bbox[1] << 4, 
+                         feat.bbox[2] << 4, feat.bbox[3] << 4 };
+                         
+    if (!viewport.intersects(object_rect)) {
+        file.seek(feat.coord_count * 4, SEEK_CUR); // Skip points
+        if (feat.geom_type == 3) {
+            uint16_t rings;
+            file.read(&rings, 2); // Read ring count (uint16)
+            file.seek(rings * 2, SEEK_CUR); // Skip ring ends
+        }
+        continue;
+    }
+
+    // Read and Project Coordinates
+    Point pts[feat.coord_count];
+    for (int j = 0; j < feat.coord_count; j++) {
+        int16_t nx, ny;
+        file.read(&nx, 2); file.read(&ny, 2);
+        // Zero-CPU projection using bit-shifts
+        pts[j].x = (nx * screen_tile_size) >> 12;
+        pts[j].y = (ny * screen_tile_size) >> 12;
+    }
+
+    // Render Geometry
+    if (feat.geom_type == 2) {
+        drawLines(pts, feat.coord_count, feat.width_pixels, feat.color_rgb565);
+    } 
+    else if (feat.geom_type == 3) {
+        uint16_t ring_count;
+        file.read(&ring_count, 2);
+        uint16_t ring_ends[ring_count];
+        file.read(ring_ends, ring_count * 2);
+        fillPolygon(pts, ring_count, ring_ends, feat.color_rgb565);
+    }
 }
-
-// Read payload into buffer
-uint8_t* buffer = (uint8_t*)malloc(feat.payload_size);
-file.read(buffer, feat.payload_size);
-uint8_t* ptr = buffer;
-
-int32_t last_x = 0, last_y = 0;
-Point pts[feat.coord_count];
-
-for (int j = 0; j < feat.coord_count; j++) {
-    last_x += zigzag_decode(read_varint(&ptr));
-    last_y += zigzag_decode(read_varint(&ptr));
-    
-    pts[j].x = (last_x * screen_tile_size) >> 12;
-    pts[j].y = (last_y * screen_tile_size) >> 12;
-}
-
-// Render...
-if (feat.geom_type == 3) {
-    uint16_t ring_count = *((uint16_t*)ptr); ptr += 2;
-    uint16_t* ring_ends = (uint16_t*)ptr;
-    fillPolygon(pts, ring_count, ring_ends, feat.color);
-}
-
-free(buffer);
 ```
