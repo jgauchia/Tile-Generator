@@ -2,7 +2,7 @@
  * @file main.cpp
  * @author Jordi Gauchía (jgauchia @jgauchia.com)
  * @brief Entry point for the NAV Tile Generator C++ implementation with packed container support.
- * @version 0.4.0
+ * @version 0.5.0
  * @date 2026-02
  */
 
@@ -68,7 +68,7 @@ int main(int argc, char* argv[])
         std::cerr << "Error: Could not load config file " << config_file << std::endl;
         return 1;
     }
-    std::cout << "Processing PBF file: " << input_pbf << " (" 
+    std::cout << "Processing PBF file: " << input_pbf << " ("
               << std::fixed << std::setprecision(1) << (std::filesystem::file_size(input_pbf) / 1024.0 / 1024.0) << " MB)" << std::endl;
     std::cout << "Zoom range: " << min_zoom << "-" << max_zoom << std::endl;
     std::cout << "Output format: packed binary containers (Zxx.nav)" << std::endl;
@@ -144,9 +144,14 @@ int main(int argc, char* argv[])
             total_features += osm_handler.features_by_zoom[i].size();
         std::cout << "  Features extracted: " << total_features << std::endl;
         std::cout << "  Features filtered:  " << osm_handler.stats_filtered << std::endl;
+        std::cout << "  Point features:     " << osm_handler.stats_points << std::endl;
+        std::cout << "  Text labels:        " << osm_handler.stats_text_labels << std::endl;
+
         std::cout << "Generating packed binary containers..." << std::endl;
         nav::TileProcessor processor{output_dir};
-        processor.process_all(osm_handler.features_by_zoom, store, min_zoom, max_zoom);
+        processor.process_all(osm_handler.features_by_zoom, store, min_zoom, max_zoom,
+                              osm_handler.text_features_vec, osm_handler.point_features);
+
         auto end_all = std::chrono::steady_clock::now();
         std::chrono::duration<double> total_elapsed = end_all - start_time;
         uint64_t total_bytes = processor.get_total_bytes();
