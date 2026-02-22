@@ -806,7 +806,6 @@ private:
         // Merged groups (landcover + buildings only, like Python)
         for (auto& [style, geos_polys] : poly_groups)
         {
-            size_t before = geos_polys.size();
             GEOSGeometry* coll = GEOSGeom_createCollection_r(local_handle, GEOS_GEOMETRYCOLLECTION, geos_polys.data(), (uint32_t)geos_polys.size());
             GEOSGeometry* merged = GEOSUnaryUnion_r(local_handle, coll);
             GEOSGeometry* final_geom = nullptr;
@@ -818,7 +817,11 @@ private:
                 if (to_clip != merged) GEOSGeom_destroy_r(local_handle, to_clip);
                 if (clipped)
                 {
-                    if (!GEOSisValid_r(local_handle, clipped)) { final_geom = GEOSMakeValid_r(local_handle, clipped); GEOSGeom_destroy_r(local_handle, clipped); }
+                    if (!GEOSisValid_r(local_handle, clipped))
+                    {
+                        final_geom = GEOSMakeValid_r(local_handle, clipped);
+                        GEOSGeom_destroy_r(local_handle, clipped);
+                    }
                     else final_geom = clipped;
                 }
                 GEOSGeom_destroy_r(local_handle, merged);

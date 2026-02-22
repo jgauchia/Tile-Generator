@@ -5,6 +5,8 @@ Industrial-grade C++ toolset for generating optimized vector map tiles from Open
 ## Features
 
 - **High-Performance C++ Engine**: Optimized OSM PBF parsing and tile generation using GEOS and Osmium.
+- **Noise Reduction (Culling)**: Automatically discards features too small for the zoom level (e.g., < 16px² or < 2px). Administrative boundaries are protected for full context.
+- **Dynamic Simplification**: Uses zoom-dependent Douglas-Peucker tolerance for smooth curves at high zooms and efficient storage at low zooms.
 - **Packed Binary Containers**: Tiles are consolidated into single `Zxx.nav` files per zoom level, eliminating SD card file system overhead and cluster waste.
 - **Memory Optimized**: Uses POSIX `mmap` for feature storage, allowing country-scale processing with a low RAM footprint (~1GB for Catalonia).
 - **Professional Aesthetics**:
