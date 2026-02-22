@@ -2,7 +2,7 @@
  * @file mapped_store.hpp
  * @author Jordi Gauchía (jgauchia @jgauchia.com)
  * @brief High-performance POSIX memory-mapped storage for map features.
- * @version 0.4.0
+ * @version 0.5.0
  * @date 2026-02
  */
 
@@ -20,21 +20,9 @@
 
 namespace nav {
 
-/**
- * @class MappedStore
- * @brief Manages a file-backed memory region for storing large amounts of geometric data.
- * 
- * This class uses Linux mmap() to map a file directly into the process address space.
- * It allows storing millions of features without exhausting the physical RAM.
- */
 class MappedStore
 {
 public:
-    /**
-     * @brief Constructor.
-     * @param filename Path to the temporary backing file.
-     * @param initial_capacity Initial size of the mapped region in bytes (default 256MB).
-     */
     MappedStore(const std::string& filename, size_t initial_capacity = 256 * 1024 * 1024)
         : file_path(filename), capacity(initial_capacity), current_offset(0)
     {
@@ -55,7 +43,6 @@ public:
         }
     }
 
-    /** @brief Destructor. Cleans up mapping and removes the temporary file. */
     ~MappedStore()
     {
         if (mapped_ptr && mapped_ptr != MAP_FAILED) munmap(mapped_ptr, capacity);
@@ -63,44 +50,39 @@ public:
         if (std::filesystem::exists(file_path)) std::filesystem::remove(file_path);
     }
 
-    /**
-     * @brief Appends a feature to the mapped storage.
-     * @param f The feature to serialize and store.
-     * @return Offset to the stored feature.
-     */
     size_t append(const Feature& f)
     {
-        // Calculate required size for serialization
         size_t pts_size = f.points.size() * sizeof(Point);
         size_t ends_size = f.ring_ends.size() * sizeof(uint32_t);
         size_t widths_size = f.zoom_widths.size() * (sizeof(int) + sizeof(uint8_t));
-        
-        // Header + Points + RingEnds + NumWidths + WidthsData
+
         size_t total_size = sizeof(int64_t) + 4 + 4 + 4 + pts_size + ends_size + sizeof(size_t) + widths_size;
+        // Extra fields: highway_type, layer, is_bridge, is_building, ref, name
+        total_size += sizeof(uint16_t) + f.highway_type.size();
+        total_size += sizeof(uint16_t) + f.layer.size();
+        total_size += sizeof(uint16_t) + f.ref.size();
+        total_size += sizeof(uint16_t) + f.name.size();
+        total_size += 2; // is_bridge + is_building
 
         if (current_offset + total_size > capacity) grow();
 
         uint8_t* p = mapped_ptr + current_offset;
         size_t start_offset = current_offset;
 
-        // Serialize fixed-size metadata
         memcpy(p, &f.id, sizeof(int64_t)); p += sizeof(int64_t);
         *p++ = f.geom_type;
         memcpy(p, &f.color_rgb565, 2); p += 2;
         *p++ = f.zoom_priority;
         memcpy(p, &f.width_meters, 4); p += 4;
 
-        // Serialize counts
         uint32_t n_pts = (uint32_t)f.points.size();
         uint32_t n_rings = (uint32_t)f.ring_ends.size();
         memcpy(p, &n_pts, 4); p += 4;
         memcpy(p, &n_rings, 4); p += 4;
 
-        // Serialize variable-size data
         if (pts_size > 0) { memcpy(p, f.points.data(), pts_size); p += pts_size; }
         if (ends_size > 0) { memcpy(p, f.ring_ends.data(), ends_size); p += ends_size; }
 
-        // Serialize dynamic widths map
         size_t n_widths = f.zoom_widths.size();
         memcpy(p, &n_widths, sizeof(size_t)); p += sizeof(size_t);
         for (auto const& [z, w] : f.zoom_widths)
@@ -109,15 +91,18 @@ public:
             *p++ = w;
         }
 
+        // Extended fields
+        p = write_string(p, f.highway_type);
+        p = write_string(p, f.layer);
+        p = write_string(p, f.ref);
+        p = write_string(p, f.name);
+        *p++ = f.is_bridge ? 1 : 0;
+        *p++ = f.is_building ? 1 : 0;
+
         current_offset = p - mapped_ptr;
         return start_offset;
     }
 
-    /**
-     * @brief Deserializes a feature from a given offset.
-     * @param offset The offset where the feature starts.
-     * @return A reconstructed Feature object.
-     */
     Feature get(size_t offset) const
     {
         Feature f;
@@ -157,21 +142,42 @@ public:
             f.zoom_widths[z] = w;
         }
 
+        // Extended fields
+        p = read_string(p, f.highway_type);
+        p = read_string(p, f.layer);
+        p = read_string(p, f.ref);
+        p = read_string(p, f.name);
+        f.is_bridge = (*p++ != 0);
+        f.is_building = (*p++ != 0);
+
         return f;
     }
 
 private:
-    /** @brief Doubles the size of the mapped file when capacity is reached. */
+    uint8_t* write_string(uint8_t* p, const std::string& s)
+    {
+        uint16_t len = (uint16_t)s.size();
+        memcpy(p, &len, 2); p += 2;
+        if (len > 0) { memcpy(p, s.data(), len); p += len; }
+        return p;
+    }
+
+    const uint8_t* read_string(const uint8_t* p, std::string& s) const
+    {
+        uint16_t len;
+        memcpy(&len, p, 2); p += 2;
+        if (len > 0) { s.assign((const char*)p, len); p += len; }
+        else s.clear();
+        return p;
+    }
+
     void grow()
     {
         size_t new_capacity = capacity * 2;
         if (munmap(mapped_ptr, capacity) == -1) throw std::runtime_error("munmap failed during grow");
-        
         if (ftruncate(fd, new_capacity) == -1) throw std::runtime_error("ftruncate failed during grow");
-
         mapped_ptr = (uint8_t*)mmap(nullptr, new_capacity, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
         if (mapped_ptr == MAP_FAILED) throw std::runtime_error("mmap failed during grow");
-
         capacity = new_capacity;
     }
 
