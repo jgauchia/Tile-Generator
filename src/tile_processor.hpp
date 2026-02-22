@@ -441,7 +441,6 @@ private:
                 for (auto const& [w_zoom, w_pixels] : pf.zoom_widths)
                     if (z >= w_zoom) final_width = w_pixels;
             }
-            else if (pf.width > 0) final_width = utils::meters_to_pixels(pf.width, z);
             if (final_width == 0) final_width = 1;
             if (final_width > 15) final_width = 15;
             std::vector<uint8_t> payload; int16_t minx = 4096, maxx = 0, miny = 4096, maxy = 0; size_t pts = 0;
