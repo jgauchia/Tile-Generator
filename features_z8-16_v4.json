@@ -1,0 +1,744 @@
+{
+  "_nibble_doc": "priority = z-order nibble 0-15. 1:aeroways 2:landuse/terrain 4:leisure/amenity 5:pitch/surface/parking 6:infrastructure 7:buildings 8:water 9-14:roads 15:rail/bridges",
+  "landuse=forest": {
+    "zoom": 8,
+    "color": "#add19e",
+    "priority": 2
+  },
+  "natural=grassland": {
+    "zoom": 9,
+    "color": "#ceecb1",
+    "priority": 5
+  },
+  "natural=heath": {
+    "zoom": 10,
+    "color": "#d6d9a0",
+    "priority": 2
+  },
+  "natural=scrub": {
+    "zoom": 10,
+    "color": "#c9d7ac",
+    "priority": 2
+  },
+  "natural=shrubbery": {
+    "zoom": 10,
+    "color": "#c9d7ac",
+    "priority": 2
+  },
+  "natural=wood": {
+    "zoom": 8,
+    "color": "#add19e",
+    "priority": 2
+  },
+  "natural=forest": {
+    "zoom": 8,
+    "color": "#add19e",
+    "priority": 2
+  },
+  "landuse=farmland": {
+    "zoom": 9,
+    "color": "#eef0d6",
+    "priority": 2
+  },
+  "landuse=grass": {
+    "zoom": 9,
+    "color": "#ceecb1",
+    "priority": 5
+  },
+  "landuse=meadow": {
+    "zoom": 10,
+    "color": "#ceecb1",
+    "priority": 5
+  },
+  "landuse=cemetery": {
+    "zoom": 11,
+    "color": "#aacbaf",
+    "priority": 4
+  },
+  "landuse=commercial": {
+    "zoom": 10,
+    "color": "#f2dad9",
+    "priority": 3
+  },
+  "landuse=garages": {
+    "zoom": 12,
+    "color": "#dfddce",
+    "priority": 2
+  },
+  "landuse=industrial": {
+    "zoom": 10,
+    "color": "#ebdbe8",
+    "priority": 2
+  },
+  "landuse=residential": {
+    "zoom": 8,
+    "color": "#e1e0e0",
+    "priority": 2
+  },
+  "landuse=quarry": {
+    "zoom": 10,
+    "color": "#d4d4d4",
+    "priority": 2
+  },
+  "landuse=military": {
+    "zoom": 10,
+    "color": "#f5bfbf",
+    "priority": 2
+  },
+  "landuse=landfill": {
+    "zoom": 11,
+    "color": "#b6b592",
+    "priority": 2
+  },
+  "landuse=reservoir": {
+    "zoom": 8,
+    "color": "#aad2df",
+    "priority": 8
+  },
+  "place=suburb": {
+    "zoom": 12,
+    "color": "#666666",
+    "priority": 12
+  },
+  "landuse=retail": {
+    "zoom": 10,
+    "color": "#ffd6d1",
+    "priority": 3
+  },
+  "landuse=allotments": {
+    "zoom": 10,
+    "color": "#cae2c1",
+    "priority": 2
+  },
+  "landuse=basin": {
+    "zoom": 11,
+    "color": "#e0e0e0",
+    "priority": 2
+  },
+  "landuse=brownfield": {
+    "zoom": 10,
+    "color": "#c7c7b4",
+    "priority": 2
+  },
+  "landuse=construction": {
+    "zoom": 10,
+    "color": "#c7c7b4",
+    "priority": 2
+  },
+  "landuse=education": {
+    "zoom": 10,
+    "color": "#ffffe5",
+    "priority": 2
+  },
+  "landuse=farmyard": {
+    "zoom": 12,
+    "color": "#f5dcba",
+    "priority": 2
+  },
+  "landuse=flowerbed": {
+    "zoom": 10,
+    "color": "#ceecb1",
+    "priority": 2
+  },
+  "landuse=orchard": {
+    "zoom": 10,
+    "color": "#afdfa4",
+    "priority": 2
+  },
+  "landuse=railway": {
+    "zoom": 11,
+    "color": "#ebdbe8",
+    "priority": 2
+  },
+  "landuse=recreation_ground": {
+    "zoom": 12,
+    "color": "#d6ffda",
+    "priority": 2
+  },
+  "landuse=village_green": {
+    "zoom": 10,
+    "color": "#ceecb1",
+    "priority": 2
+  },
+  "landuse=vineyard": {
+    "zoom": 11,
+    "color": "#afdfa4",
+    "priority": 2
+  },
+  "leisure=common": {
+    "zoom": 12,
+    "color": "#d6ffda",
+    "priority": 4
+  },
+  "leisure=garden": {
+    "zoom": 13,
+    "color": "#ceecb1",
+    "priority": 4
+  },
+  "leisure=golf_course": {
+    "zoom": 11,
+    "color": "#ceecb1",
+    "priority": 4
+  },
+  "leisure=nature_reserve": {
+    "zoom": 12,
+    "color": "#c7facb",
+    "priority": 4
+  },
+  "leisure=pitch": {
+    "zoom": 13,
+    "color": "#a9e0cb",
+    "priority": 5
+  },
+  "surface=grass": {
+    "zoom": 13,
+    "color": "#ceecb1",
+    "priority": 5
+  },
+  "surface=sand": {
+    "zoom": 13,
+    "color": "#f5e9c7",
+    "priority": 5
+  },
+  "leisure=playground": {
+    "zoom": 12,
+    "color": "#d6ffda",
+    "priority": 4
+  },
+  "leisure=recreation_ground": {
+    "zoom": 12,
+    "color": "#d6ffda",
+    "priority": 4
+  },
+  "leisure=sports_centre": {
+    "zoom": 12,
+    "color": "#d6ffda",
+    "priority": 4
+  },
+  "leisure=sports_hall": {
+    "zoom": 12,
+    "color": "#d6ffda",
+    "priority": 4
+  },
+  "leisure=stadium": {
+    "zoom": 11,
+    "color": "#d6ffda",
+    "priority": 4
+  },
+  "leisure=swimming_pool": {
+    "zoom": 14,
+    "color": "#aad2df",
+    "priority": 4
+  },
+  "leisure=track": {
+    "zoom": 12,
+    "color": "#a9e0cb",
+    "priority": 6
+  },
+  "natural=beach": {
+    "zoom": 10,
+    "color": "#fff1b8",
+    "priority": 2
+  },
+  "natural=sand": {
+    "zoom": 12,
+    "color": "#f5e9c7",
+    "priority": 2
+  },
+  "landuse=park": {
+    "zoom": 12,
+    "color": "#c7facb",
+    "priority": 4
+  },
+  "leisure=park": {
+    "zoom": 12,
+    "color": "#c7facb",
+    "priority": 4
+  },
+  "amenity=parking": {
+    "zoom": 13,
+    "color": "#e1e0e0",
+    "priority": 5
+  },
+  "place=island": {
+    "zoom": 8,
+    "color": "#f2efe9",
+    "priority": 2
+  },
+  "place=islet": {
+    "zoom": 12,
+    "color": "#f2efe9",
+    "priority": 2
+  },
+  "place=isolated_dwelling": {
+    "zoom": 14,
+    "color": "#e0dfdf",
+    "priority": 12
+  },
+  "place=locality": {
+    "zoom": 13,
+    "color": "#f2efe9",
+    "priority": 12
+  },
+  "place=neighbourhood": {
+    "zoom": 13,
+    "color": "#e0dfdf",
+    "priority": 12
+  },
+  "place=quarter": {
+    "zoom": 13,
+    "color": "#e0dfdf",
+    "priority": 12
+  },
+  "place=farm": {
+    "zoom": 14,
+    "color": "#f5dcba",
+    "priority": 12
+  },
+  "natural=bare_rock": {
+    "zoom": 8,
+    "color": "#eee6dd",
+    "priority": 2
+  },
+  "natural=peak": {
+    "zoom": 12,
+    "color": "#d08050",
+    "priority": 2
+  },
+  "natural=rock": {
+    "zoom": 8,
+    "color": "#eee6dd",
+    "priority": 2
+  },
+  "natural=scree": {
+    "zoom": 8,
+    "color": "#eee6dd",
+    "priority": 2
+  },
+  "natural=cliff": {
+    "zoom": 11,
+    "color": "#999999",
+    "priority": 2
+  },
+  "natural=arete": {
+    "zoom": 9,
+    "color": "#d0d0d0",
+    "priority": 2
+  },
+  "natural=earth_bank": {
+    "zoom": 9,
+    "color": "#c0c0c0",
+    "priority": 2
+  },
+  "natural=fell": {
+    "zoom": 8,
+    "color": "#d6d99f",
+    "priority": 2
+  },
+  "natural=ridge": {
+    "zoom": 10,
+    "color": "#d0d0d0",
+    "priority": 2
+  },
+  "natural=shingle": {
+    "zoom": 10,
+    "color": "#eee6dd",
+    "priority": 2
+  },
+  "natural=stone": {
+    "zoom": 8,
+    "color": "#eee6dd",
+    "priority": 2
+  },
+  "natural=tree_row": {
+    "zoom": 12,
+    "color": "#add19e",
+    "priority": 2
+  },
+  "natural=volcano": {
+    "zoom": 12,
+    "color": "#d40000",
+    "priority": 2
+  },
+  "natural=glacier": {
+    "zoom": 10,
+    "color": "#deeded",
+    "priority": 2
+  },
+  "natural=bay": {
+    "zoom": 8,
+    "color": "#aad2df",
+    "priority": 8
+  },
+  "natural=water": {
+    "zoom": 8,
+    "color": "#aad2df",
+    "priority": 8
+  },
+  "water=river": {
+    "zoom": 8,
+    "color": "#aad2df",
+    "priority": 8
+  },
+  "water=canal": {
+    "zoom": 10,
+    "color": "#aad2df",
+    "priority": 8
+  },
+  "water=reservoir": {
+    "zoom": 8,
+    "color": "#aad2df",
+    "priority": 8
+  },
+  "water=pond": {
+    "zoom": 12,
+    "color": "#aad2df",
+    "priority": 8
+  },
+  "water=lake": {
+    "zoom": 8,
+    "color": "#aad2df",
+    "priority": 8
+  },
+  "water=basin": {
+    "zoom": 11,
+    "color": "#aad2df",
+    "priority": 8
+  },
+  "waterway=dock": {
+    "zoom": 12,
+    "color": "#aad2df",
+    "priority": 8
+  },
+  "waterway=boatyard": {
+    "zoom": 12,
+    "color": "#aad2df",
+    "priority": 8
+  },
+  "waterway=riverbank": {
+    "zoom": 8,
+    "color": "#aad2df",
+    "priority": 8
+  },
+  "natural=coastline": {
+    "zoom": 12,
+    "color": "#aad2df",
+    "priority": 8
+  },
+  "natural=wetland": {
+    "zoom": 11,
+    "color": "#acd2bf",
+    "priority": 2
+  },
+  "natural=spring": {
+    "zoom": 13,
+    "color": "#aad2df",
+    "priority": 8
+  },
+  "waterway=river": {
+    "zoom": 10,
+    "color": "#aad2df",
+    "priority": 8
+  },
+  "waterway=canal": {
+    "zoom": 10,
+    "color": "#aad2df",
+    "priority": 8
+  },
+  "waterway=stream": {
+    "zoom": 13,
+    "color": "#aad2df",
+    "priority": 8
+  },
+  "waterway=ditch": {
+    "zoom": 13,
+    "color": "#aad2df",
+    "priority": 8
+  },
+  "waterway=drain": {
+    "zoom": 13,
+    "color": "#aad2df",
+    "priority": 8
+  },
+  "railway=rail": {
+    "zoom": 10,
+    "color": "#888888",
+    "priority": 15
+  },
+  "railway=tram": {
+    "zoom": 12,
+    "color": "#888888",
+    "priority": 13
+  },
+  "railway=abandoned": {
+    "zoom": 12,
+    "color": "#777777",
+    "priority": 15
+  },
+  "railway=disused": {
+    "zoom": 12,
+    "color": "#888888",
+    "priority": 15
+  },
+  "railway=funicular": {
+    "zoom": 11,
+    "color": "#888888",
+    "priority": 15
+  },
+  "railway=narrow_gauge": {
+    "zoom": 11,
+    "color": "#888888",
+    "priority": 15
+  },
+  "aerialway=cable_car": {
+    "zoom": 12,
+    "color": "#888888",
+    "priority": 15
+  },
+  "railway=platform": {
+    "zoom": 12,
+    "color": "#bbbbbb",
+    "priority": 15
+  },
+  "highway=motorway": {
+    "zoom": 6,
+    "color": "#e892a2",
+    "priority": 14
+  },
+  "highway=trunk": {
+    "zoom": 6,
+    "color": "#f9b29c",
+    "priority": 14
+  },
+  "highway=primary": {
+    "zoom": 7,
+    "color": "#fcd6a4",
+    "priority": 14
+  },
+  "highway=secondary": {
+    "zoom": 9,
+    "color": "#f7fabf",
+    "priority": 13
+  },
+  "highway=tertiary": {
+    "zoom": 12,
+    "color": "#ffffff",
+    "priority": 13
+  },
+  "highway=unclassified": {
+    "zoom": 13,
+    "color": "#ffffff",
+    "priority": 12
+  },
+  "highway=residential": {
+    "zoom": 13,
+    "color": "#ffffff",
+    "priority": 12
+  },
+  "highway=living_street": {
+    "zoom": 13,
+    "color": "#ededed",
+    "priority": 12
+  },
+  "highway=pedestrian": {
+    "zoom": 13,
+    "color": "#dddde8",
+    "priority": 12
+  },
+  "highway=motorway_link": {
+    "zoom": 10,
+    "color": "#e892a2",
+    "priority": 12
+  },
+  "highway=trunk_link": {
+    "zoom": 10,
+    "color": "#f9b29c",
+    "priority": 11
+  },
+  "highway=primary_link": {
+    "zoom": 11,
+    "color": "#fcd6a4",
+    "priority": 11
+  },
+  "highway=secondary_link": {
+    "zoom": 12,
+    "color": "#f7fabf",
+    "priority": 10
+  },
+  "highway=tertiary_link": {
+    "zoom": 12,
+    "color": "#ffffff",
+    "priority": 10
+  },
+  "highway=service": {
+    "zoom": 15,
+    "color": "#ffffff",
+    "priority": 9
+  },
+  "highway=track": {
+    "zoom": 14,
+    "color": "#996600",
+    "priority": 9
+  },
+  "highway=construction": {
+    "zoom": 13,
+    "color": "#aaaaaa",
+    "priority": 9
+  },
+  "highway=platform": {
+    "zoom": 13,
+    "color": "#bbbbbb",
+    "priority": 9
+  },
+  "tunnel=yes": {
+    "zoom": 13,
+    "color": "#aaaaaa",
+    "priority": 6
+  },
+  "aeroway=apron": {
+    "zoom": 12,
+    "color": "#e7e6de",
+    "priority": 6
+  },
+  "aeroway=aerodrome": {
+    "zoom": 10,
+    "color": "#e7e6de",
+    "priority": 1
+  },
+  "aeroway=hangar": {
+    "zoom": 12,
+    "color": "#d9d0c9",
+    "priority": 7
+  },
+  "aeroway=helipad": {
+    "zoom": 11,
+    "color": "#b2b5d1",
+    "priority": 6
+  },
+  "aeroway=parking_position": {
+    "zoom": 12,
+    "color": "#e7e6de",
+    "priority": 6
+  },
+  "aeroway=runway": {
+    "zoom": 12,
+    "color": "#b2b5d1",
+    "priority": 6
+  },
+  "aeroway=taxiway": {
+    "zoom": 12,
+    "color": "#b2b5d1",
+    "priority": 6
+  },
+  "man_made=embankment": {
+    "zoom": 12,
+    "color": "#c9b28b",
+    "priority": 6
+  },
+  "man_made=pier": {
+    "zoom": 11,
+    "color": "#f6f1e4",
+    "priority": 6
+  },
+  "tunnel=culvert": {
+    "zoom": 14,
+    "color": "#aaaaaa",
+    "priority": 6
+  },
+  "building": {
+    "zoom": 13,
+    "color": "#d9d0c9",
+    "priority": 7
+  },
+  "waterway=dam": {
+    "zoom": 12,
+    "color": "#adadad",
+    "priority": 6
+  },
+  "waterway=weir": {
+    "zoom": 12,
+    "color": "#aaaaaa",
+    "priority": 6
+  },
+  "amenity=grave_yard": {
+    "zoom": 12,
+    "color": "#aacbaf",
+    "priority": 4
+  },
+  "amenity=hospital": {
+    "zoom": 12,
+    "color": "#ffffe5",
+    "priority": 4
+  },
+  "amenity=marketplace": {
+    "zoom": 12,
+    "color": "#ffd6d1",
+    "priority": 4
+  },
+  "amenity=parking_space": {
+    "zoom": 13,
+    "color": "#e1e0e0",
+    "priority": 5
+  },
+  "amenity=place_of_worship": {
+    "zoom": 13,
+    "color": "#d0d0d0",
+    "priority": 4
+  },
+  "amenity=school": {
+    "zoom": 13,
+    "color": "#ffffe5",
+    "priority": 4
+  },
+  "amenity=university": {
+    "zoom": 12,
+    "color": "#ffffe5",
+    "priority": 4
+  },
+  "place=city": {
+    "zoom": 8,
+    "color": "#555555",
+    "priority": 15
+  },
+  "place=state": {
+    "zoom": 12,
+    "color": "#555555",
+    "priority": 15
+  },
+  "place=town": {
+    "zoom": 9,
+    "color": "#555555",
+    "priority": 14
+  },
+  "place=village": {
+    "zoom": 11,
+    "color": "#666666",
+    "priority": 13
+  },
+  "place=hamlet": {
+    "zoom": 13,
+    "color": "#777777",
+    "priority": 12
+  },
+  "place=square": {
+    "zoom": 13,
+    "color": "#e0e0e0",
+    "priority": 12
+  },
+  "boundary=administrative;admin_level=2": {
+    "zoom": 6,
+    "color": "#8d618b",
+    "priority": 15,
+    "width": 2
+  },
+  "boundary=administrative;admin_level=4": {
+    "zoom": 7,
+    "color": "#8d618b",
+    "priority": 15
+  },
+  "boundary=administrative;admin_level=6": {
+    "zoom": 9,
+    "color": "#8d618b",
+    "priority": 15
+  }
+}
