@@ -608,7 +608,7 @@
   "aeroway=apron": {
     "zoom": 12,
     "color": "#e7e6de",
-    "priority": 6
+    "priority": 5
   },
   "aeroway=aerodrome": {
     "zoom": 10,
