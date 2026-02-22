@@ -844,7 +844,7 @@ private:
                 if (!g || GEOSGeomTypeId_r(local_handle, g) != GEOS_POLYGON || GEOSisEmpty_r(local_handle, g)) continue;
                 emit_polygon(g, style.color, style.prio);
             }
-            merged_out += ((int)geos_polys.size() - std::max(0, n));                                                                                                                                                                                                             
+            merged_out += ((int)geos_polys.size() - std::max(0, n));
             GEOSGeom_destroy_r(local_handle, coll); GEOSGeom_destroy_r(local_handle, final_geom);
         }
 

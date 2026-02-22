@@ -1,5 +1,5 @@
 {
-  "_nibble_doc": "priority = z-order nibble 0-15. 1:aeroways 2:landuse/terrain 4:leisure/amenity 5:pitch/surface/parking 6:infrastructure 7:buildings 8:water 9-14:roads 15:rail/bridges",
+  "_nibble_doc": "priority = z-order nibble 0-15. 0:bg 1:aerodrome 2:landuse base(residential,industrial,parking,apron) 3:landuse specific(commercial,retail,cemetery,garages,leisure) 4:surfaces(pitch,grass) 5:forest/wood 6:infrastructure 7:buildings+water 8-14:roads 15:rail/bridges",
   "landuse=forest": {
     "zoom": 8,
     "color": "#add19e",
@@ -53,7 +53,7 @@
   "landuse=cemetery": {
     "zoom": 11,
     "color": "#aacbaf",
-    "priority": 4
+    "priority": 3
   },
   "landuse=commercial": {
     "zoom": 10,
@@ -63,7 +63,7 @@
   "landuse=garages": {
     "zoom": 12,
     "color": "#dfddce",
-    "priority": 2
+    "priority": 3
   },
   "landuse=industrial": {
     "zoom": 10,
@@ -93,7 +93,7 @@
   "landuse=reservoir": {
     "zoom": 8,
     "color": "#aad2df",
-    "priority": 8
+    "priority": 7
   },
   "landuse=retail": {
     "zoom": 10,
@@ -252,13 +252,13 @@
   },
   "amenity=parking": {
     "zoom": 13,
-    "color": "#e1e0e0",
-    "priority": 5
+    "color": "#eeeeee",
+    "priority": 2
   },
   "amenity=parking_space": {
     "zoom": 13,
-    "color": "#e1e0e0",
-    "priority": 5
+    "color": "#eeeeee",
+    "priority": 2
   },
   "place=island": {
     "zoom": 8,
@@ -373,62 +373,62 @@
   "natural=bay": {
     "zoom": 8,
     "color": "#aad2df",
-    "priority": 8
+    "priority": 7
   },
   "natural=water": {
     "zoom": 8,
     "color": "#aad2df",
-    "priority": 8
+    "priority": 7
   },
   "water=river": {
     "zoom": 8,
     "color": "#aad2df",
-    "priority": 8
+    "priority": 7
   },
   "water=canal": {
     "zoom": 10,
     "color": "#aad2df",
-    "priority": 8
+    "priority": 7
   },
   "water=reservoir": {
     "zoom": 8,
     "color": "#aad2df",
-    "priority": 8
+    "priority": 7
   },
   "water=pond": {
     "zoom": 12,
     "color": "#aad2df",
-    "priority": 8
+    "priority": 7
   },
   "water=lake": {
     "zoom": 8,
     "color": "#aad2df",
-    "priority": 8
+    "priority": 7
   },
   "water=basin": {
     "zoom": 11,
     "color": "#aad2df",
-    "priority": 8
+    "priority": 7
   },
   "waterway=dock": {
     "zoom": 12,
     "color": "#aad2df",
-    "priority": 8
+    "priority": 7
   },
   "waterway=boatyard": {
     "zoom": 12,
     "color": "#aad2df",
-    "priority": 8
+    "priority": 7
   },
   "waterway=riverbank": {
     "zoom": 8,
     "color": "#aad2df",
-    "priority": 8
+    "priority": 7
   },
   "natural=coastline": {
     "zoom": 12,
     "color": "#aad2df",
-    "priority": 8
+    "priority": 7
   },
   "natural=wetland": {
     "zoom": 11,
@@ -438,32 +438,32 @@
   "natural=spring": {
     "zoom": 13,
     "color": "#aad2df",
-    "priority": 8
+    "priority": 7
   },
   "waterway=river": {
     "zoom": 10,
     "color": "#aad2df",
-    "priority": 8
+    "priority": 7
   },
   "waterway=canal": {
     "zoom": 10,
     "color": "#aad2df",
-    "priority": 8
+    "priority": 7
   },
   "waterway=stream": {
     "zoom": 13,
     "color": "#aad2df",
-    "priority": 8
+    "priority": 7
   },
   "waterway=ditch": {
     "zoom": 13,
     "color": "#aad2df",
-    "priority": 8
+    "priority": 7
   },
   "waterway=drain": {
     "zoom": 13,
     "color": "#aad2df",
-    "priority": 8
+    "priority": 7
   },
   "railway=rail": {
     "zoom": 10,
@@ -489,6 +489,16 @@
     "zoom": 11,
     "color": "#888888",
     "priority": 15
+  },
+  "railway=subway": {
+    "zoom": 12,
+    "color": "#888888",
+    "priority": 13
+  },
+  "railway=light_rail": {
+    "zoom": 12,
+    "color": "#888888",
+    "priority": 13
   },
   "railway=narrow_gauge": {
     "zoom": 11,
@@ -595,20 +605,10 @@
     "color": "#bbbbbb",
     "priority": 9
   },
-  "tunnel=yes": {
-    "zoom": 13,
-    "color": "#aaaaaa",
-    "priority": 6
-  },
-  "tunnel=culvert": {
-    "zoom": 14,
-    "color": "#aaaaaa",
-    "priority": 6
-  },
   "aeroway=apron": {
     "zoom": 12,
     "color": "#e7e6de",
-    "priority": 5
+    "priority": 2
   },
   "aeroway=aerodrome": {
     "zoom": 10,
@@ -622,7 +622,7 @@
   },
   "aeroway=helipad": {
     "zoom": 11,
-    "color": "#b2b5d1",
+    "color": "#e7e6de",
     "priority": 6
   },
   "aeroway=parking_position": {
@@ -673,7 +673,7 @@
   "amenity=grave_yard": {
     "zoom": 12,
     "color": "#aacbaf",
-    "priority": 4
+    "priority": 3
   },
   "amenity=hospital": {
     "zoom": 12,

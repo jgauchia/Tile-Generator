@@ -83,15 +83,30 @@ public:
      */
     FeatureConfig get_config(const std::unordered_map<std::string, std::string>& tags) const
     {
-        FeatureConfig best_cfg;
+        // Tag key priority: most specific wins over generic qualifiers
+        static const std::vector<std::string> key_priority = {
+            "highway", "railway", "aeroway", "aerialway",
+            "waterway", "water", "natural", "landuse",
+            "building", "amenity", "leisure", "man_made",
+            "boundary", "admin_level", "place",
+            "bridge", "tunnel", "surface", "layer"
+        };
 
-        for (const auto& [k, v] : tags)
+        FeatureConfig best_cfg;
+        bool found = false;
+
+        for (const auto& key : key_priority)
         {
-            std::string exact = k + "=" + v;
+            auto it = tags.find(key);
+            if (it == tags.end()) continue;
+            std::string exact = key + "=" + it->second;
             if (config_map.count(exact))
                 return config_map.at(exact);
-            if (config_map.count(k))
-                best_cfg = config_map.at(k);
+            if (!found && config_map.count(key))
+            {
+                best_cfg = config_map.at(key);
+                found = true;
+            }
         }
         return best_cfg;
     }

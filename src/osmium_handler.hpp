@@ -142,10 +142,6 @@ public:
         }
         if (!interesting) { stats_filtered++; return; }
 
-        // Filter subway
-        if (!is_boundary && tags.count("railway") && tags.at("railway") == "subway")
-        { stats_filtered++; return; }
-
         std::string layer;
         if (is_boundary)
             layer = (boundary_level >= 8) ? "places" : "boundaries";
@@ -216,6 +212,11 @@ public:
             feat.is_building = (layer == "buildings");
             processed_areas.insert(w.id());
 
+            // Skip underground polygons (metro platforms, etc.)
+            if ((tags.count("level") && std::atoi(tags.at("level").c_str()) < 0)
+                || (tags.count("layer") && std::atoi(tags.at("layer").c_str()) < 0))
+            { stats_filtered++; return; }
+
             int nibble = get_polygon_nibble(tags, layer);
             feat.zoom_priority = utils::pack_zoom_priority(min_zoom, nibble);
             feat.points = std::move(way_points);
@@ -238,8 +239,17 @@ public:
         if (feat.is_bridge)
             nibble = 15;
 
-        if (tags.count("tunnel") && (tags.at("tunnel") == "yes" || tags.at("tunnel") == "culvert"))
-            nibble = std::max(nibble - 11, 1);
+        bool is_underground = (tags.count("tunnel") && (tags.at("tunnel") == "yes" || tags.at("tunnel") == "culvert"))
+            || (tags.count("layer") && std::atoi(tags.at("layer").c_str()) < 0);
+        if (is_underground)
+        {
+            if (layer == "water")
+            { stats_filtered++; return; }
+            std::string hw = tags.count("highway") ? tags.at("highway") : "";
+            if (hw == "pedestrian" || hw == "footway" || hw == "cycleway" || hw == "steps")
+            { stats_filtered++; return; }
+            feat.color_rgb565 = 0xD69A; // #D0D0D0 light grey for underground
+        }
 
         feat.zoom_priority = utils::pack_zoom_priority(min_zoom, nibble);
 
@@ -281,6 +291,11 @@ public:
         // Force buildings layer if building tag present
         if (tags.count("building"))
             layer = "buildings";
+
+        // Skip underground areas (metro platforms, etc.)
+        if ((tags.count("level") && std::atoi(tags.at("level").c_str()) < 0)
+            || (tags.count("layer") && std::atoi(tags.at("layer").c_str()) < 0))
+            return;
 
         FeatureConfig f_cfg = config.get_config(tags);
         int min_zoom = f_cfg.min_zoom;
@@ -419,27 +434,34 @@ private:
 
     int get_polygon_nibble(const std::unordered_map<std::string, std::string>& tags, const std::string& layer)
     {
+        // 0:bg 1:aerodrome 2:landuse base 3:landuse specific 4:surfaces
+        // 5:forest/wood 6:infrastructure 7:buildings+water 8-14:roads 15:rail/bridges
         int nibble = 2;
         if (layer == "aeroways") nibble = 1;
         else if (layer == "landuse" || layer == "terrain") nibble = 2;
-        else if (layer == "leisure" || layer == "amenities") nibble = 4;
-        else if (layer == "pitch" || layer == "surface" || layer == "parking") nibble = 5;
+        else if (layer == "parking") nibble = 2;
+        else if (layer == "leisure" || layer == "amenities") nibble = 3;
+        else if (layer == "pitch" || layer == "surface") nibble = 4;
         else if (layer == "infrastructure") nibble = 6;
         else if (layer == "buildings") nibble = 7;
-        else if (layer == "water") nibble = 8;
+        else if (layer == "water") nibble = 7;
 
+        if (tags.count("landuse") && (tags.at("landuse") == "commercial" || tags.at("landuse") == "retail"))
+            nibble = 3;
+        if (tags.count("landuse") && tags.at("landuse") == "garages")
+            nibble = 3;
+        if ((tags.count("landuse") && tags.at("landuse") == "cemetery") ||
+            (tags.count("amenity") && tags.at("amenity") == "grave_yard"))
+            nibble = 3;
         if ((tags.count("natural") && tags.at("natural") == "wood") ||
             (tags.count("landuse") && tags.at("landuse") == "forest"))
             nibble = 5;
-        if ((tags.count("landuse") && tags.at("landuse") == "cemetery") ||
-            (tags.count("amenity") && tags.at("amenity") == "grave_yard"))
-            nibble = 4;
-        if (tags.count("leisure") && tags.at("leisure") == "track")
-            nibble = 6;
         if (tags.count("aeroway") && tags.at("aeroway") == "aerodrome")
             nibble = 1;
         if (tags.count("aeroway") && tags.at("aeroway") == "apron")
-            nibble = 5;
+            nibble = 2;
+        if (tags.count("leisure") && tags.at("leisure") == "track")
+            nibble = 6;
         if ((tags.count("bridge") && (tags.at("bridge") == "yes" || tags.at("bridge") == "viaduct")) ||
             (tags.count("man_made") && tags.at("man_made") == "bridge"))
             nibble = 9;
