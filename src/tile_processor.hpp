@@ -300,9 +300,14 @@ private:
         GEOSCoordSeq_setX_r(local_handle, cbox, 3, lmin - lm); GEOSCoordSeq_setY_r(local_handle, cbox, 3, tmax + tm);
         GEOSCoordSeq_setX_r(local_handle, cbox, 4, lmin - lm); GEOSCoordSeq_setY_r(local_handle, cbox, 4, tmin - tm);
         GEOSGeometry* clip_geom = GEOSGeom_createPolygon_r(local_handle, GEOSGeom_createLinearRing_r(local_handle, cbox), NULL, 0);
-        double tolerance = (lmax - lmin) / 1024.0;
+        double px_size = (lmax - lmin) / 256.0;
+        double z_factor = 0.25;
+        if (z <= 10) z_factor = 1.0;
+        else if (z <= 13) z_factor = 0.5;
+        else if (z >= 16) z_factor = 0.1;
+        double tolerance = px_size * z_factor;
         double min_poly_area = (lmax - lmin) * (tmax - tmin) / 4096.0;
-        double min_line_len = (lmax - lmin) / 64.0;
+        double min_line_len = (lmax - lmin) / 128.0;
         const size_t MAX_SAFE_POINTS = 2000;
         std::vector<ProcessedFeature> final_features;
         auto protect_esp32 = [&](GEOSGeometry* g) {
