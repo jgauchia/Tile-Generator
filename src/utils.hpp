@@ -128,32 +128,5 @@ inline uint8_t pack_zoom_priority(int min_zoom, int priority)
     return (zoom_nibble << 4) | priority_nibble;
 }
 
-/**
- * @brief Converts meters to pixels at a given zoom and latitude.
- * @param width_meters Line width in meters.
- * @param zoom Zoom level.
- * @param lat Reference latitude (default 45.0).
- * @return Width in pixels (clamped 1-15).
- */
-inline uint8_t meters_to_pixels(double width_meters, int zoom, double lat = 45.0)
-{
-    // Calculate meters per pixel at the given latitude and zoom level
-    double meters_per_pixel = 156543.0 * std::cos(lat * M_PI / 180.0) / std::pow(2.0, zoom);
-    
-    // Calculate raw pixel width
-    double raw_pixels = width_meters / meters_per_pixel;
-    
-    // Dampen line width growth for higher zoom levels (Z13+) to prevent "fat" roads
-    if (zoom >= 13) {
-        raw_pixels *= 0.7; 
-    }
-    
-    // Round to nearest integer
-    int pixels = static_cast<int>(raw_pixels + 0.5);
-    
-    // Clamp between 1 and 15 pixels
-    return static_cast<uint8_t>(std::max(1, std::min(15, pixels)));
-}
-
 } // namespace utils
 } // namespace nav

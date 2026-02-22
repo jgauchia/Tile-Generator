@@ -17,6 +17,31 @@ namespace nav {
 const uint8_t GEOM_LINESTRING = 2;
 const uint8_t GEOM_POLYGON = 3;
 
+#pragma pack(push, 1)
+/**
+ * @struct PackHeader
+ * @brief Global header for the Zxx.nav pack file.
+ */
+struct PackHeader
+{
+    char magic[4];      ///< "NPK1"
+    uint8_t zoom;       ///< Zoom level of this pack
+    uint32_t tile_count; ///< Total number of tiles in the pack
+};
+
+/**
+ * @struct IndexEntry
+ * @brief Fixed-size entry in the Pack index table.
+ */
+struct IndexEntry
+{
+    uint32_t x;      ///< Tile X coordinate
+    uint32_t y;      ///< Tile Y coordinate
+    uint32_t offset; ///< Absolute byte offset in the pack file
+    uint32_t size;   ///< Size of the tile data in bytes
+};
+#pragma pack(pop)
+
 /**
  * @struct Point
  * @brief Represents a single geographic point in longitude and latitude.
