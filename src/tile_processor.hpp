@@ -301,6 +301,8 @@ private:
         GEOSCoordSeq_setX_r(local_handle, cbox, 4, lmin - lm); GEOSCoordSeq_setY_r(local_handle, cbox, 4, tmin - tm);
         GEOSGeometry* clip_geom = GEOSGeom_createPolygon_r(local_handle, GEOSGeom_createLinearRing_r(local_handle, cbox), NULL, 0);
         double tolerance = (lmax - lmin) / 1024.0;
+        double min_poly_area = (lmax - lmin) * (tmax - tmin) / 4096.0;
+        double min_line_len = (lmax - lmin) / 64.0;
         const size_t MAX_SAFE_POINTS = 2000;
         std::vector<ProcessedFeature> final_features;
         auto protect_esp32 = [&](GEOSGeometry* g) {
@@ -339,6 +341,8 @@ private:
             {
                 const GEOSGeometry* g = GEOSGetGeometryN_r(local_handle, final_geom, i);
                 if (!g || GEOSGeomTypeId_r(local_handle, g) != GEOS_POLYGON || GEOSisEmpty_r(local_handle, g)) continue;
+                double area; GEOSArea_r(local_handle, g, &area);
+                if (area < min_poly_area) continue;
                 GEOSGeometry* simplified = GEOSTopologyPreserveSimplify_r(local_handle, g, tolerance);
                 if (!simplified) continue;
                 GEOSGeometry* safe = protect_esp32(simplified);
@@ -389,6 +393,8 @@ private:
             {
                 const GEOSGeometry* part = GEOSGetGeometryN_r(local_handle, clipped, i);
                 if (!part || (GEOSGeomTypeId_r(local_handle, part) != GEOS_LINESTRING && GEOSGeomTypeId_r(local_handle, part) != GEOS_LINEARRING) || GEOSisEmpty_r(local_handle, part)) continue;
+                double len; GEOSLength_r(local_handle, part, &len);
+                if (len < (min_line_len / 2.0) && f.zoom_priority < 7) continue;
                 GEOSGeometry* simplified = GEOSTopologyPreserveSimplify_r(local_handle, part, tolerance);
                 if (!simplified) continue;
                 GEOSGeometry* safe = protect_esp32(simplified);
