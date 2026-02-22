@@ -376,8 +376,8 @@ private:
             double extra = 5.0 * (1 << (z - 16));
             double generous_buf = (road_width / 4.0 + extra) * px_scale;
 
-            GEOSGeometry* tb = GEOSBuffer_r(handle, line, tight_buf, 4);
-            GEOSGeometry* gb = GEOSBuffer_r(handle, line, generous_buf, 4);
+            GEOSGeometry* tb = GEOSBufferWithStyle_r(handle, line, tight_buf, 4, GEOSBUF_CAP_FLAT, GEOSBUF_JOIN_ROUND, 0.0);
+            GEOSGeometry* gb = GEOSBufferWithStyle_r(handle, line, generous_buf, 4, GEOSBUF_CAP_FLAT, GEOSBUF_JOIN_ROUND, 0.0);
             GEOSGeom_destroy_r(handle, line);
 
             if (tb) tight_buffers.push_back(tb);

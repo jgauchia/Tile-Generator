@@ -234,10 +234,10 @@ public:
 
         int nibble = f_cfg.priority;
 
-        // Bridges: flag for casing, keep road's own nibble for continuity
         feat.is_bridge = (tags.count("bridge") && (tags.at("bridge") == "yes" || tags.at("bridge") == "viaduct"));
+        if (feat.is_bridge)
+            nibble = 15;
 
-        // Tunnels: shift down, don't filter
         if (tags.count("tunnel") && (tags.at("tunnel") == "yes" || tags.at("tunnel") == "culvert"))
             nibble = std::max(nibble - 11, 1);
 
@@ -382,16 +382,13 @@ private:
     {
         int nibble = 2;
         if (layer == "aeroways") nibble = 1;
-        else if (layer == "islands") nibble = 2;
         else if (layer == "landuse" || layer == "terrain") nibble = 2;
         else if (layer == "leisure" || layer == "amenities") nibble = 4;
         else if (layer == "pitch" || layer == "surface" || layer == "parking") nibble = 5;
         else if (layer == "infrastructure") nibble = 6;
         else if (layer == "buildings") nibble = 7;
         else if (layer == "water") nibble = 8;
-        else if (layer == "places") nibble = 9;
 
-        // Tag overrides
         if ((tags.count("natural") && tags.at("natural") == "wood") ||
             (tags.count("landuse") && tags.at("landuse") == "forest"))
             nibble = 5;
@@ -400,6 +397,10 @@ private:
             nibble = 4;
         if (tags.count("leisure") && tags.at("leisure") == "track")
             nibble = 6;
+        if (tags.count("aeroway") && tags.at("aeroway") == "aerodrome")
+            nibble = 1;
+        if (tags.count("aeroway") && tags.at("aeroway") == "apron")
+            nibble = 5;
         if ((tags.count("bridge") && (tags.at("bridge") == "yes" || tags.at("bridge") == "viaduct")) ||
             (tags.count("man_made") && tags.at("man_made") == "bridge"))
             nibble = 9;
