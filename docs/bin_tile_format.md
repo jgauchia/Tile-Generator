@@ -57,19 +57,39 @@ Each entry in the Data Block starting at `offset` contains a single tile with th
 
 ### 3.2. Feature Records
 
-Features are stored sequentially. Each feature has a **13-byte header** followed by compressed coordinates.
+Features are stored sequentially. Each feature has a **13-byte header** followed by compressed coordinates or text payload.
+
+| Offset | Field          | Type      | Size  | Description                               |
+|--------|----------------|-----------|--------|-------------------------------------------|
+| 0      | geom_type      | uint8     | 1      | Geometry Type (1=Point, 2=Line, 3=Poly, 4=Text) |
+| 1      | color          | uint16    | 2      | Color in RGB565 format (LE)              |
+| 3      | zoom_priority  | uint8     | 1      | `(min_zoom << 4) | (priority & 0x0F)`     |
+| 4      | width_flags    | uint8     | 1      | Bit 7=Casing, Bits 0-6=Width (0.5px units)|
+| 5      | min_x          | uint8     | 1      | Object BBox min X (coords/16)            |
+| 6      | min_y          | uint8     | 1      | Object BBox min Y (coords/16)            |
+| 7      | max_x          | uint8     | 1      | Object BBox max X (coords/16)            |
+| 8      | max_y          | uint8     | 1      | Object BBox max Y (coords/16)            |
+| 9      | coord_count    | uint16    | 2      | Number of vertices (or words for text)   |
+| 11     | payload_size   | uint16    | 2      | Total bytes of data following the header |
 
 ---
 
 ## 4. Coordinate System & Compression
 
 - **Projection**: Web Mercator coordinates mapped to a 12-bit tile-relative space (0-4096).
-- **Safety Margin**: 20% clipping margin (approx. -820 to 4916) ensures seamless connections between tiles.
-- **Encoding**: **Delta VarInt/ZigZag**. Each point is stored as a difference from the previous one. Accumulators are reset to (0,0) at the start of each feature and each polygon ring.
+- **Safety Margin**: 20% clipping margin (approx. -819 to 4915) ensures seamless connections between tiles.
+- **Geom Encoding**: **Delta VarInt/ZigZag**. Accumulators are reset at the start of each feature and each polygon ring.
+- **Text Encoding**: Payload includes anchor coordinates (int16), length, and UTF-8 string.
 
 ---
 
-## 5. Implementation Example (C++)
+## 5. Rendering Pipeline (v0.4.0)
+
+To support road casings and text over transport, the firmware must implement a **Four-Pass Rendering** system:
+1. **Pass 1**: Polygons and at-grade lines (casing=0).
+2. **Pass 2**: Bridge/Tunnel casings (casing=1, darkened color, width+1px).
+3. **Pass 3**: Bridge/Tunnel cores (casing=1, original color, width).
+4. **Pass 4**: Text labels.
 
 The following code demonstrates how to perform an efficient binary search to find a tile offset without loading the entire index into RAM.
 

@@ -18,12 +18,69 @@ Each entry in the JSON file is a key-value pair:
 | :--- | :--- | :--- |
 | `zoom` | integer | Minimum zoom level at which the feature is included in the packed containers. |
 | `color` | string | HTML hex color (`#rrggbb`). Converted to RGB565 in the binary format. |
-| `priority`| integer | Local priority (0-99). Used to calculate the final rendering layer. |
-| `widths` | object | **Manual Width Scaling**: Map of zoom level to exact pixel width. |
+| `priority`| integer | Local priority (0-15). Lower nibble of the binary zoom_priority. |
+| `widths` | object | **Manual Width Scaling**: Map of zoom level to pixels (0.5px units in binary). |
 
 ---
 
-## 3. Layer Priority System
+## 3. Usage Example
+
+### Forest (Polygon)
+```json
+"landuse=forest": {
+  "zoom": 8,
+  "color": "#add19e",
+  "priority": 5
+}
+```
+*   **zoom**: Visible starting from level 8.
+*   **color**: Light green.
+*   **priority**: Level 5 (standard for vegetation/surfaces).
+
+### Motorway (Line)
+```json
+"highway=motorway": {
+  "zoom": 6,
+  "color": "#e892a2",
+  "priority": 14
+}
+```
+*   **zoom**: Visible from level 6.
+*   **color**: Pinkish-red (OSM standard).
+*   **priority**: High (Level 14, renders above most other features).
+
+---
+
+## 4. Layer Priority System (v0.4.0)
+
+The generator uses a simplified 16-level priority system (0-15). This value determines the rendering order within each of the four rendering passes. If multiple features have the same priority, their order is determined by their sequence in the PBF file.
+
+| Priority | Feature Type Examples |
+| :--- | :--- |
+| **0** | Background land. |
+| **1-2** | Large areas (Aerodromes, large forests, terrain). |
+| **3-5** | Smaller areas (Parks, gardens, grass, cemeteries). |
+| **6-7** | Infrastructure and Buildings. |
+| **8** | Water (Lakes, rivers). |
+| **9-11** | Links and local roads. |
+| **12-14** | Major roads and highways. |
+| **15** | Railways, Bridges, and Text Labels. |
+
+---
+
+## 5. Special Handling: Administrative Boundaries
+
+Administrative boundaries are extracted and assigned to specific priority levels to ensure they provide context without cluttering the map.
+- **Regional Borders** (admin_level < 8): Render below transport layers (Priority 3).
+- **Municipal Borders** (admin_level >= 8): Render above everything (Priority 15) but using subtle, low-contrast colors.
+
+---
+
+## 6. Special Handling: Text Labels
+
+Labels for places and road references are generated with collision detection:
+- **Place Names**: Priority 12-15 based on population.
+- **Road Shields**: Priority 15, matching the bridge/railway layer.
 
 The generator uses a 10-layer hierarchy. Final priority (0-15) is calculated as:  
 `Final Priority = (Layer_Base / 10) + (priority_from_json / 7)` (clamped to 15).

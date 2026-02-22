@@ -1,49 +1,37 @@
-# NAV Tile Viewer - ESP32 Map Simulator (Packed Containers Version)
+# NAV Tile Viewer - ESP32 Map Simulator (v0.4.0)
 
-`tile_viewer.py` is a specialized simulator for the **packed binary format**. It is designed to preview and debug consolidated vector map data before deployment to the IceNav ESP32 navigator. It displays a 768x768 viewport using the same offset-based lookup and coordinate math as the hardware.
+`tile_viewer.py` is a specialized simulator for the **v0.4.0 packed binary format**. It mirrors the exact rendering logic of the IceNav ESP32 firmware, including the **Four-Pass Rendering Pipeline** and **0.5px width units**.
 
-## Features
+## New Features (v0.4.0)
 
-- **Packed Container Support**: Directly reads consolidated `Zxx.nav` files, parsing their index tables for instant tile access.
-- **ESP32 Rendering Simulation**: Mirrors the bit-shift pixel calculation and tile-relative coordinate space used in the ESP32 firmware.
-- **Adaptive Tile Loading**: Loads tiles surrounding the current position to ensure the 768x768 viewport is always fully covered.
-- **Feature Identification**: Right-click any object to see its type, color, zoom level, and pre-calculated BBox.
-- **Grid Overlay**: Visualizes tile boundaries and Pack coordinates (X/Y) for easy debugging.
-- **Polygon Fill Toggle**: Switch between outlined and filled polygon rendering.
-
----
-
-## What Does This Script Do?
-
-- Loads and renders consolidated NAV packs for ESP32 navigation simulation.
-- Displays a 768x768 viewport (exactly 3x3 tiles at 256px, but simulates wider coverage).
-- Simulates the zero-CPU projection by using the pre-calculated 12-bit tile space (0-4096).
-- Supports interactive panning and zooming across all available Packs in the directory.
-- Provides real-time statistics on tile loading and feature counts.
+- **Four-Pass Rendering Simulation**: Automatically draws layers in the correct order (Polygons → Road Casings → Road Cores → Text Labels) to ensure visual parity with the hardware.
+- **Priority Filter Sliders**: Real-time sliders in the sidebar allow you to isolate specific priority levels (0-15) for map analysis and debugging.
+- **Reverse Tag Mapping**: When launched with `--config features.json`, the viewer can identify the original OSM tags of an object based on its binary color.
+- **Advanced Stats & Legend**: Dedicated panels to analyze the distribution of features by type, priority, and color in the current viewport.
+- **NPK1 Container Support**: Directly reads consolidated `Zxx.nav` files, parsing their index tables for instant tile access via `fseek`.
+- **Text Label Rendering**: Full support for `GEOM_TEXT` features, including multi-line text and anchor point calculation.
 
 ---
 
 ## Technical Specifications
 
-### NAV-PACK Loading
-The viewer scans the directory for files named `Z*.nav`. It loads the **Index Table** of each pack into memory to perform fast `fseek` operations, exactly like the ESP32 firmware does.
-
 ### Rendering Pipeline
-The simulator uses the same math as the IceNav-v3 firmware to map tile coordinates to screen pixels:
+The simulator mirrors the IceNav-v3 firmware's four-pass logic:
+1. **Pass 1**: Polygons and at-grade lines.
+2. **Pass 2**: Road casings (darkened color, width+1px).
+3. **Pass 3**: Road cores (original color and width).
+4. **Pass 4**: Text labels on top of everything.
+
+### Coordinate Mapping
+Uses the same bit-shift pixel calculation and 12-bit tile-relative coordinate space (0-4096) as the ESP32:
 ```python
 fx = (tile_x - tl_x) + (coord_x / 4096.0)
 pixel_x = fx * TILE_SIZE
 ```
-This ensures that what you see in the viewer is exactly what will be rendered on the ESP32 display.
 
 ---
 
 ## Controls
-
-### Mouse Controls
-- **Left Click + Drag**: Pan the map.
-- **Mouse Wheel**: Zoom in/out (limited to available Packs).
-- **Right Click**: Identify the feature under the cursor.
 
 ### Keyboard Controls
 - **Arrow Keys**: Pan map.
@@ -51,21 +39,23 @@ This ensures that what you see in the viewer is exactly what will be rendered on
 - **`B`**: Toggle background color (White/Black).
 - **`F`**: Toggle polygon fill.
 - **`G`**: Toggle tile grid and coordinate labels.
+- **`S`**: Open/Close **Statistics Panel**.
+- **`L`**: Open/Close **Color Legend Panel**.
+- **`R`**: Refresh current viewport (Clear Cache).
 - **`Q` / `ESC`**: Quit application.
+
+### Mouse Controls
+- **Left Click + Drag**: Pan the map.
+- **Mouse Wheel**: Zoom in/out.
+- **Right Click**: Identify the feature under the cursor (Type, Color, Tags, Prio, BBox).
+- **Sliders**: Drag the blue/red handles in the sidebar to filter priority levels.
 
 ---
 
-## Status and Sidebar Information
+## Sidebar Panels
 
 ### Query Statistics
-- **Tiles**: Number of tiles found in the Pack vs. total tiles required for the view.
-- **Features**: Total number of vector objects currently being rendered.
-- **Time**: Time taken to query the Index Table and parse tile data in milliseconds.
+Displays real-time performance data: tiles loaded from NPK1, total feature count, and query time in milliseconds.
 
-### Selected Feature Details
-When you right-click an object, the sidebar displays:
-- **Type**: Point, Line, or Polygon.
-- **Color**: Hexadecimal representation of the RGB565 color.
-- **Zoom**: The minimum zoom level configured for this object.
-- **Pts**: Number of vertices in the geometry.
-- **BBox**: Pre-calculated object extent normalized to 0-255 (used for ESP32 culling).
+### Feature Legend & Stats
+The `L` key opens a color legend that maps RGB565 colors back to their OSM tags (requires `--config`). The `S` key shows a breakdown of features by geometry type and priority nibble.
