@@ -595,31 +595,6 @@
     "color": "#bbbbbb",
     "priority": 9
   },
-  "highway=path": {
-    "zoom": 15,
-    "color": "#fa8072",
-    "priority": 9
-  },
-  "highway=footway": {
-    "zoom": 15,
-    "color": "#fa8072",
-    "priority": 9
-  },
-  "highway=cycleway": {
-    "zoom": 14,
-    "color": "#0000ff",
-    "priority": 9
-  },
-  "highway=steps": {
-    "zoom": 16,
-    "color": "#fa8072",
-    "priority": 9
-  },
-  "highway=bridleway": {
-    "zoom": 15,
-    "color": "#00a000",
-    "priority": 9
-  },
   "tunnel=yes": {
     "zoom": 13,
     "color": "#aaaaaa",
@@ -758,27 +733,17 @@
   "admin_level=2": {
     "zoom": 6,
     "color": "#8d618b",
-    "priority": 15,
+    "priority": 3,
     "width": 2
   },
   "admin_level=4": {
     "zoom": 7,
     "color": "#8d618b",
-    "priority": 15
+    "priority": 3
   },
   "admin_level=6": {
     "zoom": 9,
     "color": "#8d618b",
-    "priority": 15
-  },
-  "admin_level=7": {
-    "zoom": 10,
-    "color": "#8d618b",
-    "priority": 15
-  },
-  "admin_level=8": {
-    "zoom": 13,
-    "color": "#8d618b",
-    "priority": 15
+    "priority": 3
   }
 }

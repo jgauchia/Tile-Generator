@@ -12,6 +12,7 @@
 #include <chrono>
 #include <iomanip>
 #include <filesystem>
+#include <unordered_set>
 #include <osmium/io/any_input.hpp>
 #include <osmium/handler.hpp>
 #include <osmium/visitor.hpp>
@@ -83,10 +84,12 @@ int main(int argc, char* argv[])
         std::cerr << "Error preparing output directory: " << e.what() << std::endl;
         return 1;
     }
-    class BoundaryScanner : public osmium::handler::Handler
+    class RelationScanner : public osmium::handler::Handler
     {
     public:
-        BoundaryScanner(std::unordered_map<osmium::unsigned_object_id_type, uint8_t>& w2b) : way_to_boundary(w2b) {}
+        RelationScanner(std::unordered_map<osmium::unsigned_object_id_type, uint8_t>& w2b,
+                        std::unordered_set<osmium::unsigned_object_id_type>& wrw)
+            : way_to_boundary(w2b), water_relation_ways(wrw) {}
         void relation(const osmium::Relation& rel)
         {
             const char* boundary = rel.tags().get_value_by_key("boundary");
@@ -94,7 +97,7 @@ int main(int argc, char* argv[])
             {
                 const char* level_str = rel.tags().get_value_by_key("admin_level");
                 int level = level_str ? std::atoi(level_str) : 10;
-                if (level <= 8)
+                if (level <= 6)
                 {
                     for (const auto& member : rel.members())
                     {
@@ -107,9 +110,36 @@ int main(int argc, char* argv[])
                     }
                 }
             }
+            const char* type = rel.tags().get_value_by_key("type");
+            if (type && std::string(type) == "multipolygon")
+            {
+                bool is_water = false;
+                const char* natural = rel.tags().get_value_by_key("natural");
+                if (natural && (std::string(natural) == "water" || std::string(natural) == "bay"))
+                    is_water = true;
+                if (!is_water && rel.tags().get_value_by_key("waterway"))
+                    is_water = true;
+                if (!is_water && rel.tags().get_value_by_key("water"))
+                    is_water = true;
+                if (!is_water)
+                {
+                    const char* landuse = rel.tags().get_value_by_key("landuse");
+                    if (landuse && std::string(landuse) == "reservoir")
+                        is_water = true;
+                }
+                if (is_water)
+                {
+                    for (const auto& member : rel.members())
+                    {
+                        if (member.type() == osmium::item_type::way)
+                            water_relation_ways.insert(member.ref());
+                    }
+                }
+            }
         }
     private:
         std::unordered_map<osmium::unsigned_object_id_type, uint8_t>& way_to_boundary;
+        std::unordered_set<osmium::unsigned_object_id_type>& water_relation_ways;
     };
     std::cout << "Processing OSM data..." << std::endl;
     auto start_time = std::chrono::steady_clock::now();
@@ -121,9 +151,9 @@ int main(int argc, char* argv[])
         nav::OSMHandler osm_handler{config, store, min_zoom, max_zoom};
         std::cout << "  Pass 1: Scanning relations..." << std::endl;
         osmium::area::MultipolygonManager<osmium::area::Assembler> mp_manager{osmium::area::Assembler::config_type{}};
-        BoundaryScanner boundary_scanner(osm_handler.way_to_boundary);
+        RelationScanner relation_scanner(osm_handler.way_to_boundary, osm_handler.water_relation_ways);
         osmium::io::Reader reader1{input_pbf, osmium::osm_entity_bits::relation};
-        osmium::apply(reader1, mp_manager, boundary_scanner);
+        osmium::apply(reader1, mp_manager, relation_scanner);
         reader1.close();
         std::cout << "  Preparing relations..." << std::endl;
         mp_manager.prepare_for_lookup();

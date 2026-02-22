@@ -11,6 +11,7 @@
 #include <unordered_map>
 #include <vector>
 #include <cstdint>
+#include <cmath>
 
 namespace nav {
 namespace constants {
@@ -103,6 +104,38 @@ constexpr int LABEL_HEIGHT_PX = 11;
 constexpr int POPULATION_MAJOR_CITY = 500000;
 constexpr int POPULATION_LARGE_CITY = 100000;
 constexpr int POPULATION_TOWN = 15000;
+
+constexpr double CLIP_MARGIN_POLYGON = 0.10;
+constexpr double CLIP_MARGIN_LINE = 1.0;
+constexpr double K_VISIBILITY = 2.0;
+constexpr double K_HOLE_FACTOR = 10.0;
+constexpr const char* LAND_BG_COLOR = "#f2efe9";
+
+inline double min_area_deg2_for_zoom(int z)
+{
+    if (z >= 14) return 0.0;
+    double zres_prev = 360.0 / (std::pow(2, z - 1) * 256.0);
+    double multiplier;
+    if (z <= 7) multiplier = 2.5;
+    else if (z == 8) multiplier = 1.8;
+    else if (z == 9) multiplier = 2.5;
+    else multiplier = 3.0;
+    return (zres_prev * zres_prev) * multiplier;
+}
+
+inline double post_projection_min_area(int z)
+{
+    double factor;
+    if (z <= 7) factor = 8.0;
+    else if (z == 8) factor = 6.0;
+    else if (z == 9) factor = 8.0;
+    else if (z <= 11) factor = 8.0;
+    else if (z == 12) factor = 5.0;
+    else if (z == 13) factor = 2.0;
+    else if (z == 14) factor = 0.5;
+    else factor = 0.1;
+    return K_VISIBILITY * factor;
+}
 
 } // namespace constants
 } // namespace nav

@@ -613,56 +613,197 @@ private:
                                          const std::vector<ProcessedFeature>& point_symbols)
     {
         struct Style {
-            uint16_t color; uint8_t prio;
-            bool operator<(const Style& o) const { return color < o.color || (color == o.color && prio < o.prio); }
+            uint16_t color; uint8_t prio; std::string subclass; bool is_building;
+            bool operator<(const Style& o) const {
+                if (color != o.color) return color < o.color;
+                if (prio != o.prio) return prio < o.prio;
+                if (subclass != o.subclass) return subclass < o.subclass;
+                return is_building < o.is_building;
+            }
         };
         std::map<Style, std::vector<GEOSGeometry*>> poly_groups;
+        std::map<Style, std::vector<Feature>> poly_individual;
         std::vector<Feature> lines;
+        std::vector<GEOSGeometry*> island_geoms;
         const auto& width_table = constants::line_width_per_zoom();
         const auto& color_table = constants::line_color_per_zoom();
+
+        double pre_min_area = constants::min_area_deg2_for_zoom(z);
 
         for (size_t offset : offsets)
         {
             Feature f = store.get(offset);
             if (f.geom_type == GEOM_POLYGON)
             {
-                GEOSGeometry* g = feature_to_geos(f, local_handle);
-                if (g) poly_groups[{f.color_rgb565, f.zoom_priority}].push_back(g);
+                // Pre-area filtering: skip small polygons at low zooms
+                if (pre_min_area > 0 && !f.points.empty())
+                {
+                    double area2 = 0;
+                    size_t npts = f.ring_ends.empty() ? f.points.size() : f.ring_ends[0];
+                    for (size_t i = 0; i < npts; ++i)
+                    {
+                        size_t j = (i + 1) % npts;
+                        area2 += f.points[i].lon * f.points[j].lat - f.points[j].lon * f.points[i].lat;
+                    }
+                    if (std::abs(area2) * 0.5 < pre_min_area) continue;
+                }
+
+                // Collect island geometries for water hole subtraction
+                if (f.layer == "islands")
+                {
+                    GEOSGeometry* ig = feature_to_geos(f, local_handle);
+                    if (ig && !GEOSisEmpty_r(local_handle, ig))
+                        island_geoms.push_back(ig);
+                }
+
+                uint8_t nibble = f.zoom_priority & 0x0F;
+                bool is_landcover = nibble <= 3 && (f.layer == "wood" || f.layer == "forest");
+                bool is_building_merge = f.is_building && z <= 15;
+                Style key{f.color_rgb565, f.zoom_priority, f.layer, f.is_building};
+                if (is_landcover || is_building_merge)
+                {
+                    GEOSGeometry* g = feature_to_geos(f, local_handle);
+                    if (g) poly_groups[key].push_back(g);
+                }
+                else
+                {
+                    poly_individual[key].push_back(std::move(f));
+                }
             }
             else
                 lines.push_back(std::move(f));
         }
 
+        // Build island union for subtracting from water
+        GEOSGeometry* island_union = nullptr;
+        bool island_geoms_owned = false;
+        if (!island_geoms.empty())
+        {
+            if (island_geoms.size() == 1)
+            {
+                island_union = GEOSGeom_clone_r(local_handle, island_geoms[0]);
+            }
+            else
+            {
+                // createCollection takes ownership of the pointers
+                GEOSGeometry* coll = GEOSGeom_createCollection_r(local_handle, GEOS_GEOMETRYCOLLECTION,
+                                                                   island_geoms.data(), (uint32_t)island_geoms.size());
+                island_geoms_owned = true;
+                island_union = GEOSUnaryUnion_r(local_handle, coll);
+                GEOSGeom_destroy_r(local_handle, coll);
+            }
+            if (island_union && !GEOSisValid_r(local_handle, island_union))
+            {
+                GEOSGeometry* v = GEOSMakeValid_r(local_handle, island_union);
+                GEOSGeom_destroy_r(local_handle, island_union);
+                island_union = v;
+            }
+        }
+
         double lmin = utils::tile_x_to_lon(x, z), lmax = utils::tile_x_to_lon(x + 1, z);
         double tmax = utils::tile_y_to_lat(y, z), tmin = utils::tile_y_to_lat(y + 1, z);
-        double lm = (lmax - lmin) * 0.2, tm = (tmax - tmin) * 0.2;
-        GEOSCoordSequence* cbox = GEOSCoordSeq_create_r(local_handle, 5, 2);
-        GEOSCoordSeq_setX_r(local_handle, cbox, 0, lmin - lm); GEOSCoordSeq_setY_r(local_handle, cbox, 0, tmin - tm);
-        GEOSCoordSeq_setX_r(local_handle, cbox, 1, lmax + lm); GEOSCoordSeq_setY_r(local_handle, cbox, 1, tmin - tm);
-        GEOSCoordSeq_setX_r(local_handle, cbox, 2, lmax + lm); GEOSCoordSeq_setY_r(local_handle, cbox, 2, tmax + tm);
-        GEOSCoordSeq_setX_r(local_handle, cbox, 3, lmin - lm); GEOSCoordSeq_setY_r(local_handle, cbox, 3, tmax + tm);
-        GEOSCoordSeq_setX_r(local_handle, cbox, 4, lmin - lm); GEOSCoordSeq_setY_r(local_handle, cbox, 4, tmin - tm);
-        GEOSGeometry* clip_geom = GEOSGeom_createPolygon_r(local_handle, GEOSGeom_createLinearRing_r(local_handle, cbox), NULL, 0);
+
+        auto make_clip_box = [&](double margin) -> GEOSGeometry* {
+            double lm = (lmax - lmin) * margin, tm = (tmax - tmin) * margin;
+            GEOSCoordSequence* cb = GEOSCoordSeq_create_r(local_handle, 5, 2);
+            GEOSCoordSeq_setX_r(local_handle, cb, 0, lmin - lm); GEOSCoordSeq_setY_r(local_handle, cb, 0, tmin - tm);
+            GEOSCoordSeq_setX_r(local_handle, cb, 1, lmax + lm); GEOSCoordSeq_setY_r(local_handle, cb, 1, tmin - tm);
+            GEOSCoordSeq_setX_r(local_handle, cb, 2, lmax + lm); GEOSCoordSeq_setY_r(local_handle, cb, 2, tmax + tm);
+            GEOSCoordSeq_setX_r(local_handle, cb, 3, lmin - lm); GEOSCoordSeq_setY_r(local_handle, cb, 3, tmax + tm);
+            GEOSCoordSeq_setX_r(local_handle, cb, 4, lmin - lm); GEOSCoordSeq_setY_r(local_handle, cb, 4, tmin - tm);
+            return GEOSGeom_createPolygon_r(local_handle, GEOSGeom_createLinearRing_r(local_handle, cb), NULL, 0);
+        };
+        GEOSGeometry* clip_poly = make_clip_box(constants::CLIP_MARGIN_POLYGON);
+        GEOSGeometry* clip_line = make_clip_box(constants::CLIP_MARGIN_LINE);
         double tolerance = (lmax - lmin) / 1024.0;
-        const size_t MAX_SAFE_POINTS = 2000;
+        double pixel_deg = (lmax - lmin) / 256.0;
+        double min_pixel_area = constants::post_projection_min_area(z);
+        double min_hole_area_deg2 = 0.0;
+        {
+            double hole_factor = (z >= 13) ? 1.5 : 10.0;
+            min_hole_area_deg2 = (pixel_deg * pixel_deg) * constants::K_VISIBILITY * hole_factor;
+        }
         std::vector<ProcessedFeature> final_features;
 
-        auto protect_esp32 = [&](GEOSGeometry* g) {
-            if (!g || GEOSisEmpty_r(local_handle, g)) return (GEOSGeometry*)nullptr;
-            GEOSGeometry* current = g;
-            uint32_t pts = count_geos_points(local_handle, current);
-            double current_tol = tolerance;
-            while (pts > MAX_SAFE_POINTS && current_tol < (tolerance * 20))
+        auto project_ring = [&](const GEOSGeometry* ring) -> std::vector<std::pair<int16_t, int16_t>> {
+            std::vector<std::pair<int16_t, int16_t>> rpts;
+            if (!ring) return rpts;
+            const GEOSCoordSequence* s = GEOSGeom_getCoordSeq_r(local_handle, ring);
+            if (!s) return rpts;
+            uint32_t sz = 0; GEOSCoordSeq_getSize_r(local_handle, s, &sz);
+            if (sz < 3) return rpts;
+            for (uint32_t j = 0; j < sz; ++j)
             {
-                current_tol *= 1.5;
-                GEOSGeometry* temp = GEOSTopologyPreserveSimplify_r(local_handle, current, current_tol);
-                if (temp) { if (current != g) GEOSGeom_destroy_r(local_handle, current); current = temp; pts = count_geos_points(local_handle, current); }
-                else break;
+                double lon, lat;
+                if (GEOSCoordSeq_getX_r(local_handle, s, j, &lon) && GEOSCoordSeq_getY_r(local_handle, s, j, &lat))
+                    rpts.push_back({static_cast<int16_t>((utils::lon_to_x(lon, z) - x) * 4096),
+                                   static_cast<int16_t>((utils::lat_to_y(lat, z) - y) * 4096)});
             }
-            return current;
+            return rpts;
         };
 
-        // Process polygons (merge + clip + simplify)
+        auto emit_polygon = [&](const GEOSGeometry* safe, uint16_t color, uint8_t prio,
+                                const std::string& feat_layer = "", bool is_building = false) {
+            if (!safe || GEOSGeomTypeId_r(local_handle, safe) != GEOS_POLYGON || GEOSisEmpty_r(local_handle, safe)) return;
+            bool is_water = ((prio & 0x0F) == 8);
+
+            auto ext_pts = project_ring(GEOSGetExteriorRing_r(local_handle, safe));
+            if (ext_pts.size() < 3) return;
+
+            // Post-projection pixel area filter (water exempt)
+            if (!is_water && min_pixel_area > 0)
+            {
+                int16_t minx = 4096, maxx = 0, miny = 4096, maxy = 0;
+                for (const auto& p : ext_pts)
+                {
+                    int16_t cx = std::max((int16_t)0, std::min((int16_t)4096, p.first));
+                    int16_t cy = std::max((int16_t)0, std::min((int16_t)4096, p.second));
+                    if (cx < minx) minx = cx;
+                    if (cx > maxx) maxx = cx;
+                    if (cy < miny) miny = cy;
+                    if (cy > maxy) maxy = cy;
+                }
+                double pixel_area = (double)(maxx - minx) * (maxy - miny) / (16.0 * 16.0);
+                if (pixel_area < min_pixel_area) return;
+            }
+
+            ProcessedFeature pf{GEOM_POLYGON, color, prio, 0, {}, {}, "", feat_layer, false, is_building};
+            pf.rings.push_back(std::move(ext_pts));
+
+            int nh = GEOSGetNumInteriorRings_r(local_handle, safe);
+            for (int h = 0; h < nh; ++h)
+            {
+                const GEOSGeometry* hole = GEOSGetInteriorRingN_r(local_handle, safe, h);
+                if (!hole) continue;
+
+                // Filter small holes (not water)
+                if (!is_water && min_hole_area_deg2 > 0)
+                {
+                    const GEOSCoordSequence* hs = GEOSGeom_getCoordSeq_r(local_handle, hole);
+                    if (hs)
+                    {
+                        uint32_t hsz = 0; GEOSCoordSeq_getSize_r(local_handle, hs, &hsz);
+                        double area2 = 0;
+                        for (uint32_t j = 0; j < hsz; ++j)
+                        {
+                            double x0, y0, x1, y1;
+                            GEOSCoordSeq_getX_r(local_handle, hs, j, &x0);
+                            GEOSCoordSeq_getY_r(local_handle, hs, j, &y0);
+                            GEOSCoordSeq_getX_r(local_handle, hs, (j + 1) % hsz, &x1);
+                            GEOSCoordSeq_getY_r(local_handle, hs, (j + 1) % hsz, &y1);
+                            area2 += x0 * y1 - x1 * y0;
+                        }
+                        if (std::abs(area2) * 0.5 < min_hole_area_deg2) continue;
+                    }
+                }
+
+                auto hole_pts = project_ring(hole);
+                if (hole_pts.size() >= 3) pf.rings.push_back(std::move(hole_pts));
+            }
+            if (!pf.rings.empty()) final_features.push_back(std::move(pf));
+        };
+
+        // Merged groups (landcover + buildings only, like Python)
         for (auto& [style, geos_polys] : poly_groups)
         {
             size_t before = geos_polys.size();
@@ -671,7 +812,10 @@ private:
             GEOSGeometry* final_geom = nullptr;
             if (merged)
             {
-                GEOSGeometry* clipped = GEOSIntersection_r(local_handle, merged, clip_geom);
+                GEOSGeometry* simplified = GEOSTopologyPreserveSimplify_r(local_handle, merged, tolerance * 0.5);
+                GEOSGeometry* to_clip = (simplified && !GEOSisEmpty_r(local_handle, simplified)) ? simplified : merged;
+                GEOSGeometry* clipped = GEOSIntersection_r(local_handle, to_clip, clip_poly);
+                if (to_clip != merged) GEOSGeom_destroy_r(local_handle, to_clip);
                 if (clipped)
                 {
                     if (!GEOSisValid_r(local_handle, clipped)) { final_geom = GEOSMakeValid_r(local_handle, clipped); GEOSGeom_destroy_r(local_handle, clipped); }
@@ -680,54 +824,104 @@ private:
                 GEOSGeom_destroy_r(local_handle, merged);
             }
             if (!final_geom) { GEOSGeom_destroy_r(local_handle, coll); continue; }
+
+            // Sharding fallback: if merged result has > 65535 points, emit individually
+            uint32_t merged_pts = count_geos_points(local_handle, final_geom);
+            if (merged_pts > 65535)
+            {
+                for (auto* gp : geos_polys) emit_polygon(gp, style.color, style.prio);
+                GEOSGeom_destroy_r(local_handle, coll); GEOSGeom_destroy_r(local_handle, final_geom);
+                continue;
+            }
+
             int n = GEOSGetNumGeometries_r(local_handle, final_geom);
             for (int i = 0; i < n; ++i)
             {
                 const GEOSGeometry* g = GEOSGetGeometryN_r(local_handle, final_geom, i);
                 if (!g || GEOSGeomTypeId_r(local_handle, g) != GEOS_POLYGON || GEOSisEmpty_r(local_handle, g)) continue;
-                GEOSGeometry* simplified = GEOSTopologyPreserveSimplify_r(local_handle, g, tolerance);
-                if (!simplified) continue;
-                GEOSGeometry* safe = protect_esp32(simplified);
-                if (!safe || GEOSGeomTypeId_r(local_handle, safe) != GEOS_POLYGON || GEOSisEmpty_r(local_handle, safe))
-                {
-                    if (safe && safe != simplified) GEOSGeom_destroy_r(local_handle, safe);
-                    GEOSGeom_destroy_r(local_handle, simplified);
-                    continue;
-                }
-                ProcessedFeature pf{GEOM_POLYGON, style.color, style.prio, 0, {}, {}, "", "", false, false};
-                auto process_ring = [&](const GEOSGeometry* ring) {
-                    if (!ring) return;
-                    const GEOSCoordSequence* s = GEOSGeom_getCoordSeq_r(local_handle, ring);
-                    if (!s) return;
-                    uint32_t sz; GEOSCoordSeq_getSize_r(local_handle, s, &sz);
-                    if (sz < 3) return;
-                    std::vector<std::pair<int16_t, int16_t>> rpts;
-                    for (uint32_t j = 0; j < sz; ++j)
-                    {
-                        double lon, lat;
-                        if (GEOSCoordSeq_getX_r(local_handle, s, j, &lon) && GEOSCoordSeq_getY_r(local_handle, s, j, &lat))
-                            rpts.push_back({static_cast<int16_t>((utils::lon_to_x(lon, z) - x) * 4096),
-                                           static_cast<int16_t>((utils::lat_to_y(lat, z) - y) * 4096)});
-                    }
-                    if (rpts.size() >= 3) pf.rings.push_back(std::move(rpts));
-                };
-                process_ring(GEOSGetExteriorRing_r(local_handle, safe));
-                int nh = GEOSGetNumInteriorRings_r(local_handle, safe);
-                for (int h = 0; h < nh; ++h) process_ring(GEOSGetInteriorRingN_r(local_handle, safe, h));
-                if (!pf.rings.empty()) final_features.push_back(std::move(pf));
-                if (safe != simplified) GEOSGeom_destroy_r(local_handle, safe);
-                GEOSGeom_destroy_r(local_handle, simplified);
+                emit_polygon(g, style.color, style.prio);
             }
             merged_out += (before - std::max(0, n));
             GEOSGeom_destroy_r(local_handle, coll); GEOSGeom_destroy_r(local_handle, final_geom);
         }
 
-        // Process lines
+        // Individual polygons (water, etc.) — clip + single simplify
+        for (auto& [style, feats] : poly_individual)
+        {
+            uint8_t nibble = style.prio & 0x0F;
+            bool is_water = (nibble == 8);
+            bool is_landuse_low = (nibble <= 3) && z < 14;
+            for (auto& f : feats)
+            {
+                GEOSGeometry* g = feature_to_geos(f, local_handle);
+                if (!g) continue;
+                GEOSGeometry* clipped = GEOSIntersection_r(local_handle, g, clip_poly);
+                GEOSGeom_destroy_r(local_handle, g);
+                if (!clipped || GEOSisEmpty_r(local_handle, clipped)) { if (clipped) GEOSGeom_destroy_r(local_handle, clipped); continue; }
+                if (!GEOSisValid_r(local_handle, clipped)) { GEOSGeometry* v = GEOSMakeValid_r(local_handle, clipped); GEOSGeom_destroy_r(local_handle, clipped); clipped = v; }
+                if (!clipped) continue;
+
+                // Subtract islands from water to create holes
+                if (is_water && island_union)
+                {
+                    GEOSGeometry* diff = GEOSDifference_r(local_handle, clipped, island_union);
+                    if (diff && !GEOSisEmpty_r(local_handle, diff))
+                    {
+                        GEOSGeom_destroy_r(local_handle, clipped);
+                        clipped = diff;
+                        if (!GEOSisValid_r(local_handle, clipped))
+                        {
+                            GEOSGeometry* v = GEOSMakeValid_r(local_handle, clipped);
+                            GEOSGeom_destroy_r(local_handle, clipped);
+                            clipped = v;
+                        }
+                        if (!clipped) continue;
+                    }
+                    else
+                    {
+                        if (diff) GEOSGeom_destroy_r(local_handle, diff);
+                    }
+                }
+
+                GEOSGeometry* result = clipped;
+                if (is_landuse_low)
+                {
+                    GEOSGeometry* s = GEOSTopologyPreserveSimplify_r(local_handle, clipped, tolerance);
+                    if (s && !GEOSisEmpty_r(local_handle, s)) result = s;
+                }
+                else if (!is_water)
+                {
+                    GEOSGeometry* s = GEOSTopologyPreserveSimplify_r(local_handle, clipped, tolerance * 0.5);
+                    if (s && !GEOSisEmpty_r(local_handle, s)) result = s;
+                }
+                auto emit_geom = [&](const GEOSGeometry* geom) {
+                    if (!geom) return;
+                    int type = GEOSGeomTypeId_r(local_handle, geom);
+                    if (type == GEOS_POLYGON && !GEOSisEmpty_r(local_handle, geom))
+                        emit_polygon(geom, style.color, style.prio, f.layer, f.is_building);
+                    else if (type == GEOS_MULTIPOLYGON || type == GEOS_GEOMETRYCOLLECTION)
+                    {
+                        int np = GEOSGetNumGeometries_r(local_handle, geom);
+                        for (int i = 0; i < np; ++i)
+                        {
+                            const GEOSGeometry* part = GEOSGetGeometryN_r(local_handle, geom, i);
+                            if (part && GEOSGeomTypeId_r(local_handle, part) == GEOS_POLYGON && !GEOSisEmpty_r(local_handle, part))
+                                emit_polygon(part, style.color, style.prio, f.layer, f.is_building);
+                        }
+                    }
+                };
+                emit_geom(result);
+                if (result != clipped) GEOSGeom_destroy_r(local_handle, result);
+                GEOSGeom_destroy_r(local_handle, clipped);
+            }
+        }
+
+        // Process lines — clip with line margin, conditional simplification, no protect_esp32
         for (const auto& f : lines)
         {
             GEOSGeometry* g = feature_to_geos(f, local_handle);
             if (!g) continue;
-            GEOSGeometry* clipped = GEOSIntersection_r(local_handle, g, clip_geom);
+            GEOSGeometry* clipped = GEOSIntersection_r(local_handle, g, clip_line);
             if (!clipped || GEOSisEmpty_r(local_handle, clipped))
             {
                 GEOSGeom_destroy_r(local_handle, g);
@@ -735,7 +929,6 @@ private:
                 continue;
             }
 
-            // Apply LINE_COLOR_PER_ZOOM override
             uint16_t line_color = f.color_rgb565;
             if (!f.highway_type.empty())
             {
@@ -748,22 +941,31 @@ private:
                 }
             }
 
+            // Conditional simplification tolerance per layer
+            bool skip_simplify = (f.layer == "water" || f.layer == "roads");
+            double line_tol = tolerance;
+            if (f.layer == "infrastructure") line_tol = pixel_deg * 0.1;
+
             int n = GEOSGetNumGeometries_r(local_handle, clipped);
             for (int i = 0; i < n; ++i)
             {
                 const GEOSGeometry* part = GEOSGetGeometryN_r(local_handle, clipped, i);
                 if (!part || (GEOSGeomTypeId_r(local_handle, part) != GEOS_LINESTRING && GEOSGeomTypeId_r(local_handle, part) != GEOS_LINEARRING) || GEOSisEmpty_r(local_handle, part)) continue;
-                GEOSGeometry* simplified = GEOSTopologyPreserveSimplify_r(local_handle, part, tolerance);
-                if (!simplified) continue;
-                GEOSGeometry* safe = protect_esp32(simplified);
-                if (!safe || (GEOSGeomTypeId_r(local_handle, safe) != GEOS_LINESTRING && GEOSGeomTypeId_r(local_handle, safe) != GEOS_LINEARRING) || GEOSisEmpty_r(local_handle, safe))
+
+                const GEOSGeometry* use = part;
+                GEOSGeometry* simplified = nullptr;
+                if (!skip_simplify)
                 {
-                    if (safe && safe != simplified) GEOSGeom_destroy_r(local_handle, safe);
-                    GEOSGeom_destroy_r(local_handle, simplified);
-                    continue;
+                    simplified = GEOSTopologyPreserveSimplify_r(local_handle, part, line_tol);
+                    if (simplified && !GEOSisEmpty_r(local_handle, simplified)) use = simplified;
+                    else { if (simplified) GEOSGeom_destroy_r(local_handle, simplified); simplified = nullptr; }
                 }
-                const GEOSCoordSequence* s = GEOSGeom_getCoordSeq_r(local_handle, safe);
-                uint32_t sz; if (s) GEOSCoordSeq_getSize_r(local_handle, s, &sz); else sz = 0;
+
+                if (GEOSGeomTypeId_r(local_handle, use) != GEOS_LINESTRING && GEOSGeomTypeId_r(local_handle, use) != GEOS_LINEARRING)
+                { if (simplified) GEOSGeom_destroy_r(local_handle, simplified); continue; }
+
+                const GEOSCoordSequence* s = GEOSGeom_getCoordSeq_r(local_handle, use);
+                uint32_t sz = 0; if (s) GEOSCoordSeq_getSize_r(local_handle, s, &sz);
                 if (sz >= 2)
                 {
                     ProcessedFeature pf{GEOM_LINESTRING, line_color, f.zoom_priority, f.width_meters,
@@ -777,8 +979,7 @@ private:
                     }
                     if (pf.rings[0].size() >= 2) final_features.push_back(std::move(pf));
                 }
-                if (safe != simplified) GEOSGeom_destroy_r(local_handle, safe);
-                GEOSGeom_destroy_r(local_handle, simplified);
+                if (simplified) GEOSGeom_destroy_r(local_handle, simplified);
             }
             GEOSGeom_destroy_r(local_handle, g); GEOSGeom_destroy_r(local_handle, clipped);
         }
@@ -795,6 +996,14 @@ private:
         std::sort(final_features.begin(), final_features.end(), [](const ProcessedFeature& a, const ProcessedFeature& b) {
             return (a.prio & 0x0F) < (b.prio & 0x0F);
         });
+
+        // Background land polygon — full tile rectangle, nibble 0, inserted first
+        {
+            static const uint16_t LAND_BG = utils::hex_to_rgb565(constants::LAND_BG_COLOR);
+            ProcessedFeature bg{GEOM_POLYGON, LAND_BG, utils::pack_zoom_priority(0, 0), 0, {}, {}, "", "", false, false};
+            bg.rings.push_back({{0, 0}, {4096, 0}, {4096, 4096}, {0, 4096}, {0, 0}});
+            final_features.insert(final_features.begin(), std::move(bg));
+        }
 
         // --- Serialize ---
         std::vector<uint8_t> buffer;
@@ -857,9 +1066,9 @@ private:
             std::vector<uint8_t> payload;
             int16_t minx = 4096, maxx = 0, miny = 4096, maxy = 0;
             size_t pts = 0;
+            int16_t lx = 0, ly = 0;
             for (const auto& r : pf.rings)
             {
-                int16_t lx = 0, ly = 0;
                 for (const auto& p : r)
                 {
                     auto vx = utils::to_varint(utils::zigzag_encode(p.first - lx));
@@ -949,7 +1158,10 @@ private:
         // Patch feature count
         memcpy(buffer.data() + 4, &written, 2);
 
-        GEOSGeom_destroy_r(local_handle, clip_geom);
+        GEOSGeom_destroy_r(local_handle, clip_poly); GEOSGeom_destroy_r(local_handle, clip_line);
+        if (!island_geoms_owned)
+            for (auto* ig : island_geoms) GEOSGeom_destroy_r(local_handle, ig);
+        if (island_union) GEOSGeom_destroy_r(local_handle, island_union);
         return buffer;
     }
 };

@@ -200,9 +200,17 @@ public:
                            tags.count("aeroway");
         bool is_area = is_closed && (has_area_tag || (tags.count("area") && tags.at("area") == "yes"));
 
+        bool is_aeroway_line = tags.count("aeroway") &&
+                              (tags.at("aeroway") == "runway" || tags.at("aeroway") == "taxiway" ||
+                               tags.at("aeroway") == "helipad");
         if (is_area && !tags.count("highway") && !tags.count("place") &&
-            layer != "boundaries" && layer != "places")
+            !is_aeroway_line && layer != "boundaries" && layer != "places")
         {
+            // Water ways that belong to multipolygon relations: skip here,
+            // let area_callback handle them to preserve inner rings
+            if (layer == "water" && water_relation_ways.count(w.id()))
+                return;
+
             feat.geom_type = GEOM_POLYGON;
             feat.width_meters = 0;
             feat.is_building = (layer == "buildings");
@@ -218,6 +226,7 @@ public:
 
         // Linestring
         feat.geom_type = GEOM_LINESTRING;
+        feat.layer = layer;
         feat.width_meters = get_width(tags);
         feat.highway_type = get_highway_type(tags);
         feat.ref = tags.count("ref") ? tags.at("ref") : "";
@@ -225,10 +234,8 @@ public:
 
         int nibble = f_cfg.priority;
 
-        // Bridges
+        // Bridges: flag for casing, keep road's own nibble for continuity
         feat.is_bridge = (tags.count("bridge") && (tags.at("bridge") == "yes" || tags.at("bridge") == "viaduct"));
-        if (feat.is_bridge)
-            nibble = 15;
 
         // Tunnels: shift down, don't filter
         if (tags.count("tunnel") && (tags.at("tunnel") == "yes" || tags.at("tunnel") == "culvert"))
@@ -262,7 +269,10 @@ public:
             if (config.is_interesting(t.key(), t.value()))
                 interesting = true;
         }
-        if (!interesting || tags.count("highway") || tags.count("place") || tags.count("boundary"))
+        bool is_place_area = tags.count("place") && (tags.at("place") == "island" || tags.at("place") == "islet");
+        if (!interesting || tags.count("highway") || tags.count("boundary"))
+            return;
+        if (tags.count("place") && !is_place_area)
             return;
         std::string layer = get_layer(tags);
         if (layer.empty() || layer == "boundaries")
@@ -310,6 +320,7 @@ public:
     std::vector<size_t> features_by_zoom[18];
     std::unordered_set<int64_t> processed_areas;
     std::unordered_map<osmium::unsigned_object_id_type, uint8_t> way_to_boundary;
+    std::unordered_set<osmium::unsigned_object_id_type> water_relation_ways;
 
     std::vector<Feature> text_features_vec;
     std::vector<Feature> point_features;
@@ -338,23 +349,32 @@ private:
 
     std::string get_layer(const std::unordered_map<std::string, std::string>& tags)
     {
-        if (tags.count("natural") || tags.count("waterway") || tags.count("water"))
+        // Water: only specific natural values, not all natural=*
+        if ((tags.count("natural") && (tags.at("natural") == "water" || tags.at("natural") == "bay")) ||
+            tags.count("waterway") || tags.count("water") ||
+            (tags.count("landuse") && tags.at("landuse") == "reservoir"))
             return "water";
-        if (tags.count("landuse") || tags.count("leisure"))
-            return "landuse";
         if (tags.count("highway"))
             return "roads";
         if (tags.count("railway"))
-            return "railways";
-        if (tags.count("building"))
+            return "roads";
+        if (tags.count("building") || (tags.count("aeroway") && tags.at("aeroway") == "hangar"))
             return "buildings";
+        if (tags.count("place"))
+        {
+            auto p = tags.at("place");
+            if (p == "island" || p == "islet") return "islands";
+            return "places";
+        }
+        if (tags.count("landuse") || tags.count("leisure"))
+            return "landuse";
         if (tags.count("amenity"))
             return "amenities";
         if (tags.count("bridge") || tags.count("tunnel") || tags.count("aeroway") ||
             (tags.count("man_made") && tags.at("man_made") == "bridge"))
             return "infrastructure";
-        if (tags.count("place"))
-            return "places";
+        if (tags.count("natural"))
+            return "landuse";
         return "";
     }
 
@@ -362,12 +382,14 @@ private:
     {
         int nibble = 2;
         if (layer == "aeroways") nibble = 1;
+        else if (layer == "islands") nibble = 2;
         else if (layer == "landuse" || layer == "terrain") nibble = 2;
         else if (layer == "leisure" || layer == "amenities") nibble = 4;
         else if (layer == "pitch" || layer == "surface" || layer == "parking") nibble = 5;
         else if (layer == "infrastructure") nibble = 6;
         else if (layer == "buildings") nibble = 7;
         else if (layer == "water") nibble = 8;
+        else if (layer == "places") nibble = 9;
 
         // Tag overrides
         if ((tags.count("natural") && tags.at("natural") == "wood") ||
