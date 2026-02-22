@@ -349,32 +349,71 @@ private:
 
     std::string get_layer(const std::unordered_map<std::string, std::string>& tags)
     {
-        // Water: only specific natural values, not all natural=*
+        // Water
         if ((tags.count("natural") && (tags.at("natural") == "water" || tags.at("natural") == "bay")) ||
             tags.count("waterway") || tags.count("water") ||
             (tags.count("landuse") && tags.at("landuse") == "reservoir"))
             return "water";
+
+        // Roads / railways (before boundary check — roads can carry boundary tags)
         if (tags.count("highway"))
             return "roads";
-        if (tags.count("railway"))
+        if (tags.count("railway") || tags.count("aerialway"))
             return "roads";
-        if (tags.count("building") || (tags.count("aeroway") && tags.at("aeroway") == "hangar"))
-            return "buildings";
+
+        // Boundaries / places — skip abstract features
+        if (tags.count("boundary") || tags.count("admin_level"))
+            return "";
         if (tags.count("place"))
         {
             auto p = tags.at("place");
             if (p == "island" || p == "islet") return "islands";
             return "places";
         }
-        if (tags.count("landuse") || tags.count("leisure"))
-            return "landuse";
+
+        // Buildings
+        if (tags.count("building") || (tags.count("aeroway") && tags.at("aeroway") == "hangar")
+            || (tags.count("man_made") && tags.at("man_made") == "tower"))
+            return "buildings";
+
+        // Aeroways (aerodrome only — other aeroway goes to infrastructure)
+        if (tags.count("aeroway") && tags.at("aeroway") == "aerodrome")
+            return "aeroways";
+
+        // Parking
+        if (tags.count("amenity") && (tags.at("amenity") == "parking" || tags.at("amenity") == "parking_space"))
+            return "parking";
+
+        // Amenities
         if (tags.count("amenity"))
             return "amenities";
-        if (tags.count("bridge") || tags.count("tunnel") || tags.count("aeroway") ||
-            (tags.count("man_made") && tags.at("man_made") == "bridge"))
-            return "infrastructure";
-        if (tags.count("natural"))
+
+        // Pitch
+        if (tags.count("leisure") && tags.at("leisure") == "pitch")
+            return "pitch";
+
+        // Leisure
+        if (tags.count("leisure"))
+            return "leisure";
+
+        // Surface (grassland/grass/meadow)
+        if ((tags.count("natural") && tags.at("natural") == "grassland") ||
+            (tags.count("landuse") && (tags.at("landuse") == "grass" || tags.at("landuse") == "meadow")))
+            return "surface";
+
+        // Landuse
+        if (tags.count("landuse"))
             return "landuse";
+
+        // Infrastructure (bridges, tunnels, aeroway lines, piers, dams)
+        if (tags.count("bridge") || tags.count("tunnel") || tags.count("aeroway") ||
+            (tags.count("man_made") && (tags.at("man_made") == "bridge" || tags.at("man_made") == "embankment" || tags.at("man_made") == "pier")))
+            return "infrastructure";
+
+        // Terrain (natural features not matched above)
+        if (tags.count("natural"))
+            return "terrain";
+
         return "";
     }
 
