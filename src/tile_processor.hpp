@@ -200,7 +200,7 @@ private:
         unsigned int num_threads = std::thread::hardware_concurrency();
         if (num_threads == 0)
             num_threads = 4;
-        std::atomic<size_t> next_tile(0), merged_count{0};
+        std::atomic<size_t> next_tile(0);
         std::vector<std::thread> workers;
         for (unsigned int t = 0; t < num_threads; ++t)
         {
@@ -211,12 +211,10 @@ private:
                     size_t idx = next_tile.fetch_add(1);
                     if (idx >= tiles.size())
                         break;
-                    size_t m = 0;
                     const auto& [coord, offsets] = tiles[idx];
                     packed_results[idx].x = (uint32_t)coord.x;
                     packed_results[idx].y = (uint32_t)coord.y;
-                    packed_results[idx].data = serialize_tile(z, coord.x, coord.y, store, offsets, handle, m);
-                    merged_count += m;
+                    packed_results[idx].data = serialize_tile(z, coord.x, coord.y, store, offsets, handle);
                 }
                 GEOS_finish_r(handle);
             });
@@ -265,7 +263,7 @@ private:
         auto end = std::chrono::steady_clock::now();
         std::chrono::duration<double> elapsed = end - start;
         double avg_tps = (elapsed.count() > 0) ? (double)tiles.size() / elapsed.count() : 0;
-        std::cout << "\r\33[2K  Zoom " << std::setw(2) << z << ": " << std::setw(8) << tiles.size() << " tiles (" << std::fixed << std::setprecision(1) << avg_tps << " t/s), " << std::setw(8) << (size_t)merged_count << " polygons merged | ";
+        std::cout << "\r\33[2K  Zoom " << std::setw(2) << z << ": " << std::setw(8) << tiles.size() << " tiles (" << std::fixed << std::setprecision(1) << avg_tps << " t/s) | ";
         if (out.tellp() < 1024 * 1024)
             std::cout << std::fixed << std::setprecision(2) << ((double)out.tellp() / 1024.0) << " KB";
         else
@@ -276,7 +274,7 @@ private:
     /**
      * @brief Serializes a single tile into a binary buffer.
      */
-    std::vector<uint8_t> serialize_tile(int z, int x, int y, const MappedStore& store, const std::vector<size_t>& offsets, GEOSContextHandle_t local_handle, size_t& merged_out)
+    std::vector<uint8_t> serialize_tile(int z, int x, int y, const MappedStore& store, const std::vector<size_t>& offsets, GEOSContextHandle_t local_handle)
     {
         struct Style { uint16_t color; uint8_t prio; bool operator<(const Style& o) const { return color < o.color || (color == o.color && prio < o.prio); } };
         std::map<Style, std::vector<GEOSGeometry*>> poly_groups;
@@ -326,7 +324,6 @@ private:
         };
         for (auto& [style, geos_polys] : poly_groups)
         {
-            size_t before = geos_polys.size();
             GEOSGeometry* coll = GEOSGeom_createCollection_r(local_handle, GEOS_GEOMETRYCOLLECTION, geos_polys.data(), (uint32_t)geos_polys.size());
             GEOSGeometry* merged = GEOSUnaryUnion_r(local_handle, coll);
             GEOSGeometry* final_geom = nullptr;
@@ -335,18 +332,27 @@ private:
                 GEOSGeometry* clipped = GEOSIntersection_r(local_handle, merged, clip_geom);
                 if (clipped)
                 {
-                    if (!GEOSisValid_r(local_handle, clipped)) { final_geom = GEOSMakeValid_r(local_handle, clipped); GEOSGeom_destroy_r(local_handle, clipped); }
+                    if (!GEOSisValid_r(local_handle, clipped))
+                    {
+                        final_geom = GEOSMakeValid_r(local_handle, clipped);
+                        GEOSGeom_destroy_r(local_handle, clipped);
+                    }
                     else final_geom = clipped;
                 }
                 GEOSGeom_destroy_r(local_handle, merged);
             }
-            if (!final_geom) { GEOSGeom_destroy_r(local_handle, coll); continue; }
+            if (!final_geom)
+            {
+                GEOSGeom_destroy_r(local_handle, coll);
+                continue;
+            }
             int n = GEOSGetNumGeometries_r(local_handle, final_geom);
             for (int i = 0; i < n; ++i)
             {
                 const GEOSGeometry* g = GEOSGetGeometryN_r(local_handle, final_geom, i);
                 if (!g || GEOSGeomTypeId_r(local_handle, g) != GEOS_POLYGON || GEOSisEmpty_r(local_handle, g)) continue;
-                double area; GEOSArea_r(local_handle, g, &area);
+                double area;
+                GEOSArea_r(local_handle, g, &area);
                 if (area < min_poly_area) continue;
                 GEOSGeometry* simplified = GEOSTopologyPreserveSimplify_r(local_handle, g, tolerance);
                 if (!simplified) continue;
@@ -362,12 +368,14 @@ private:
                     if (!ring) return;
                     const GEOSCoordSequence* s = GEOSGeom_getCoordSeq_r(local_handle, ring);
                     if (!s) return;
-                    uint32_t sz; GEOSCoordSeq_getSize_r(local_handle, s, &sz);
+                    uint32_t sz;
+                    GEOSCoordSeq_getSize_r(local_handle, s, &sz);
                     if (sz < 3) return;
                     std::vector<std::pair<int16_t, int16_t>> rpts;
                     for (uint32_t j = 0; j < sz; ++j)
                     {
-                        double lon, lat; if (GEOSCoordSeq_getX_r(local_handle, s, j, &lon) && GEOSCoordSeq_getY_r(local_handle, s, j, &lat))
+                        double lon, lat;
+                        if (GEOSCoordSeq_getX_r(local_handle, s, j, &lon) && GEOSCoordSeq_getY_r(local_handle, s, j, &lat))
                             rpts.push_back({static_cast<int16_t>((utils::lon_to_x(lon, z) - x) * 4096), static_cast<int16_t>((utils::lat_to_y(lat, z) - y) * 4096)});
                     }
                     if (rpts.size() >= 3) pf.rings.push_back(std::move(rpts));
@@ -379,8 +387,8 @@ private:
                 if (safe != simplified) GEOSGeom_destroy_r(local_handle, safe);
                 GEOSGeom_destroy_r(local_handle, simplified);
             }
-            merged_out += (before - std::max((int)0, n));
-            GEOSGeom_destroy_r(local_handle, coll); GEOSGeom_destroy_r(local_handle, final_geom);
+            GEOSGeom_destroy_r(local_handle, coll);
+            GEOSGeom_destroy_r(local_handle, final_geom);
         }
         for (const auto& f : lines)
         {
