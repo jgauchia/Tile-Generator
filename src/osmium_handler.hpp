@@ -213,8 +213,12 @@ public:
             processed_areas.insert(w.id());
 
             // Skip underground polygons (metro platforms, etc.)
-            if ((tags.count("level") && std::atoi(tags.at("level").c_str()) < 0)
-                || (tags.count("layer") && std::atoi(tags.at("layer").c_str()) < 0))
+            // Only filter when explicitly underground (tunnel/covered), not layer alone
+            // (layer=-5 on wetlands, riverbanks etc. means elevation, not underground)
+            bool poly_underground = (tags.count("level") && std::atoi(tags.at("level").c_str()) < 0)
+                || ((tags.count("tunnel") || tags.count("covered"))
+                    && (tags.count("layer") && std::atoi(tags.at("layer").c_str()) < 0));
+            if (poly_underground)
             { stats_filtered++; return; }
 
             int nibble = get_polygon_nibble(tags, layer);
@@ -294,8 +298,10 @@ public:
             layer = "buildings";
 
         // Skip underground areas (metro platforms, etc.)
-        if ((tags.count("level") && std::atoi(tags.at("level").c_str()) < 0)
-            || (tags.count("layer") && std::atoi(tags.at("layer").c_str()) < 0))
+        bool area_underground = (tags.count("level") && std::atoi(tags.at("level").c_str()) < 0)
+            || ((tags.count("tunnel") || tags.count("covered"))
+                && (tags.count("layer") && std::atoi(tags.at("layer").c_str()) < 0));
+        if (area_underground)
             return;
 
         FeatureConfig f_cfg = config.get_config(tags);
@@ -447,8 +453,13 @@ private:
         else if (layer == "buildings") nibble = 7;
         else if (layer == "water") nibble = 7;
 
-        if (tags.count("landuse") && (tags.at("landuse") == "commercial" || tags.at("landuse") == "retail"))
+        if (tags.count("landuse") && tags.at("landuse") == "commercial")
+            nibble = 1;
+        if (tags.count("landuse") && tags.at("landuse") == "retail")
             nibble = 3;
+        if (tags.count("landuse") && (tags.at("landuse") == "residential" || tags.at("landuse") == "industrial"
+            || tags.at("landuse") == "brownfield" || tags.at("landuse") == "construction"))
+            nibble = 1;
         if (tags.count("landuse") && (tags.at("landuse") == "farmland" || tags.at("landuse") == "farmyard"))
             nibble = 4;
         if (tags.count("landuse") && tags.at("landuse") == "garages")
@@ -456,7 +467,13 @@ private:
         if ((tags.count("landuse") && tags.at("landuse") == "cemetery") ||
             (tags.count("amenity") && tags.at("amenity") == "grave_yard"))
             nibble = 3;
+        if (tags.count("leisure") && (tags.at("leisure") == "park" || tags.at("leisure") == "nature_reserve"))
+            nibble = 1;
         if (tags.count("leisure") && tags.at("leisure") == "playground")
+            nibble = 4;
+        if (tags.count("natural") && tags.at("natural") == "beach")
+            nibble = 4;
+        if (tags.count("natural") && tags.at("natural") == "wetland")
             nibble = 4;
         if (tags.count("landuse") && (tags.at("landuse") == "grass" || tags.at("landuse") == "meadow"
             || tags.at("landuse") == "village_green"))
