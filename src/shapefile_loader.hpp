@@ -20,7 +20,9 @@ inline size_t load_water_polygons(const std::string& shapefile_path,
                                   MappedStore& store,
                                   std::vector<size_t> (&features_by_zoom)[18],
                                   uint16_t water_color,
-                                  uint8_t min_zoom)
+                                  uint8_t min_zoom,
+                                  double bbox_min_lon, double bbox_min_lat,
+                                  double bbox_max_lon, double bbox_max_lat)
 {
     GDALAllRegister();
 
@@ -41,6 +43,7 @@ inline size_t load_water_polygons(const std::string& shapefile_path,
         return 0;
     }
 
+    layer->SetSpatialFilterRect(bbox_min_lon, bbox_min_lat, bbox_max_lon, bbox_max_lat);
     layer->ResetReading();
     size_t count = 0;
     static int64_t ocean_id_base = -1000000000;
