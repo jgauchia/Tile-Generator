@@ -571,13 +571,32 @@ private:
         std::ofstream out(pack_path, std::ios::binary);
         if (out)
         {
+            uint32_t y_min = packed_results.front().y;
+            uint32_t y_max = packed_results.back().y;
+            uint32_t y_span = y_max - y_min + 1;
+
+            std::vector<YTableEntry> ytable(y_span, {0, 0});
+            for (size_t i = 0; i < packed_results.size(); ++i)
+            {
+                uint32_t yi = packed_results[i].y - y_min;
+                if (ytable[yi].idx_count == 0)
+                    ytable[yi].idx_start = (uint32_t)i;
+                ytable[yi].idx_count++;
+            }
+
             PackHeader ph;
-            memcpy(ph.magic, "NPK1", 4);
+            memcpy(ph.magic, "NPK2", 4);
             ph.zoom = (uint8_t)z;
             ph.tile_count = (uint32_t)packed_results.size();
-            out.write((char*)&ph, sizeof(PackHeader));
+            ph.y_min = y_min;
+            ph.y_max = y_max;
+            ph.ytable_offset = sizeof(PackHeader);
+            ph.index_offset = ph.ytable_offset + (uint32_t)(ytable.size() * sizeof(YTableEntry));
+
+            uint32_t data_offset = ph.index_offset + (uint32_t)(packed_results.size() * sizeof(IndexEntry));
+
             std::vector<IndexEntry> index(packed_results.size());
-            uint32_t current_offset = sizeof(PackHeader) + (uint32_t)(index.size() * sizeof(IndexEntry));
+            uint32_t current_offset = data_offset;
             for (size_t i = 0; i < packed_results.size(); ++i)
             {
                 index[i].x = packed_results[i].x;
@@ -586,6 +605,9 @@ private:
                 index[i].size = (uint32_t)packed_results[i].data.size();
                 current_offset += index[i].size;
             }
+
+            out.write((char*)&ph, sizeof(PackHeader));
+            out.write((char*)ytable.data(), ytable.size() * sizeof(YTableEntry));
             out.write((char*)index.data(), index.size() * sizeof(IndexEntry));
             for (const auto& pt : packed_results)
                 out.write((char*)pt.data.data(), pt.data.size());

@@ -288,21 +288,22 @@ class NAVViewer:
                 self._index_pack_file(full)
 
     def _index_pack_file(self, pack_path: str):
-        """Parse NPK1 pack header + index and store tile offsets."""
+        """Parse NPK2 pack header + index and store tile offsets."""
         try:
             with open(pack_path, 'rb') as f:
                 magic = f.read(4)
-                if magic != b'NPK1':
+                if magic != b'NPK2':
                     return
                 zoom = struct.unpack('<B', f.read(1))[0]
-                tile_count = struct.unpack('<I', f.read(4))[0]
+                tile_count, y_min, y_max, ytable_off, index_off = struct.unpack('<IIIII', f.read(20))
+                f.seek(index_off)
                 index = {}
                 for _ in range(tile_count):
                     x, y, offset, size = struct.unpack('<IIII', f.read(16))
                     index[(x, y)] = (pack_path, offset, size)
                 self.pack_index[zoom] = index
                 self.available_zooms.add(zoom)
-                logger.info(f"Indexed pack Z{zoom}: {tile_count} tiles")
+                logger.info(f"Indexed pack Z{zoom}: {tile_count} tiles, Y {y_min}-{y_max}")
         except Exception as e:
             logger.warning(f"Could not index pack {pack_path}: {e}")
 
