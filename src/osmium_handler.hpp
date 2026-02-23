@@ -240,13 +240,14 @@ public:
             nibble = 15;
 
         bool is_underground = (tags.count("tunnel") && (tags.at("tunnel") == "yes" || tags.at("tunnel") == "culvert"))
-            || (tags.count("layer") && std::atoi(tags.at("layer").c_str()) < 0);
+            || (tags.count("layer") && std::atoi(tags.at("layer").c_str()) < 0)
+            || (tags.count("level") && std::atoi(tags.at("level").c_str()) < 0);
         if (is_underground)
         {
             if (layer == "water")
             { stats_filtered++; return; }
             std::string hw = tags.count("highway") ? tags.at("highway") : "";
-            if (hw == "pedestrian" || hw == "footway" || hw == "cycleway" || hw == "steps")
+            if (hw == "pedestrian" || hw == "footway" || hw == "cycleway" || hw == "steps" || hw == "platform")
             { stats_filtered++; return; }
             feat.color_rgb565 = 0xD69A; // #D0D0D0 light grey for underground
         }
@@ -448,14 +449,26 @@ private:
 
         if (tags.count("landuse") && (tags.at("landuse") == "commercial" || tags.at("landuse") == "retail"))
             nibble = 3;
+        if (tags.count("landuse") && (tags.at("landuse") == "farmland" || tags.at("landuse") == "farmyard"))
+            nibble = 4;
         if (tags.count("landuse") && tags.at("landuse") == "garages")
             nibble = 3;
         if ((tags.count("landuse") && tags.at("landuse") == "cemetery") ||
             (tags.count("amenity") && tags.at("amenity") == "grave_yard"))
             nibble = 3;
+        if (tags.count("leisure") && tags.at("leisure") == "playground")
+            nibble = 4;
+        if (tags.count("landuse") && (tags.at("landuse") == "grass" || tags.at("landuse") == "meadow"
+            || tags.at("landuse") == "village_green"))
+            nibble = 5;
+        if (tags.count("natural") && (tags.at("natural") == "grassland" || tags.at("natural") == "scrub"))
+            nibble = 5;
         if ((tags.count("natural") && tags.at("natural") == "wood") ||
             (tags.count("landuse") && tags.at("landuse") == "forest"))
             nibble = 5;
+        if (tags.count("amenity") && (tags.at("amenity") == "school" ||
+            tags.at("amenity") == "college" || tags.at("amenity") == "university"))
+            nibble = 3;
         if (tags.count("aeroway") && tags.at("aeroway") == "aerodrome")
             nibble = 1;
         if (tags.count("aeroway") && tags.at("aeroway") == "apron")

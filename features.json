@@ -207,7 +207,7 @@
   },
   "leisure=sports_centre": {
     "zoom": 12,
-    "color": "#d6ffda",
+    "color": "#e1e0e0",
     "priority": 4
   },
   "leisure=sports_hall": {
@@ -510,6 +510,11 @@
     "color": "#888888",
     "priority": 15
   },
+  "aerialway=gondola": {
+    "zoom": 12,
+    "color": "#888888",
+    "priority": 15
+  },
   "railway=platform": {
     "zoom": 12,
     "color": "#bbbbbb",
@@ -692,6 +697,11 @@
   },
   "amenity=school": {
     "zoom": 13,
+    "color": "#ffffe5",
+    "priority": 4
+  },
+  "amenity=college": {
+    "zoom": 12,
     "color": "#ffffe5",
     "priority": 4
   },
