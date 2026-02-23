@@ -9,6 +9,7 @@ find_package(ZLIB REQUIRED)
 find_package(EXPAT REQUIRED)
 find_package(BZip2 REQUIRED)
 find_package(Threads REQUIRED)
+find_package(GDAL REQUIRED)
 
 # Manually find GEOS
 find_path(GEOS_INCLUDE_DIR geos_c.h)
@@ -30,6 +31,7 @@ include_directories(
     ${ZLIB_INCLUDE_DIRS}
     ${EXPAT_INCLUDE_DIRS}
     ${BZIP2_INCLUDE_DIR}
+    ${GDAL_INCLUDE_DIRS}
     src
 )
 
@@ -46,6 +48,7 @@ target_link_libraries(nav_generator
     ${EXPAT_LIBRARIES}
     ${BZIP2_LIBRARIES}
     ${CMAKE_THREAD_LIBS_INIT}
+    ${GDAL_LIBRARIES}
 )
 
 if(nlohmann_json_FOUND)

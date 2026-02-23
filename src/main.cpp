@@ -26,13 +26,14 @@
 #include "tile_processor.hpp"
 #include "utils.hpp"
 #include "mapped_store.hpp"
+#include "shapefile_loader.hpp"
 
 using index_type = osmium::index::map::FlexMem<osmium::unsigned_object_id_type, osmium::Location>;
 using location_handler_type = osmium::handler::NodeLocationsForWays<index_type>;
 
 void print_usage()
 {
-    std::cout << "Usage: nav_generator <input.pbf> <output_dir> <features.json> [--zoom min-max]" << std::endl;
+    std::cout << "Usage: nav_generator <input.pbf> <output_dir> <features.json> [--zoom min-max] [--water-shp <path>]" << std::endl;
 }
 
 int main(int argc, char* argv[])
@@ -46,6 +47,7 @@ int main(int argc, char* argv[])
     std::string output_dir = argv[2];
     std::string config_file = argv[3];
     int min_zoom = 6, max_zoom = 17;
+    std::string water_shp;
     for (int i = 4; i < argc; ++i)
     {
         std::string arg = argv[i];
@@ -60,6 +62,10 @@ int main(int argc, char* argv[])
             }
             else
                 min_zoom = max_zoom = std::stoi(zoom_val);
+        }
+        else if (arg == "--water-shp" && i + 1 < argc)
+        {
+            water_shp = argv[++i];
         }
     }
     std::cout << "Loading configuration from " << config_file << std::endl;
@@ -163,6 +169,16 @@ int main(int argc, char* argv[])
             osmium::apply(buffer, osm_handler);
         }));
         reader2.close();
+
+        if (!water_shp.empty())
+        {
+            std::cout << "  Pass 3: Loading water polygons from shapefile..." << std::endl;
+            uint16_t water_color = nav::utils::hex_to_rgb565("#aad2df");
+            size_t water_count = nav::load_water_polygons(
+                water_shp, store, osm_handler.features_by_zoom, water_color, min_zoom);
+            std::cout << "  Water polygons loaded: " << water_count << std::endl;
+        }
+
         auto end_extract = std::chrono::steady_clock::now();
         std::chrono::duration<double> elapsed = end_extract - start_time;
         std::cout << "\nProcessing completed in " << std::fixed << std::setprecision(2) << elapsed.count() << "s" << std::endl;
