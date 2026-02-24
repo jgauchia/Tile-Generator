@@ -1,8 +1,7 @@
-.gemini/
 build/
 *.pbf
 .gitignore
 rsync_copy.sh
 NAVMAP/
-GEMINI.md
 water-polygons-split-*/
+water-polygons-split-4326.zip
