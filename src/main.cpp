@@ -173,23 +173,13 @@ int main(int argc, char* argv[])
         if (!water_shp.empty())
         {
             std::cout << "  Pass 3: Loading water polygons from shapefile..." << std::endl;
-            osmium::io::Reader bbox_reader{input_pbf, osmium::osm_entity_bits::nothing};
-            auto bbox = bbox_reader.header().boxes();
-            bbox_reader.close();
-            double bmin_lon = -180, bmin_lat = -90, bmax_lon = 180, bmax_lat = 90;
-            if (!bbox.empty())
-            {
-                bmin_lon = bbox[0].bottom_left().lon();
-                bmin_lat = bbox[0].bottom_left().lat();
-                bmax_lon = bbox[0].top_right().lon();
-                bmax_lat = bbox[0].top_right().lat();
-                std::cout << "  PBF bbox: " << bmin_lon << "," << bmin_lat
-                          << " -> " << bmax_lon << "," << bmax_lat << std::endl;
-            }
+            std::cout << "  Data bbox: " << osm_handler.bbox_min_lon << "," << osm_handler.bbox_min_lat
+                      << " -> " << osm_handler.bbox_max_lon << "," << osm_handler.bbox_max_lat << std::endl;
             uint16_t water_color = nav::utils::hex_to_rgb565("#aad2df");
             size_t water_count = nav::load_water_polygons(
                 water_shp, store, osm_handler.features_by_zoom, water_color, min_zoom,
-                bmin_lon, bmin_lat, bmax_lon, bmax_lat);
+                osm_handler.bbox_min_lon, osm_handler.bbox_min_lat,
+                osm_handler.bbox_max_lon, osm_handler.bbox_max_lat);
             std::cout << "  Water polygons loaded: " << water_count << std::endl;
         }
 

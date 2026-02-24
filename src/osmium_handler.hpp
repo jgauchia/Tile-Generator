@@ -36,11 +36,15 @@ public:
         stats_nodes++;
         if (!n.location().valid()) return;
 
+        double lon = n.location().lon(), lat = n.location().lat();
+        if (lon < bbox_min_lon) bbox_min_lon = lon;
+        if (lon > bbox_max_lon) bbox_max_lon = lon;
+        if (lat < bbox_min_lat) bbox_min_lat = lat;
+        if (lat > bbox_max_lat) bbox_max_lat = lat;
+
         std::unordered_map<std::string, std::string> tags;
         for (const auto& t : n.tags())
             tags[t.key()] = t.value();
-
-        double lon = n.location().lon(), lat = n.location().lat();
 
         // Point symbols (peaks, volcanoes)
         for (const auto& [k, v] : tags)
@@ -353,6 +357,9 @@ public:
     size_t stats_filtered = 0;
     size_t stats_points = 0;
     size_t stats_text_labels = 0;
+
+    double bbox_min_lon = 180, bbox_min_lat = 90;
+    double bbox_max_lon = -180, bbox_max_lat = -90;
 
 private:
     const ConfigManager& config;
