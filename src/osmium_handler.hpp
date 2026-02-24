@@ -36,11 +36,15 @@ public:
         stats_nodes++;
         if (!n.location().valid()) return;
 
+        double lon = n.location().lon(), lat = n.location().lat();
+        if (lon < bbox_min_lon) bbox_min_lon = lon;
+        if (lon > bbox_max_lon) bbox_max_lon = lon;
+        if (lat < bbox_min_lat) bbox_min_lat = lat;
+        if (lat > bbox_max_lat) bbox_max_lat = lat;
+
         std::unordered_map<std::string, std::string> tags;
         for (const auto& t : n.tags())
             tags[t.key()] = t.value();
-
-        double lon = n.location().lon(), lat = n.location().lat();
 
         // Point symbols (peaks, volcanoes)
         for (const auto& [k, v] : tags)
@@ -213,8 +217,12 @@ public:
             processed_areas.insert(w.id());
 
             // Skip underground polygons (metro platforms, etc.)
-            if ((tags.count("level") && std::atoi(tags.at("level").c_str()) < 0)
-                || (tags.count("layer") && std::atoi(tags.at("layer").c_str()) < 0))
+            // Only filter when explicitly underground (tunnel/covered), not layer alone
+            // (layer=-5 on wetlands, riverbanks etc. means elevation, not underground)
+            bool poly_underground = (tags.count("level") && std::atoi(tags.at("level").c_str()) < 0)
+                || ((tags.count("tunnel") || tags.count("covered"))
+                    && (tags.count("layer") && std::atoi(tags.at("layer").c_str()) < 0));
+            if (poly_underground)
             { stats_filtered++; return; }
 
             int nibble = get_polygon_nibble(tags, layer);
@@ -294,8 +302,10 @@ public:
             layer = "buildings";
 
         // Skip underground areas (metro platforms, etc.)
-        if ((tags.count("level") && std::atoi(tags.at("level").c_str()) < 0)
-            || (tags.count("layer") && std::atoi(tags.at("layer").c_str()) < 0))
+        bool area_underground = (tags.count("level") && std::atoi(tags.at("level").c_str()) < 0)
+            || ((tags.count("tunnel") || tags.count("covered"))
+                && (tags.count("layer") && std::atoi(tags.at("layer").c_str()) < 0));
+        if (area_underground)
             return;
 
         FeatureConfig f_cfg = config.get_config(tags);
@@ -347,6 +357,9 @@ public:
     size_t stats_filtered = 0;
     size_t stats_points = 0;
     size_t stats_text_labels = 0;
+
+    double bbox_min_lon = 180, bbox_min_lat = 90;
+    double bbox_max_lon = -180, bbox_max_lat = -90;
 
 private:
     const ConfigManager& config;
@@ -447,8 +460,13 @@ private:
         else if (layer == "buildings") nibble = 7;
         else if (layer == "water") nibble = 7;
 
-        if (tags.count("landuse") && (tags.at("landuse") == "commercial" || tags.at("landuse") == "retail"))
+        if (tags.count("landuse") && tags.at("landuse") == "commercial")
+            nibble = 1;
+        if (tags.count("landuse") && tags.at("landuse") == "retail")
             nibble = 3;
+        if (tags.count("landuse") && (tags.at("landuse") == "residential" || tags.at("landuse") == "industrial"
+            || tags.at("landuse") == "brownfield" || tags.at("landuse") == "construction"))
+            nibble = 1;
         if (tags.count("landuse") && (tags.at("landuse") == "farmland" || tags.at("landuse") == "farmyard"))
             nibble = 4;
         if (tags.count("landuse") && tags.at("landuse") == "garages")
@@ -456,7 +474,13 @@ private:
         if ((tags.count("landuse") && tags.at("landuse") == "cemetery") ||
             (tags.count("amenity") && tags.at("amenity") == "grave_yard"))
             nibble = 3;
+        if (tags.count("leisure") && (tags.at("leisure") == "park" || tags.at("leisure") == "nature_reserve"))
+            nibble = 1;
         if (tags.count("leisure") && tags.at("leisure") == "playground")
+            nibble = 4;
+        if (tags.count("natural") && tags.at("natural") == "beach")
+            nibble = 4;
+        if (tags.count("natural") && tags.at("natural") == "wetland")
             nibble = 4;
         if (tags.count("landuse") && (tags.at("landuse") == "grass" || tags.at("landuse") == "meadow"
             || tags.at("landuse") == "village_green"))

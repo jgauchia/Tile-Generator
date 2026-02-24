@@ -1,5 +1,5 @@
 {
-  "_nibble_doc": "priority = z-order nibble 0-15. 0:bg 1:aerodrome 2:landuse base(residential,industrial,parking,apron) 3:landuse specific(commercial,retail,cemetery,garages,leisure) 4:surfaces(pitch,grass) 5:forest/wood 6:infrastructure 7:buildings+water 8-14:roads 15:rail/bridges",
+  "_nibble_doc": "priority = z-order nibble 0-15. 0:bg 1:large zones(aerodrome,park,residential,commercial,industrial) 2:landuse base(parking,apron,heath,scrub) 3:landuse detail(retail,cemetery,garages,leisure) 4:surfaces(pitch,beach,wetland,playground) 5:forest/wood 6:infrastructure 7:buildings+water 8-14:roads 15:rail/bridges",
   "landuse=forest": {
     "zoom": 8,
     "color": "#add19e",
@@ -13,6 +13,11 @@
   "natural=heath": {
     "zoom": 10,
     "color": "#d6d9a0",
+    "priority": 2
+  },
+  "natural=sand": {
+    "zoom": 10,
+    "color": "#f5e9c6",
     "priority": 2
   },
   "natural=scrub": {
@@ -58,7 +63,7 @@
   "landuse=commercial": {
     "zoom": 10,
     "color": "#f2dad9",
-    "priority": 3
+    "priority": 1
   },
   "landuse=garages": {
     "zoom": 12,
@@ -68,12 +73,22 @@
   "landuse=industrial": {
     "zoom": 10,
     "color": "#ebdbe8",
-    "priority": 2
+    "priority": 1
+  },
+  "landuse=brownfield": {
+    "zoom": 10,
+    "color": "#f2efe9",
+    "priority": 1
+  },
+  "landuse=construction": {
+    "zoom": 10,
+    "color": "#f2efe9",
+    "priority": 1
   },
   "landuse=residential": {
     "zoom": 8,
     "color": "#e1e0e0",
-    "priority": 2
+    "priority": 1
   },
   "landuse=quarry": {
     "zoom": 10,
@@ -108,16 +123,6 @@
   "landuse=basin": {
     "zoom": 11,
     "color": "#e0e0e0",
-    "priority": 2
-  },
-  "landuse=brownfield": {
-    "zoom": 10,
-    "color": "#c7c7b4",
-    "priority": 2
-  },
-  "landuse=construction": {
-    "zoom": 10,
-    "color": "#c7c7b4",
     "priority": 2
   },
   "landuse=education": {
@@ -177,8 +182,8 @@
   },
   "leisure=nature_reserve": {
     "zoom": 12,
-    "color": "#c7facb",
-    "priority": 4
+    "color": "#f2efe9",
+    "priority": 1
   },
   "leisure=pitch": {
     "zoom": 13,
@@ -233,7 +238,7 @@
   "natural=beach": {
     "zoom": 10,
     "color": "#fff1b8",
-    "priority": 2
+    "priority": 4
   },
   "natural=sand": {
     "zoom": 12,
@@ -248,7 +253,7 @@
   "leisure=park": {
     "zoom": 12,
     "color": "#c7facb",
-    "priority": 4
+    "priority": 1
   },
   "amenity=parking": {
     "zoom": 13,
@@ -433,7 +438,7 @@
   "natural=wetland": {
     "zoom": 11,
     "color": "#acd2bf",
-    "priority": 2
+    "priority": 4
   },
   "natural=spring": {
     "zoom": 13,
