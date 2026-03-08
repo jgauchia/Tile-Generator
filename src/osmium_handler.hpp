@@ -203,7 +203,14 @@ public:
         bool is_aeroway_line = tags.count("aeroway") &&
                               (tags.at("aeroway") == "runway" || tags.at("aeroway") == "taxiway" ||
                                tags.at("aeroway") == "helipad");
-        if (is_area && !tags.count("highway") && !tags.count("place") &&
+        
+        // Optimize: Allow highway areas (pedestrian squares, parking lots) but NOT roads
+        bool is_road_transit = tags.count("highway") && 
+                              (tags.at("highway") == "motorway" || tags.at("highway") == "trunk" ||
+                               tags.at("highway") == "primary" || tags.at("highway") == "secondary" ||
+                               tags.at("highway") == "tertiary");
+
+        if (is_area && !is_road_transit && !tags.count("place") &&
             !is_aeroway_line && layer != "boundaries" && layer != "places")
         {
             // Water ways that belong to multipolygon relations: skip here,
@@ -223,7 +230,10 @@ public:
                 || ((tags.count("tunnel") || tags.count("covered"))
                     && (tags.count("layer") && std::atoi(tags.at("layer").c_str()) < 0));
             if (poly_underground)
-            { stats_filtered++; return; }
+            {
+                stats_filtered++;
+                return;
+            }
 
             int nibble = get_polygon_nibble(tags, layer);
             feat.zoom_priority = utils::pack_zoom_priority(min_zoom, nibble);
@@ -253,19 +263,25 @@ public:
         if (is_underground)
         {
             if (layer == "water")
-            { stats_filtered++; return; }
+            {
+                stats_filtered++;
+                return;
+            }
             std::string hw = tags.count("highway") ? tags.at("highway") : "";
             if (hw == "pedestrian" || hw == "footway" || hw == "cycleway" || hw == "steps" || hw == "platform")
-            { stats_filtered++; return; }
+            {
+                stats_filtered++;
+                return;
+            }
             feat.color_rgb565 = 0xD69A; // #D0D0D0 light grey for underground
         }
 
         feat.zoom_priority = utils::pack_zoom_priority(min_zoom, nibble);
 
         // Densify curves (not aeroways)
-        bool is_aeroway = tags.count("aeroway") && !tags.at("aeroway").empty();
-        if (!feat.highway_type.empty() && !is_aeroway && way_points.size() >= 2)
-            way_points = utils::densify_linestring(way_points, 0.0001);
+        // bool is_aeroway = tags.count("aeroway") && !tags.at("aeroway").empty();
+        // if (!feat.highway_type.empty() && !is_aeroway && way_points.size() >= 2)
+        //    way_points = utils::densify_linestring(way_points, 0.0001);
 
         feat.points = std::move(way_points);
         feat.ring_ends.push_back(static_cast<uint32_t>(feat.points.size()));
