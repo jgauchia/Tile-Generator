@@ -1,192 +1,180 @@
-# NAV Tile Format Specification
+# NAV-PACK Format Specification (v2)
 
-This document describes the optimized NAV binary format produced by `tile_generator.py`. The format is specifically designed for ultra-fast vector map rendering on ESP32 embedded systems by using pre-projected, compact relative coordinates and hardware-friendly data alignment.
+This document describes the **NPK2** container format, a high-performance binary storage system for vector map tiles designed for ESP32-based GPS navigators.
 
----
-
-## File Overview
-
-Each file represents a single tile for a given zoom level (`z`), x coordinate (`x`), and y coordinate (`y`).  
-The directory structure follows the standard XYZ tile scheme:  
-```
-{output_dir}/{z}/{x}/{y}.nav
-```
-
-The format uses **tile-relative coordinates** (mapped to a 0-4096 range) with a pre-applied Mercator projection.
+NPK2 eliminates the overhead of traditional file systems on SD cards by consolidating tiles into single files per zoom level, with a Y-table index for O(1) row lookup optimized for 20MHz SPI access.
 
 ---
 
-## File Structure
+## 1. Storage Architecture
 
-The file is a single binary blob consisting of a global header followed by sequential feature records.
+Map data is organized into consolidated binary files, one for each zoom level:
+`Z{zoom}.nav` (e.g., `Z14.nav`, `Z17.nav`).
 
-### 1. Tile Header (22 bytes)
+Each Pack file consists of: **Tile Data** → **Y-Table** → **Index Table** → **Global Header** (written last).
+
+---
+
+## 2. File Structure
+
+### 2.1. Global Pack Header (21 bytes)
 
 | Offset | Field          | Type      | Size  | Description                               |
 |--------|----------------|-----------|--------|-------------------------------------------|
-| 0      | magic          | bytes[4]  | 4      | Format identifier ("NAV1")               |
-| 4      | feature_count  | uint16    | 2      | Number of features in the tile (LE)      |
-| 6      | min_lon        | int32     | 4      | Tile min longitude (scaled 1e7)           |
-| 10     | min_lat        | int32     | 4      | Tile min latitude (scaled 1e7)            |
-| 14     | max_lon        | int32     | 4      | Tile max longitude (scaled 1e7)           |
-| 18     | max_lat        | int32     | 4      | Tile max latitude (scaled 1e7)            |
+| 0      | magic          | bytes[4]  | 4      | "NPK2" (Nav Pack version 2)               |
+| 4      | zoom           | uint8     | 1      | Zoom level of all tiles in this pack       |
+| 5      | tile_count     | uint32    | 4      | Total number of tiles (LE)                 |
+| 9      | y_min          | uint32    | 4      | Minimum Y tile coordinate                  |
+| 13     | y_max          | uint32    | 4      | Maximum Y tile coordinate                  |
+| 17     | ytable_offset  | uint32    | 4      | File offset to Y-table                     |
 
-### 2. Feature Records (Sequential)
+The header is located at offset 0 of the file.
 
-Each feature consists of a **12-byte aligned header**, followed by coordinate data, and optional ring information for polygons.
+### 2.2. Y-Table ((y_max - y_min + 1) * 8 bytes)
 
-#### Feature Header (12 bytes)
+The Y-table provides O(1) lookup by tile Y coordinate. Each entry maps a Y row to its range in the index table.
 
-| Offset | Field            | Type   | Size | Description                                  |
-|--------|------------------|--------|-------|----------------------------------------------|
-| 0      | geom_type        | uint8  | 1     | 1=Point, 2=LineString, 3=Polygon             |
-| 1      | color_rgb565     | uint16 | 2     | RGB565 color (Little-Endian)                 |
-| 3      | zoom_priority    | uint8  | 1     | High nibble: min_zoom, Low nibble: priority  |
-| 4      | width_pixels     | uint8  | 1     | Rendered line width in pixels (1-15)         |
-| 5      | bbox             | uint8[4]| 4     | Object BBox [x1, y1, x2, y2] normalized 0-255|
-| 9      | coord_count      | uint16 | 2     | Total number of points (across all rings)    |
-| 11     | padding          | uint8  | 1     | Alignment padding (always 0x00)              |
+| Offset | Field      | Type   | Size | Description                              |
+|--------|------------|--------|------|------------------------------------------|
+| 0      | idx_start  | uint32 | 4    | First index entry for this Y row         |
+| 4      | idx_count  | uint32 | 4    | Number of tiles in this Y row            |
 
-#### Coordinate Data
+To find a tile at (x, y):
+1. Read `ytable[y - y_min]` to get `idx_start` and `idx_count`
+2. Binary search within `idx_count` index entries starting at `idx_start`
 
-Follows the header immediately. Each point is a pair of signed 16-bit integers.
+### 2.3. Index Table (tile_count * 16 bytes)
 
-| Field            | Type   | Size | Description                                  |
-|------------------|--------|-------|----------------------------------------------|
-| coordinates[]    | int16[]| 4×N   | x, y pairs relative to tile origin (0-4096)  |
+Entries are sorted by Y then X (row-major).
 
-#### Polygon Ring Information (Polygons Only)
-
-Only present if `geom_type == 3`. Follows the coordinate data.
-
-| Field          | Type   | Size | Description                    |
-|----------------|--------|-------|--------------------------------|
-| ring_count     | uint8  | 1     | Total number of rings (exterior + holes) |
-| ring_ends[]    | uint16 | 2×R   | Cumulative end index for each ring |
+| Offset | Field  | Type   | Size | Description                          |
+|--------|--------|--------|------|--------------------------------------|
+| 0      | x      | uint32 | 4    | Tile X coordinate (LE)               |
+| 4      | y      | uint32 | 4    | Tile Y coordinate (LE)               |
+| 8      | offset | uint32 | 4    | Absolute byte offset of tile data    |
+| 12     | size   | uint32 | 4    | Size of tile data in bytes           |
 
 ---
 
-## Coordinate System
+## 3. Internal Tile Format (NAV1)
 
-### Tile-Relative Projection
-NAV stores coordinates already projected using the Web Mercator projection. Values are mapped to a 12-bit space (0-4096) relative to the tile's top-left corner.
+Each tile in the data block contains:
 
-- **Range**: The standard tile extent is 0-4096. To ensure seamless rendering across tiles, features are clipped with a **10% safety margin**, allowing coordinates to range from approximately -410 to 4506.
-- **Precision**: 1 unit = 1/16th of a pixel (assuming a 256px tile).
-- **Format**: Signed `int16`.
+### 3.1. Tile Header (22 bytes)
 
-### ESP32 Rendering Math
-Conversion to screen pixels is extremely efficient:
-```cpp
-pixel_x = (nav_x * screen_tile_size) >> 12;
-pixel_y = (nav_y * screen_tile_size) >> 12;
-```
+| Offset | Field         | Type     | Size | Description                          |
+|--------|---------------|----------|------|--------------------------------------|
+| 0      | magic         | bytes[4] | 4    | "NAV1"                               |
+| 4      | feature_count | uint16   | 2    | Number of features                   |
+| 6      | min_lon       | int32    | 4    | Tile min longitude (scaled 1e7)      |
+| 10     | min_lat       | int32    | 4    | Tile min latitude (scaled 1e7)       |
+| 14     | max_lon       | int32    | 4    | Tile max longitude (scaled 1e7)      |
+| 18     | max_lat       | int32    | 4    | Tile max latitude (scaled 1e7)       |
 
----
+### 3.2. Feature Records
 
-## Optimizations
+Each feature has a **13-byte header** followed by compressed coordinates or text payload.
 
-### BBox Culling
-The 4-byte `bbox` field stores normalized extents (`tile_coord >> 4`). The renderer can reconstruct the pixel bounds (`bbox[i] << 4`) and skip features that do not intersect the current viewport before reading any coordinate data.
-
-### Geometry Clipping
-All features are clipped using `shapely` during generation. This reduces the number of points processed by the ESP32 and ensures that only relevant geometry is loaded from the SD card.
-
-### Minimum Area Filter
-Polygons whose bounding box area is smaller than 4 pixels squared at the target zoom level are discarded. This significantly reduces file size and visual noise in dense areas.
-
-### Data Alignment
-The 12-byte feature header ensures efficient memory access and simplified struct mapping in C/C++ environments.
-
----
-
-## Color & Priority Encoding
-
-### RGB565
-Colors are stored in the native 16-bit format used by most ESP32 displays (`RRRRRGGGGGGBBBBB`), allowing direct buffer injection.
-
-### Zoom Priority
-Packed into a single byte:
-- `min_zoom`: `zoom_priority >> 4` (High 4 bits).
-- `priority`: `zoom_priority & 0x0F` (Low 4 bits). 
-Features are pre-sorted by this priority during generation to ensure correct draw order.
+| Offset | Field         | Type   | Size | Description                                        |
+|--------|---------------|--------|------|----------------------------------------------------|
+| 0      | geom_type     | uint8  | 1    | 1=Point, 2=Line, 3=Polygon, 4=Text                |
+| 1      | color         | uint16 | 2    | Color in RGB565 (LE)                               |
+| 3      | zoom_priority | uint8  | 1    | `(min_zoom << 4) \| (priority & 0x0F)`            |
+| 4      | width_flags   | uint8  | 1    | Bit 7=Casing, Bits 0-6=Width (0.5px units)        |
+| 5      | min_x         | uint8  | 1    | BBox min X (coords/16)                             |
+| 6      | min_y         | uint8  | 1    | BBox min Y (coords/16)                             |
+| 7      | max_x         | uint8  | 1    | BBox max X (coords/16)                             |
+| 8      | max_y         | uint8  | 1    | BBox max Y (coords/16)                             |
+| 9      | coord_count   | uint16 | 2    | Number of vertices (or words for text)             |
+| 11     | payload_size  | uint16 | 2    | Total bytes of data following the header           |
 
 ---
 
-## Implementation Example (C++)
+## 4. Coordinate System & Compression
 
-### 1. Data Structures
+- **Projection**: Web Mercator mapped to 12-bit tile-relative space (0-4096).
+- **Clipping Margin**: Polygons 10%, lines 100% — ensures seamless tile edges.
+- **Encoding**: Delta VarInt/ZigZag. Accumulators reset at the start of each feature and each polygon ring.
+- **Text Encoding**: Anchor coordinates (int16), length, and UTF-8 string.
 
-The 12-byte aligned header allows direct mapping to C structs:
+---
+
+## 5. Rendering Pipeline
+
+Four-pass rendering for road casings and layered text:
+
+1. **Pass 1**: Polygons and at-grade lines (casing=0).
+2. **Pass 2**: Bridge/Tunnel casings (casing=1, darkened color, width+1px).
+3. **Pass 3**: Bridge/Tunnel cores (casing=1, original color, width).
+4. **Pass 4**: Text labels.
+
+---
+
+## 6. Tile Lookup (ESP32)
 
 ```cpp
-#pragma pack(push, 1)
-struct NavTileHeader {
-    char magic[4];          // "NAV1"
-    uint16_t feature_count; // Little-Endian
-    int32_t min_lon;        // scaled 1e7
-    int32_t min_lat;
-    int32_t max_lon;
-    int32_t max_lat;
+struct Npk2Header {
+    char magic[4];       // "NPK2"
+    uint8_t zoom;
+    uint32_t tile_count;
+    uint32_t y_min, y_max;
+    uint32_t ytable_offset;
 };
 
-struct NavFeatureHeader {
-    uint8_t geom_type;      // 1=Point, 2=LineString, 3=Polygon
-    uint16_t color_rgb565;  // Little-Endian
-    uint8_t zoom_priority;  // High: min_zoom, Low: priority
-    uint8_t width_pixels;   // 1-15
-    uint8_t bbox[4];        // [x1, y1, x2, y2] normalized 0-255
-    uint16_t coord_count;   // Total points
-    uint8_t padding;        // Always 0x00
+struct YTableEntry {
+    uint32_t idx_start;
+    uint32_t idx_count;
 };
-#pragma pack(pop)
-```
 
-### 2. Rendering Pseudo-code
+struct IndexEntry {
+    uint32_t x, y, offset, size;
+};
 
-```cpp
-// 1. Read Tile Header
-NavTileHeader tile;
-file.read(&tile, sizeof(tile));
+// Y-table loaded in PSRAM at pack open time
+// Lookup: O(1) Y-table access + O(log N) binary search within row
+bool findTile(File& f, YTableEntry* ytable, Npk2Header& hdr,
+              uint32_t x, uint32_t y, IndexEntry& out)
+{
+    if (y < hdr.y_min || y > hdr.y_max) return false;
+    YTableEntry& ye = ytable[y - hdr.y_min];
+    if (ye.idx_count == 0) return false;
 
-// 2. Iterate Features
-for (int i = 0; i < tile.feature_count; i++) {
-    NavFeatureHeader feat;
-    file.read(&feat, sizeof(feat));
+    // Index offset = after header (21 bytes) + tile data
+    uint32_t base = hdr.ytable_offset
+                  + (hdr.y_max - hdr.y_min + 1) * sizeof(YTableEntry)
+                  + ye.idx_start * sizeof(IndexEntry);
 
-    // Fast BBox Culling
-    // Reconstruct tile coords (0-4096) from normalized bbox (0-255)
-    Rect object_rect = { feat.bbox[0] << 4, feat.bbox[1] << 4, 
-                         feat.bbox[2] << 4, feat.bbox[3] << 4 };
-                         
-    if (!viewport.intersects(object_rect)) {
-        file.seek(feat.coord_count * 4, SEEK_CUR); // Skip points
-        if (feat.geom_type == 3) {
-            uint8_t rings = file.readUint8();
-            file.seek(rings * 2, SEEK_CUR); // Skip ring ends
+    int low = 0, high = (int)ye.idx_count - 1;
+    while (low <= high) {
+        int mid = low + (high - low) / 2;
+        IndexEntry entry;
+        f.seek(base + mid * sizeof(IndexEntry));
+        f.read((uint8_t*)&entry, sizeof(IndexEntry));
+
+        if (entry.x == x && entry.y == y) {
+            out = entry;
+            return true;
         }
-        continue;
+        if (entry.x < x) low = mid + 1;
+        else high = mid - 1;
     }
-
-    // Read and Project Coordinates
-    Point pts[feat.coord_count];
-    for (int j = 0; j < feat.coord_count; j++) {
-        int16_t nx, ny;
-        file.read(&nx, 2); file.read(&ny, 2);
-        // Zero-CPU projection using bit-shifts
-        pts[j].x = (nx * screen_tile_size) >> 12;
-        pts[j].y = (ny * screen_tile_size) >> 12;
-    }
-
-    // Render Geometry
-    if (feat.geom_type == 2) {
-        drawLines(pts, feat.coord_count, feat.width_pixels, feat.color_rgb565);
-    } 
-    else if (feat.geom_type == 3) {
-        uint8_t ring_count = file.readUint8();
-        uint16_t ring_ends[ring_count];
-        file.read(ring_ends, ring_count * 2);
-        fillPolygon(pts, ring_count, ring_ends, feat.color_rgb565);
-    }
+    return false;
 }
+```
+
+---
+
+## 7. Priority Levels (Z-Order)
+
+```
+ 0: Background land
+ 1: Large zones (aerodrome, residential, commercial, industrial)
+ 2: Landuse base (parking, heath, scrub), islands
+ 3: Boundaries, retail, cemetery, leisure
+ 4: Surfaces (pitch, beach, wetland, farmland)
+ 5: Forest/wood, apron
+ 6: Infrastructure (runway, taxiway, helipad)
+ 7: Buildings, water
+ 8-14: Roads (by class)
+15: Rail, bridges, labels
 ```

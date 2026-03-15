@@ -1,135 +1,89 @@
-# OSM Tile Generator for IceNav
+# Tile-Generator (v0.4.0)
 
-Converts OpenStreetMap PBF files to NAV tiles for [IceNav](https://github.com/jgauchia/IceNav-v3) ESP32-based GPS navigator.
+C++ toolset for generating optimized vector map tiles from OpenStreetMap PBF files, targeting ESP32-based GPS navigators.
 
 ## Features
 
-- **Direct PBF processing** - No intermediate formats (GOL, Docker, etc.)
-- **Tile-based structure** - Standard z/x/y tile layout
-- **Pre-calculated projection** - Mercator projection done on PC for zero-CPU rendering on ESP32
-- **Optimized Storage** - int16 relative coordinates with 12-byte aligned headers
-- **Multi-Ring Polygons** - Correctly handles islands and holes in water/land features
-- **Area Filtering** - Automatically discards polygons smaller than 4px² to reduce noise
-- **BBox-based Culling** - 4-byte object bounding box for ultra-fast visibility checks
-- **Seamless borders** - Features stored with 10% safety margin to avoid edge artifacts
-- **Feature filtering** - Configurable via `features.json`
+- **High-Performance C++ Engine**: OSM PBF parsing and tile generation using GEOS, Osmium, and GDAL.
+- **Four-Pass Rendering Pipeline**: Road casings, bridge decks, and layered text labels.
+- **Smart Text Labels (GEOM_TEXT)**: Collision detection and population-based filtering for place names and road labels.
+- **Packed Binary Containers (NPK2)**: Tiles consolidated into single `Zxx.nav` files per zoom level with Y-table index for O(1) row lookup.
+- **Ocean Water Polygons**: Optional loading of pre-computed water polygons from [osmdata.openstreetmap.de](https://osmdata.openstreetmap.de) shapefiles, with spatial filtering on the PBF bounding box.
+- **Memory Optimized**: POSIX `mmap` feature storage for country-scale processing with low RAM footprint.
+- **Advanced Aesthetics**:
+    - **Multi-Level Boundaries**: International, regional, and municipal borders.
+    - **Smart Filtering**: Automatic removal of tunnels, subway lines, and underground polygons.
+    - **Dynamic Styles**: Line widths (0.5px units) and 16-level priorities via `features.json`.
+- **ESP32 Ready**: VarInt/ZigZag delta encoding and streaming-ready structures.
+- **PC Simulator**: Pygame-based viewer with 4-pass rendering simulation.
 
-## Requirements
+---
 
-- Python 3.8+
-- Virtual environment (recommended)
+## Getting Started
 
-## Installation
-
+### 1. Requirements
+Install the necessary libraries (Ubuntu/Debian):
 ```bash
-# Clone repository
-git clone https://github.com/jgauchia/Tile-Generator.git
-cd Tile-Generator
+sudo apt-get install libosmium2-dev libgeos-dev nlohmann-json3-dev libgdal-dev libboost-dev
+```
 
-# Create virtual environment
-python3 -m venv venv
-source venv/bin/activate
+### 2. Building the Generator
+```bash
+mkdir build && cd build
+cmake ..
+make -j$(nproc)
+```
 
-# Install dependencies
-pip install shapely pygame osmium
+### 3. Generating Maps
+```bash
+./nav_generator <input.pbf> <output_dir> features.json [--zoom 6-17] [--water-shp <path>]
+```
+
+### 4. Ocean Water Polygons (optional)
+
+Download the pre-computed water polygons shapefile (once, ~540 MB):
+```bash
+wget https://osmdata.openstreetmap.de/download/water-polygons-split-4326.zip
+unzip water-polygons-split-4326.zip
+```
+
+Generate with oceans:
+```bash
+./nav_generator input.pbf output features.json --zoom 6-17 \
+    --water-shp water-polygons-split-4326/water_polygons.shp
+```
+
+The generator reads the PBF bounding box and only loads water polygons intersecting the extract area. See [WATER.md](WATER.md) for details.
+
+### 5. Viewing Maps (PC)
+```bash
+python tile_viewer.py <output_dir> --lat <latitude> --lon <longitude> [--zoom <level>] --config features.json
 ```
 
 ---
 
-## Generate NAV Tiles
+## Processing Pipeline
 
-```bash
-python tile_generator.py <input.pbf> <output_dir> features.json [--zoom 6-17]
+```
+1. Config loading (features.json)
+2. Pass 1: RelationScanner (boundaries, water multipolygon relations)
+3. Pass 2: PBF feature extraction (ways, areas → MappedStore)
+4. Pass 3: Water polygon loading from shapefile (optional, --water-shp)
+5. TileProcessor: clip, merge, simplify, emit for all zoom levels → NPK2 packs
 ```
 
-**Arguments:**
+---
 
-| Argument | Description | Default |
-|----------|-------------|---------|
-| `input.pbf` | OpenStreetMap PBF file | Required |
-| `output_dir` | Output directory | Required |
-| `features.json` | Feature configuration | Required |
-| `--zoom` | Zoom range (e.g., `6-17`, `10-14`, `12`) | `6-17` |
+## Technical Standards
+
+- **Container Format**: NPK2 with Y-table index for O(1) row lookup + binary search within rows.
+- **Tile Format**: NAV1, 13-byte feature header with casing flags and 0.5px width units.
+- **Z-Order**: 16 priority levels (0-15) mapped to a 4-pass rendering pipeline.
+- **Coordinate System**: Web Mercator, 12-bit tile-relative space (0-4096), delta VarInt/ZigZag encoding.
+
+For detailed binary format specifications, see [`docs/bin_tile_format.md`](docs/bin_tile_format.md).
 
 ---
 
-## View NAV Tiles
-
-```bash
-python tile_viewer.py <nav_dir> --lat <latitude> --lon <longitude> [--zoom <level>]
-```
-
-**Viewer Controls:**
-
-| Key | Action |
-|-----|--------|
-| Arrow keys | Pan map |
-| Mouse drag | Pan map |
-| `[` / `]` or Mouse wheel | Zoom in/out |
-| `B` | Toggle background (white/black) |
-| `F` | Toggle polygon fill |
-| `G` | Toggle tile grid |
-| `Right Click` | Identify feature info |
-| `Q` / `ESC` | Quit |
-
----
-
-## NAV Binary Format Specification
-
-NAV is a proprietary binary format designed as a lightweight alternative to FlatGeobuf for embedded devices with limited resources. Optimized for ESP32's SD card access and low memory usage.
-
-**Key Features:**
-- Pre-projected Mercator coordinates relative to tile (0-4096 range).
-- int16 coordinates for minimal memory footprint.
-- Sequential structure for streaming reads.
-
-**File Header (22 bytes):**
-
-| Offset | Size | Field | Description |
-|--------|------|-------|-------------|
-| 0 | 4 | Magic | `NAV1` (0x4E, 0x41, 0x56, 0x31) |
-| 4 | 2 | Feature count | Number of features (little-endian) |
-| 6 | 16 | Tile BBox | lon_min, lat_min, lon_max, lat_max (4 x int32 scaled 1e7) |
-
-**Feature Record:**
-
-| Size | Field | Description |
-|------|-------|-------------|
-| 1 | Geometry type | 1=Point, 2=LineString, 3=Polygon |
-| 2 | Color | RGB565 color (little-endian) |
-| 1 | Zoom/Priority | High nibble = min_zoom, low nibble = priority |
-| 1 | Width | Line width in pixels (1-15) |
-| 4 | Object BBox | Normalized relative BBox [x1, y1, x2, y2] (4 x uint8) |
-| 2 | Coord count | Number of coordinates (little-endian) |
-| 4×N | Coordinates | x(int16) + y(int16) relative to tile origin |
-| 1 | Ring count | (Polygons only) Number of rings (default 1) |
-| 2×R | Ring ends | (Polygons only) End index of each ring |
-
-**Coordinate Mapping:**
-
-Coordinates are pre-projected to a 12-bit tile space (0-4096).
-The ESP32 renderer converts these to screen pixels using a simple bit-shift:
-`pixel = (coord * tile_size) >> 12`
-
----
-
-## Output Structure
-
-Standard z/x/y tile structure used by both IceNav and the viewer:
-`output_dir/<zoom>/<x>/<y>.nav`
-
----
-
-## SD Card Structure
-
-Copy the output directory to your SD card: `/sdcard/NAVMAP/`
-
----
-
-## License
-
-MIT License
-
-## Related Projects
-
-- [IceNav-v3](https://github.com/jgauchia/IceNav-v3) - ESP32-based GPS navigator
+## Author
+**Jordi Gauchía** (jgauchia@jgauchia.com)

@@ -1,144 +1,112 @@
 # Features JSON Format Specification
 
-This document describes the structure and usage of the `features.json` configuration file for vector tile generation.  
-The file defines feature styling, priority, and minimum zoom level for OpenStreetMap (OSM) tags to be rendered in the generated tiles.
+This document describes the structure and usage of the `features.json` configuration file for vector tile generation. The file defines styling, priority, and minimum zoom levels for OpenStreetMap (OSM) tags.
 
 ---
 
-## File Overview
+## 1. Feature Definitions
 
-- The file is a JSON object containing **feature definitions** for OpenStreetMap data styling and filtering.
-- **Feature definitions** specify styling, priority, and minimum zoom level for OSM tags.
-- Uses a **layer-based priority system** with 9 distinct categories for efficient rendering.
-
----
-
-## Feature Definitions
-
-Each feature definition is a key-value pair where:
-- The key is a **feature selector** for OSM data, matching tags in the form `key=value` or just `key`.
-- The value is an object specifying options for rendering that feature.
+Each entry in the JSON file is a key-value pair:
+- **Key**: An OSM tag selector, either `"key=value"` (exact match) or `"key"` (matches any value). Note: Compound selectors (separated by commas) are not supported.
+- **Value**: An object specifying the rendering parameters for that feature.
 
 ---
 
-## Feature Selector
+## 2. Feature Parameters
 
-- The key is either:
-    - `"key=value"`: Matches OSM features where the given tag equals the specified value.
-    - `"key"`: Matches any OSM feature with the given key present (any value).
+| Parameter | Type | Description |
+| :--- | :--- | :--- |
+| `zoom` | integer | Minimum zoom level at which the feature is included in the packed containers. |
+| `color` | string | HTML hex color (`#rrggbb`). Converted to RGB565 in the binary format. |
+| `priority`| integer | Local priority (0-15). Lower nibble of the binary zoom_priority. |
+| `widths` | object | **Manual Width Scaling**: Map of zoom level to pixels (0.5px units in binary). |
 
-**Examples:**
+---
+
+## 3. Usage Example
+
+### Forest (Polygon)
 ```json
-"natural=water": {...}
-"building": {...}
-```
-
----
-
-## Feature Parameters
-
-Each feature definition object includes:
-
-| Parameter    | Type     | Description                                                                                       |
-|--------------|----------|---------------------------------------------------------------------------------------------------|
-| zoom         | integer  | Minimum zoom level at which the feature is rendered.                                             |
-| color        | string   | Fill/stroke color in HTML hexadecimal format (`#rrggbb`).                                         |
-| priority     | integer  | Priority offset within its layer (0-9). Higher numbers render on top.                             |
-
----
-
-### Parameter Details
-
-- **zoom**  
-  - Specifies the lowest zoom at which the feature will be rendered.
-  - Features are omitted from tiles with a zoom less than this value.
-
-- **color**  
-  - Specifies the color to render the feature.
-  - Uses standard 6-character hex notation (e.g., `#aad3df`).
-  - Colors are stored in RGB565 format in binary tiles.
-
-- **priority**  
-  - Controls draw order within each layer.
-  - Final priority = `layer_base + (priority % 10)`.
-
----
-
-## Layer System
-
-Features are organized into 9 distinct layers for efficient rendering hierarchy:
-
-| Layer          | Base Priority | Description                                    |
-|----------------|----------------|------------------------------------------------|
-| landuse        | 10             | Base terrain, parks, forests, urban areas      |
-| terrain        | 20             | Natural terrain features, ridges, peaks        |
-| water          | 30             | Water bodies, coastlines (Drawn above land)    |
-| amenities      | 35             | Facility grounds (Schools, Hospitals)          |
-| railways       | 40             | Railway lines and infrastructure               |
-| roads          | 50             | All highway types and road features            |
-| infrastructure | 60             | Bridges, tunnels, and utility lines            |
-| buildings      | 70             | Building footprints and structures             |
-| places         | 90             | Geographic labels and place names              |
-
----
-
-## Special Metadata
-
-The file includes two metadata fields for system configuration:
-
-### Comment Field
-```json
-"_comment": "OSM-style colors in RGB565 format. Priority: layer_base + (priority % 10)."
-```
-
-### Layers Definition
-```json
-"_layers": "landuse:10, terrain:20, water:30, amenities:35, railways:40, roads:50, infrastructure:60, buildings:70, places:90"
-```
-- Documents the rendering hierarchy used by the generator.
-
----
-
-## Example Structure
-
-```json
-{
-  "_comment": "OSM-style colors in RGB565 format. Priority: layer_base + (priority % 10).",
-  "_layers": "landuse:10, terrain:20, water:30, amenities:35, railways:40, roads:50, infrastructure:60, buildings:70, places:90",
-  
-  "natural=water": {
-    "zoom": 12,
-    "color": "#aad3df", 
-    "priority": 1
-  },
-  "landuse=residential": {
-    "zoom": 12,
-    "color": "#e0dfdf",
-    "priority": 0
-  }
+"landuse=forest": {
+  "zoom": 8,
+  "color": "#add19e",
+  "priority": 5
 }
 ```
+*   **zoom**: Visible starting from level 8.
+*   **color**: Light green.
+*   **priority**: Level 5 (standard for vegetation/surfaces).
+
+### Motorway (Line)
+```json
+"highway=motorway": {
+  "zoom": 6,
+  "color": "#e892a2",
+  "priority": 14
+}
+```
+*   **zoom**: Visible from level 6.
+*   **color**: Pinkish-red (OSM standard).
+*   **priority**: High (Level 14, renders above most other features).
 
 ---
 
-## How Matching Works
+## 4. Layer Priority System (v0.4.0)
 
-- During tile generation, each OSM feature is checked against the keys in the JSON:
-    - If a feature has a matching tag (`key=value`), the corresponding entry is used.
-    - If only the key matches (e.g., `"building"`), it applies for any value of that key.
-- Specific matches (`key=value`) take precedence over generic key matches.
-- Features are filtered by zoom level and then sorted by final priority.
+The generator uses a simplified 16-level priority system (0-15). This value determines the rendering order within each of the four rendering passes. If multiple features have the same priority, their order is determined by their sequence in the PBF file.
+
+| Priority | Feature Type Examples |
+| :--- | :--- |
+| **0** | Background land. |
+| **1-2** | Large areas (Aerodromes, large forests, terrain). |
+| **3-5** | Smaller areas (Parks, gardens, grass, cemeteries). |
+| **6-7** | Infrastructure and Buildings. |
+| **8** | Water (Lakes, rivers). |
+| **9-11** | Links and local roads. |
+| **12-14** | Major roads and highways. |
+| **15** | Railways, Bridges, and Text Labels. |
 
 ---
 
-## Rendering Order Summary
+## 5. Special Handling: Administrative Boundaries
 
-1. **Landuse** (10-19): Base background.
-2. **Terrain** (20-29): Relief details.
-3. **Water** (30-34): Rivers and lakes on top of land.
-4. **Amenities** (35-39): School/Hospital areas.
-5. **Railways** (40-49): Tracks.
-6. **Roads** (50-59): Streets.
-7. **Infrastructure** (60-69): Bridges/Tunnels.
-8. **Buildings** (70-79): Footprints.
-9. **Places** (90-99): Labels.
+Administrative boundaries are extracted and assigned to specific priority levels to ensure they provide context without cluttering the map.
+- **Regional Borders** (admin_level < 8): Render below transport layers (Priority 3).
+- **Municipal Borders** (admin_level >= 8): Render above everything (Priority 15) but using subtle, low-contrast colors.
+
+---
+
+## 6. Special Handling: Text Labels
+
+Labels for places and road references are generated with collision detection:
+- **Place Names**: Priority 12-15 based on population.
+- **Road Shields**: Priority 15, matching the bridge/railway layer.
+
+The generator uses a 10-layer hierarchy. Final priority (0-15) is calculated as:  
+`Final Priority = (Layer_Base / 10) + (priority_from_json / 7)` (clamped to 15).
+
+| Layer | Base Priority | Description |
+| :--- | :--- | :--- |
+| **landuse** | 10 | Terrain, forests, urban areas. |
+| **boundaries**| 35 | Countries, regions, and provinces (Under roads). |
+| **water** | 30 | Lakes and rivers. |
+| **railways** | 40 | Train tracks (surface only). |
+| **roads** | 50 | Streets and highways. |
+| **places** | 90 | City labels and **Municipal boundaries** (Above roads). |
+
+---
+
+## 4. Special Handling: Administrative Boundaries
+
+Administrative boundaries are extracted using a two-pass scanner to ensure full fidelity.
+- **Regional Borders (admin_level < 8)**: Assigned to the `boundaries` layer (Base 35). They render below transport layers to avoid visual clutter.
+- **Municipal Borders (admin_level >= 8)**: Assigned to the `places` layer (Base 90). They render above everything using subtle colors to provide local context without obstructing navigation.
+
+---
+
+## 5. Rendering Order (Bottom to Top)
+
+1. **Background** (Base 10-30): Land, Water, Terrain.
+2. **Regional Borders** (Base 35): Countries and provinces.
+3. **Transport** (Base 40-50): Railways and Roads.
+4. **Information** (Base 90): Labels and Municipal limits.
