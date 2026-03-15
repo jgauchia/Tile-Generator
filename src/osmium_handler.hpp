@@ -2,7 +2,7 @@
  * @file osmium_handler.hpp
  * @author Jordi Gauchía (jgauchia @jgauchia.com)
  * @brief OSM PBF extractor using Osmium library with mapped storage support.
- * @version 0.5.0
+ * @version 0.4.0
  * @date 2026-02
  */
 
@@ -36,11 +36,15 @@ public:
         stats_nodes++;
         if (!n.location().valid()) return;
 
+        double lon = n.location().lon(), lat = n.location().lat();
+        if (lon < bbox_min_lon) bbox_min_lon = lon;
+        if (lon > bbox_max_lon) bbox_max_lon = lon;
+        if (lat < bbox_min_lat) bbox_min_lat = lat;
+        if (lat > bbox_max_lat) bbox_max_lat = lat;
+
         std::unordered_map<std::string, std::string> tags;
         for (const auto& t : n.tags())
             tags[t.key()] = t.value();
-
-        double lon = n.location().lon(), lat = n.location().lat();
 
         // Point symbols (peaks, volcanoes)
         for (const auto& [k, v] : tags)
@@ -199,7 +203,14 @@ public:
         bool is_aeroway_line = tags.count("aeroway") &&
                               (tags.at("aeroway") == "runway" || tags.at("aeroway") == "taxiway" ||
                                tags.at("aeroway") == "helipad");
-        if (is_area && !tags.count("highway") && !tags.count("place") &&
+        
+        // Optimize: Allow highway areas (pedestrian squares, parking lots) but NOT roads
+        bool is_road_transit = tags.count("highway") && 
+                              (tags.at("highway") == "motorway" || tags.at("highway") == "trunk" ||
+                               tags.at("highway") == "primary" || tags.at("highway") == "secondary" ||
+                               tags.at("highway") == "tertiary");
+
+        if (is_area && !is_road_transit && !tags.count("place") &&
             !is_aeroway_line && layer != "boundaries" && layer != "places")
         {
             // Water ways that belong to multipolygon relations: skip here,
@@ -213,9 +224,16 @@ public:
             processed_areas.insert(w.id());
 
             // Skip underground polygons (metro platforms, etc.)
-            if ((tags.count("level") && std::atoi(tags.at("level").c_str()) < 0)
-                || (tags.count("layer") && std::atoi(tags.at("layer").c_str()) < 0))
-            { stats_filtered++; return; }
+            // Only filter when explicitly underground (tunnel/covered), not layer alone
+            // (layer=-5 on wetlands, riverbanks etc. means elevation, not underground)
+            bool poly_underground = (tags.count("level") && std::atoi(tags.at("level").c_str()) < 0)
+                || ((tags.count("tunnel") || tags.count("covered"))
+                    && (tags.count("layer") && std::atoi(tags.at("layer").c_str()) < 0));
+            if (poly_underground)
+            {
+                stats_filtered++;
+                return;
+            }
 
             int nibble = get_polygon_nibble(tags, layer);
             feat.zoom_priority = utils::pack_zoom_priority(min_zoom, nibble);
@@ -245,19 +263,25 @@ public:
         if (is_underground)
         {
             if (layer == "water")
-            { stats_filtered++; return; }
+            {
+                stats_filtered++;
+                return;
+            }
             std::string hw = tags.count("highway") ? tags.at("highway") : "";
             if (hw == "pedestrian" || hw == "footway" || hw == "cycleway" || hw == "steps" || hw == "platform")
-            { stats_filtered++; return; }
+            {
+                stats_filtered++;
+                return;
+            }
             feat.color_rgb565 = 0xD69A; // #D0D0D0 light grey for underground
         }
 
         feat.zoom_priority = utils::pack_zoom_priority(min_zoom, nibble);
 
         // Densify curves (not aeroways)
-        bool is_aeroway = tags.count("aeroway") && !tags.at("aeroway").empty();
-        if (!feat.highway_type.empty() && !is_aeroway && way_points.size() >= 2)
-            way_points = utils::densify_linestring(way_points, 0.0001);
+        // bool is_aeroway = tags.count("aeroway") && !tags.at("aeroway").empty();
+        // if (!feat.highway_type.empty() && !is_aeroway && way_points.size() >= 2)
+        //    way_points = utils::densify_linestring(way_points, 0.0001);
 
         feat.points = std::move(way_points);
         feat.ring_ends.push_back(static_cast<uint32_t>(feat.points.size()));
@@ -294,8 +318,10 @@ public:
             layer = "buildings";
 
         // Skip underground areas (metro platforms, etc.)
-        if ((tags.count("level") && std::atoi(tags.at("level").c_str()) < 0)
-            || (tags.count("layer") && std::atoi(tags.at("layer").c_str()) < 0))
+        bool area_underground = (tags.count("level") && std::atoi(tags.at("level").c_str()) < 0)
+            || ((tags.count("tunnel") || tags.count("covered"))
+                && (tags.count("layer") && std::atoi(tags.at("layer").c_str()) < 0));
+        if (area_underground)
             return;
 
         FeatureConfig f_cfg = config.get_config(tags);
@@ -347,6 +373,9 @@ public:
     size_t stats_filtered = 0;
     size_t stats_points = 0;
     size_t stats_text_labels = 0;
+
+    double bbox_min_lon = 180, bbox_min_lat = 90;
+    double bbox_max_lon = -180, bbox_max_lat = -90;
 
 private:
     const ConfigManager& config;
@@ -447,8 +476,13 @@ private:
         else if (layer == "buildings") nibble = 7;
         else if (layer == "water") nibble = 7;
 
-        if (tags.count("landuse") && (tags.at("landuse") == "commercial" || tags.at("landuse") == "retail"))
+        if (tags.count("landuse") && tags.at("landuse") == "commercial")
+            nibble = 1;
+        if (tags.count("landuse") && tags.at("landuse") == "retail")
             nibble = 3;
+        if (tags.count("landuse") && (tags.at("landuse") == "residential" || tags.at("landuse") == "industrial"
+            || tags.at("landuse") == "brownfield" || tags.at("landuse") == "construction"))
+            nibble = 1;
         if (tags.count("landuse") && (tags.at("landuse") == "farmland" || tags.at("landuse") == "farmyard"))
             nibble = 4;
         if (tags.count("landuse") && tags.at("landuse") == "garages")
@@ -456,7 +490,13 @@ private:
         if ((tags.count("landuse") && tags.at("landuse") == "cemetery") ||
             (tags.count("amenity") && tags.at("amenity") == "grave_yard"))
             nibble = 3;
+        if (tags.count("leisure") && (tags.at("leisure") == "park" || tags.at("leisure") == "nature_reserve"))
+            nibble = 1;
         if (tags.count("leisure") && tags.at("leisure") == "playground")
+            nibble = 4;
+        if (tags.count("natural") && tags.at("natural") == "beach")
+            nibble = 4;
+        if (tags.count("natural") && tags.at("natural") == "wetland")
             nibble = 4;
         if (tags.count("landuse") && (tags.at("landuse") == "grass" || tags.at("landuse") == "meadow"
             || tags.at("landuse") == "village_green"))

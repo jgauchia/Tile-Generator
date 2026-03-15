@@ -22,9 +22,19 @@ const uint8_t GEOM_TEXT = 4;
 #pragma pack(push, 1)
 struct PackHeader
 {
-    char magic[4];
+    char magic[4];    // "NPK2"
     uint8_t zoom;
     uint32_t tile_count;
+    uint32_t y_min;
+    uint32_t y_max;
+    uint32_t ytable_offset;  // file offset to Y-table
+    uint32_t index_offset;   // file offset to tile index
+};
+
+struct YTableEntry
+{
+    uint32_t idx_start;  // first index entry for this Y row
+    uint32_t idx_count;  // number of tiles in this Y row
 };
 
 struct IndexEntry
