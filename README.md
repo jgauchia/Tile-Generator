@@ -1,85 +1,87 @@
-# Tile-Generator (v0.4.0)
+# Tile-Generator (v0.5.0)
 
 C++ toolset for generating optimized vector map tiles from OpenStreetMap PBF files, targeting ESP32-based GPS navigators.
 
 ## Features
 
-- **High-Performance C++ Engine**: OSM PBF parsing and tile generation using GEOS, Osmium, and GDAL.
-- **Four-Pass Rendering Pipeline**: Road casings, bridge decks, and layered text labels.
-- **Smart Text Labels (GEOM_TEXT)**: Collision detection and population-based filtering for place names and road labels.
-- **Packed Binary Containers (NPK2)**: Tiles consolidated into single `Zxx.nav` files per zoom level with Y-table index for O(1) row lookup.
-- **Ocean Water Polygons**: Optional loading of pre-computed water polygons from [osmdata.openstreetmap.de](https://osmdata.openstreetmap.de) shapefiles, with spatial filtering on the PBF bounding box.
-- **Memory Optimized**: POSIX `mmap` feature storage for country-scale processing with low RAM footprint.
-- **Advanced Aesthetics**:
-    - **Multi-Level Boundaries**: International, regional, and municipal borders.
-    - **Smart Filtering**: Automatic removal of tunnels, subway lines, and underground polygons.
-    - **Dynamic Styles**: Line widths (0.5px units) and 16-level priorities via `features.json`.
-- **ESP32 Ready**: VarInt/ZigZag delta encoding and streaming-ready structures.
-- **PC Simulator**: Pygame-based viewer with 4-pass rendering simulation.
+- **Pure Hilbert Indexing (New)**: Uses a space-filling curve for both data ordering and indexing, ensuring maximum spatial locality and optimized SD card seek patterns.
+- **Binary Tile Deduplication (New)**: Identifies identical tiles (e.g., land/ocean background) and reuses data blocks, significantly reducing final file size.
+- **High-Performance C++ Engine**: OSM PBF parsing and tile generation using GEOS, GDAL, and Libosmium.
+- **Efficient Binary Format**: Packed NPK2 containers with Delta+ZigZag+VarInt coordinate encoding.
+- **Memory-Mapped Storage**: Uses `mmap` for feature storage, allowing processing of large PBF files with minimal RAM.
+- **Multi-threaded Processing**: Parallel tile generation leveraging all available CPU cores.
+- **Z-Order Management**: 4-pass rendering pipeline supported in binary format.
 
----
+## Generation Process
 
-## Getting Started
+The generator operates in multiple passes to ensure topological consistency and optimal packaging:
 
-### 1. Requirements
-Install the necessary libraries (Ubuntu/Debian):
+1. **Pass 1 (Relations)**: Scans PBF for administrative boundaries and water multipolygons.
+2. **Pass 2 (Features)**: Extracts nodes and ways, applying semantic filtering and layer assignment.
+3. **Pass 3 (Water)**: Integrates global water polygons from external Shapefiles (using GDAL/OGR).
+4. **Pass 4 (Tiles)**: Parallel clipping, simplification (GEOS), and NPK2-Hilbert packaging.
+
+## Dependencies & Installation
+
+### Required Libraries
+- **Libosmium**: PBF parsing.
+- **GEOS**: Geometry operations (clipping, simplification, unions).
+- **GDAL/OGR**: Shapefile support for ocean water polygons.
+- **Protozero**: Low-level OSM data handling.
+- **C++17 Compiler**: GCC 9+ or Clang.
+
+### Installation (Ubuntu/Debian)
 ```bash
-sudo apt-get install libosmium2-dev libgeos-dev nlohmann-json3-dev libgdal-dev libboost-dev
+sudo apt-get update
+sudo apt-get install -y build-essential cmake \
+    libosmium2-dev libgeos-dev libgdal-dev \
+    libbz2-dev zlib1g-dev libexpat1-dev
 ```
 
-### 2. Building the Generator
+## Compilation
+
 ```bash
 mkdir build && cd build
 cmake ..
 make -j$(nproc)
 ```
 
-### 3. Generating Maps
+## Usage
+
 ```bash
-./nav_generator <input.pbf> <output_dir> features.json [--zoom 6-17] [--water-shp <path>]
+./nav_generator <osm_pbf_file> <output_dir> <features_json> [--zoom min-max]
 ```
 
-### 4. Ocean Water Polygons (optional)
-
-Download the pre-computed water polygons shapefile (once, ~540 MB):
+### Example
 ```bash
-wget https://osmdata.openstreetmap.de/download/water-polygons-split-4326.zip
-unzip water-polygons-split-4326.zip
+./nav_generator andorra-latest.osm.pbf ./NAVMAP features.json --zoom 10-15
 ```
 
-Generate with oceans:
+## Visualization & Debugging
+
+The project includes a Python-based simulator to validate maps before flashing them to the ESP32.
+
+### Prerequisites
+- **Python 3.x**
+- **Pygame**: `pip install pygame`
+
+### Usage
 ```bash
-./nav_generator input.pbf output features.json --zoom 6-17 \
-    --water-shp water-polygons-split-4326/water_polygons.shp
+python3 tile_viewer.py <output_dir> --lat <latitude> --lon <longitude> --config features.json
 ```
 
-The generator reads the PBF bounding box and only loads water polygons intersecting the extract area. See [WATER.md](WATER.md) for details.
+### Key Commands
+- **Arrows / Mouse Drag**: Pan map.
+- **`[` / `]`**: Zoom control.
+- **`H`**: Toggle **Hilbert Path** (verify spatial locality).
+- **`G`**: Toggle Tile Grid.
+- **`S` / `L`**: Toggle Stats and Legend panels.
 
-### 5. Viewing Maps (PC)
-```bash
-python tile_viewer.py <output_dir> --lat <latitude> --lon <longitude> [--zoom <level>] --config features.json
-```
+## Internal Format Details
 
----
-
-## Processing Pipeline
-
-```
-1. Config loading (features.json)
-2. Pass 1: RelationScanner (boundaries, water multipolygon relations)
-3. Pass 2: PBF feature extraction (ways, areas → MappedStore)
-4. Pass 3: Water polygon loading from shapefile (optional, --water-shp)
-5. TileProcessor: clip, merge, simplify, emit for all zoom levels → NPK2 packs
-```
-
----
-
-## Technical Standards
-
-- **Container Format**: NPK2 with Y-table index for O(1) row lookup + binary search within rows.
-- **Tile Format**: NAV1, 13-byte feature header with casing flags and 0.5px width units.
-- **Z-Order**: 16 priority levels (0-15) mapped to a 4-pass rendering pipeline.
-- **Coordinate System**: Web Mercator, 12-bit tile-relative space (0-4096), delta VarInt/ZigZag encoding.
+- **Container**: NPK2-Hilbert (Flat Hilbert Index).
+- **Internal Format**: NAV1 (Geometry + Text labels).
+- **Coordinates**: Web Mercator, 12-bit tile-relative space (0-4096).
 
 For detailed binary format specifications, see [`docs/bin_tile_format.md`](docs/bin_tile_format.md).
 

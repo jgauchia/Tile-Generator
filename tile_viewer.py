@@ -54,6 +54,53 @@ def deg2num(lat_deg: float, lon_deg: float, zoom: int) -> Tuple[float, float]:
     return xtile, ytile
 
 
+def xy_to_hilbert(x: int, y: int, z: int) -> int:
+    """Convert (x,y) tile coordinates to Hilbert index."""
+    def rot(n, x, y, rx, ry):
+        if ry == 0:
+            if rx == 1:
+                x = n - 1 - x
+                y = n - 1 - y
+            return y, x
+        return x, y
+
+    rx, ry, d = 0, 0, 0
+    n = 1 << z
+    s = n // 2
+    while s > 0:
+        rx = 1 if (x & s) > 0 else 0
+        ry = 1 if (y & s) > 0 else 0
+        d += s * s * ((3 * rx) ^ ry)
+        x, y = rot(s, x, y, rx, ry)
+        s //= 2
+    return d
+
+
+def hilbert_to_xy(d: int, z: int) -> Tuple[int, int]:
+    """Convert Hilbert index to (x,y) tile coordinates."""
+    def rot(n, x, y, rx, ry):
+        if ry == 0:
+            if rx == 1:
+                x = n - 1 - x
+                y = n - 1 - y
+            return y, x
+        return x, y
+
+    n = 1 << z
+    x, y = 0, 0
+    t = d
+    s = 1
+    while s < n:
+        rx = 1 & (t // 2)
+        ry = 1 & (t ^ rx)
+        x, y = rot(s, x, y, rx, ry)
+        x += s * rx
+        y += s * ry
+        t //= 4
+        s *= 2
+    return x, y
+
+
 def num2deg(xtile: float, ytile: float, zoom: int) -> Tuple[float, float]:
     """Convert fractional tile numbers to lat/lon."""
     n = 2.0 ** zoom
@@ -252,6 +299,7 @@ class NAVViewer:
         self.nav_dir = nav_dir
         self.available_zooms: Set[int] = set()
         self.pack_index: Dict[int, Dict[Tuple[int, int], Tuple[str, int, int]]] = {}
+        self.dedup_stats: Dict[int, Dict[str, float]] = {}  # Stats per zoom
         self._index_tiles()
 
         self.center_lat = 0.0
@@ -260,6 +308,7 @@ class NAVViewer:
         self.background_color = (255, 255, 255)
         self.fill_polygons = True
         self.show_tile_grid = False
+        self.show_hilbert_path = False
 
         self.last_query_stats = {}
         self.cached_features: Optional[List[NavFeature]] = None
@@ -288,31 +337,62 @@ class NAVViewer:
                 self._index_pack_file(full)
 
     def _index_pack_file(self, pack_path: str):
-        """Parse NPK2 pack header + index and store tile offsets."""
+        """Parse Pure Hilbert NPK2 pack header + index and store tile offsets."""
         try:
             with open(pack_path, 'rb') as f:
                 magic = f.read(4)
                 if magic != b'NPK2':
                     return
                 zoom = struct.unpack('<B', f.read(1))[0]
-                tile_count, y_min, y_max, ytable_off, index_off = struct.unpack('<IIIII', f.read(20))
+                # Header: magic(4), zoom(1), count(4), index_off(4), reserved(16)
+                tile_count, index_off = struct.unpack('<II', f.read(8))
+                f.read(16) # Skip reserved
+                
                 f.seek(index_off)
                 index = {}
+                offsets_seen = set()
+                total_indexed_size = 0
+                unique_data_size = 0
+                
+                # IndexEntry: h(8), offset(4), size(4)
                 for _ in range(tile_count):
-                    x, y, offset, size = struct.unpack('<IIII', f.read(16))
-                    index[(x, y)] = (pack_path, offset, size)
+                    h, offset, size = struct.unpack('<QII', f.read(16))
+                    index[h] = (pack_path, offset, size)
+                    total_indexed_size += size
+                    if offset not in offsets_seen:
+                        offsets_seen.add(offset)
+                        unique_data_size += size
+                
                 self.pack_index[zoom] = index
                 self.available_zooms.add(zoom)
-                logger.info(f"Indexed pack Z{zoom}: {tile_count} tiles, Y {y_min}-{y_max}")
+                
+                # Calculate deduplication savings
+                savings = 0
+                if total_indexed_size > 0:
+                    savings = (1.0 - (unique_data_size / total_indexed_size)) * 100
+                
+                self.dedup_stats[zoom] = {
+                    'total_tiles': tile_count,
+                    'unique_tiles': len(offsets_seen),
+                    'savings_pct': savings,
+                    'file_size_mb': os.path.getsize(pack_path) / (1024*1024)
+                }
+                
+                logger.info(f"Indexed Hilbert pack Z{zoom}: {tile_count} tiles, "
+                            f"Savings: {savings:.1f}%, Size: {self.dedup_stats[zoom]['file_size_mb']:.2f} MB")
         except Exception as e:
             logger.warning(f"Could not index pack {pack_path}: {e}")
 
     def _read_tile_from_pack(self, zoom: int, tx: int, ty: int) -> List[NavFeature]:
-        """Read a single tile's NAV data from an NPK1 pack file."""
+        """Read a single tile's NAV data using Hilbert ID lookup."""
         zindex = self.pack_index.get(zoom)
         if not zindex:
             return []
-        entry = zindex.get((tx, ty))
+        
+        # Convert (x,y) to Hilbert index for lookup
+        h_id = xy_to_hilbert(tx, ty, zoom)
+        entry = zindex.get(h_id)
+        
         if not entry:
             return []
         pack_path, offset, size = entry
@@ -322,7 +402,7 @@ class NAVViewer:
                 tile_data = f.read(size)
             return read_nav_tile_from_bytes(tile_data, tx, ty)
         except Exception as e:
-            logger.debug(f"Error reading tile {tx}/{ty} from pack: {e}")
+            logger.debug(f"Error reading Hilbert tile {tx}/{ty} (H:{h_id}) from pack: {e}")
             return []
 
     def _load_config(self, config_file: str):
@@ -466,6 +546,34 @@ class NAVViewer:
 
         if self.show_tile_grid:
             self._draw_tile_grid(surface)
+
+        if self.show_hilbert_path:
+            self._draw_hilbert_path(surface)
+
+    def _draw_hilbert_path(self, surface: pygame.Surface):
+        """Draw a line connecting tiles in Hilbert order."""
+        if self.zoom not in self.pack_index:
+            return
+        
+        # Get sorted Hilbert IDs present in the current zoom
+        h_ids = sorted(self.pack_index[self.zoom].keys())
+        points = []
+        
+        # Identify viewport boundaries
+        center_x, center_y = deg2num(self.center_lat, self.center_lon, self.zoom)
+        tl_x, tl_y = center_x - 1.5, center_y - 1.5
+        
+        for h in h_ids:
+            tx, ty = hilbert_to_xy(h, self.zoom)
+            # Only draw if tile is near the viewport
+            if tl_x - 1 <= tx <= tl_x + 4 and tl_y - 1 <= ty <= tl_y + 4:
+                sx, sy = self._tile_coord_to_screen(tx, ty, 2048, 2048)
+                points.append((sx, sy))
+        
+        if len(points) >= 2:
+            pygame.draw.lines(surface, (255, 50, 50), False, points, 2)
+            for p in points:
+                pygame.draw.circle(surface, (255, 50, 50), p, 4)
 
     def _tile_coord_to_screen(self, tx: int, ty: int, px: int, py: int) -> Tuple[int, int]:
         """Convert relative tile coordinate (0-4096) to viewport pixels."""
@@ -801,6 +909,9 @@ def main():
                 elif event.key == pygame.K_g:
                     viewer.show_tile_grid = not viewer.show_tile_grid
                     need_redraw = True
+                elif event.key == pygame.K_h:
+                    viewer.show_hilbert_path = not viewer.show_hilbert_path
+                    need_redraw = True
                 elif event.key == pygame.K_r:
                     # Force reload tiles (clear cache)
                     viewer.last_viewport_key = None
@@ -947,8 +1058,17 @@ def main():
                 screen.blit(font_small.render(f"  Features: {s.get('features', 0)}", True, (150, 150, 150)), (VIEWPORT_SIZE + 10, stats_y + 32))
                 screen.blit(font_small.render(f"  Time: {s.get('time_ms', 0):.0f}ms", True, (150, 150, 150)), (VIEWPORT_SIZE + 10, stats_y + 46))
 
+            # Deduplication statistics
+            dedup_y = stats_y + 70
+            if viewer.zoom in viewer.dedup_stats:
+                ds = viewer.dedup_stats[viewer.zoom]
+                screen.blit(font_small.render(f"  Unique data: {ds['unique_tiles']}/{ds['total_tiles']}", True, (150, 150, 150)), (VIEWPORT_SIZE + 10, dedup_y + 18))
+                savings_color = (100, 255, 100) if ds['savings_pct'] > 10 else (150, 150, 150)
+                screen.blit(font_small.render(f"  Space savings: {ds['savings_pct']:.1f}%", True, savings_color), (VIEWPORT_SIZE + 10, dedup_y + 32))
+                screen.blit(font_small.render(f"  Pack size: {ds['file_size_mb']:.2f} MB", True, (150, 150, 150)), (VIEWPORT_SIZE + 10, dedup_y + 46))
+
             # Feature Identification (Right-click)
-            feature_y = stats_y + 80
+            feature_y = dedup_y + 70
             if not show_stats_window and not show_legend_window:
                 screen.blit(font_small.render("Selected Feature:", True, info_color), (VIEWPORT_SIZE + 10, feature_y))
                 if viewer.selected_feature:

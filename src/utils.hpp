@@ -112,6 +112,66 @@ inline uint8_t pack_zoom_priority(int min_zoom, int priority)
     return (zoom_nibble << 4) | priority_nibble;
 }
 
+/**
+ * @brief Hilbert curve helper: rotate/flip a quadrant appropriately.
+ */
+inline void hilbert_rot(uint32_t n, uint32_t *x, uint32_t *y, uint32_t rx, uint32_t ry) 
+{
+    if (ry == 0) 
+    {
+        if (rx == 1) 
+        {
+            *x = n - 1 - *x;
+            *y = n - 1 - *y;
+        }
+        uint32_t t = *x;
+        *x = *y;
+        *y = t;
+    }
+}
+
+/**
+ * @brief Convert (x,y) tile coordinates to Hilbert index.
+ * @param x Tile X coordinate
+ * @param y Tile Y coordinate
+ * @param z Zoom level (defines grid size 2^z)
+ * @return 64-bit Hilbert distance
+ */
+inline uint64_t xy_to_hilbert(uint32_t x, uint32_t y, int z) 
+{
+    uint32_t rx, ry;
+    uint64_t d = 0;
+    uint32_t n = 1 << z;
+    for (uint32_t s = n / 2; s > 0; s /= 2) 
+    {
+        rx = (x & s) > 0;
+        ry = (y & s) > 0;
+        d += static_cast<uint64_t>(s) * s * ((3 * rx) ^ ry);
+        hilbert_rot(s, &x, &y, rx, ry);
+    }
+    return d;
+}
+
+/**
+ * @brief Convert Hilbert index to (x,y) tile coordinates.
+ */
+inline void hilbert_to_xy(uint64_t d, int z, uint32_t &x, uint32_t &y) 
+{
+    uint32_t rx, ry, s;
+    uint64_t t = d;
+    x = y = 0;
+    uint32_t n = 1 << z;
+    for (s = 1; s < n; s *= 2) 
+    {
+        rx = 1 & (t / 2);
+        ry = 1 & (t ^ rx);
+        hilbert_rot(s, &x, &y, rx, ry);
+        x += s * rx;
+        y += s * ry;
+        t /= 4;
+    }
+}
+
 inline uint8_t meters_to_pixels(double width_meters, int zoom, double lat = 45.0)
 {
     double meters_per_pixel = 156543.0 * std::cos(lat * M_PI / 180.0) / std::pow(2.0, zoom);
