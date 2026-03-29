@@ -25,22 +25,13 @@ struct PackHeader
     char magic[4];    // "NPK2"
     uint8_t zoom;
     uint32_t tile_count;
-    uint32_t y_min;
-    uint32_t y_max;
-    uint32_t ytable_offset;  // file offset to Y-table
     uint32_t index_offset;   // file offset to tile index
-};
-
-struct YTableEntry
-{
-    uint32_t idx_start;  // first index entry for this Y row
-    uint32_t idx_count;  // number of tiles in this Y row
+    uint32_t reserved[4];    // for future use
 };
 
 struct IndexEntry
 {
-    uint32_t x;
-    uint32_t y;
+    uint64_t h;       // Hilbert index
     uint32_t offset;
     uint32_t size;
 };

@@ -1,9 +1,9 @@
 /**
  * @file tile_processor.hpp
  * @author Jordi Gauchía (jgauchia @jgauchia.com)
- * @brief Optimized tile generation engine with NAV-PACK container support.
- * @version 0.4.0
- * @date 2026-02
+ * @brief Optimized tile generation engine with Pure Hilbert Indexing and NAV-PACK container support.
+ * @version 0.5.0
+ * @date 2026-03
  */
 
 #pragma once
@@ -27,6 +27,7 @@
 #include "utils.hpp"
 #include "mapped_store.hpp"
 #include "constants.hpp"
+#include "nav_types.hpp"
 
 namespace nav {
 
@@ -67,7 +68,7 @@ private:
         std::size_t operator()(const TileCoord& k) const
         { return std::hash<int>()(k.x) ^ (std::hash<int>()(k.y) << 1); }
     };
-    struct PackedTile { uint32_t x, y; std::vector<uint8_t> data; };
+    struct PackedTile { uint32_t x, y; uint64_t h; std::vector<uint8_t> data; };
 
     struct ProcessedFeature
     {
@@ -346,8 +347,6 @@ private:
             bool is_rail = RAIL_TYPES.count(pf.highway_type) > 0;
             if (!is_road && !is_rail) continue;
 
-            // Build GEOS linestring from tile coords → need to reverse project
-            // Actually we need to work from projected coords already in the ProcessedFeature
             if (pf.rings.empty() || pf.rings[0].size() < 2) continue;
 
             GEOSCoordSequence* seq = GEOSCoordSeq_create_r(handle, (uint32_t)pf.rings[0].size(), 2);
@@ -370,8 +369,7 @@ private:
             }
 
             double rail_extra = is_rail ? 2.0 : 1.0;
-            // Scale factor: pixel_deg converts to degrees, but we're in tile coords (4096 per tile)
-            double px_scale = 4096.0 / 256.0; // 16 tile units per pixel
+            double px_scale = 4096.0 / 256.0; 
             double tight_buf = (road_width * 0.4 + rail_extra) * px_scale;
             double extra = 5.0 * (1 << (z - 16));
             double generous_buf = (road_width / 4.0 + extra) * px_scale;
@@ -387,14 +385,12 @@ private:
         std::vector<ProcessedFeature> result;
         if (tight_buffers.empty()) return result;
 
-        // Union all tight buffers
         GEOSGeometry* tight_coll = GEOSGeom_createCollection_r(handle, GEOS_GEOMETRYCOLLECTION,
                                                                  tight_buffers.data(), (uint32_t)tight_buffers.size());
         GEOSGeometry* tight_union = GEOSUnaryUnion_r(handle, tight_coll);
 
         if (tight_union && !GEOSisEmpty_r(handle, tight_union))
         {
-            // Use convex hull if multi
             GEOSGeometry* deck = tight_union;
             int type = GEOSGeomTypeId_r(handle, tight_union);
             if (type == GEOS_MULTIPOLYGON || type == GEOS_GEOMETRYCOLLECTION)
@@ -460,8 +456,6 @@ private:
             for (size_t offset : bucket)
             {
                 Feature f = store.get(offset);
-
-                // z9 filter: skip secondary without ref
                 if (z == 9 && f.highway_type == "secondary" && f.ref.empty())
                     continue;
 
@@ -481,7 +475,6 @@ private:
             }
         }
 
-        // Collect tile coords that have labels
         std::unordered_map<TileCoord, std::vector<size_t>, TileCoordHash> tile_label_indices;
         for (size_t li = 0; li < placed_labels.size(); ++li)
         {
@@ -489,7 +482,6 @@ private:
                 tile_label_indices[tc].push_back(li);
         }
 
-        // Merge tile sets
         std::unordered_set<TileCoord, TileCoordHash> all_tile_coords;
         for (const auto& [tc, _] : tile_map) all_tile_coords.insert(tc);
         for (const auto& [tc, _] : tile_label_indices) all_tile_coords.insert(tc);
@@ -529,16 +521,15 @@ private:
                     const auto& tw = tiles[idx];
                     size_t m = 0;
 
-                    // Collect labels for this tile
                     std::vector<const Feature*> tile_labels;
                     for (size_t li : tw.label_indices)
                         tile_labels.push_back(&placed_labels[li].feature);
 
-                    // Point symbols for this tile
                     auto pt_syms = make_point_symbols(point_features, z, tw.coord.x, tw.coord.y);
 
                     packed_results[idx].x = (uint32_t)tw.coord.x;
                     packed_results[idx].y = (uint32_t)tw.coord.y;
+                    packed_results[idx].h = utils::xy_to_hilbert(packed_results[idx].x, packed_results[idx].y, z);
                     packed_results[idx].data = serialize_tile(z, tw.coord.x, tw.coord.y,
                                                               store, tw.offsets, handle, m,
                                                               tile_labels, pt_syms);
@@ -563,55 +554,56 @@ private:
         }
         for (auto& w : workers) w.join();
 
+        // 1. Sort by Hilbert index to define physical AND index order
         std::sort(packed_results.begin(), packed_results.end(), [](const PackedTile& a, const PackedTile& b) {
-            return a.y != b.y ? a.y < b.y : a.x < b.x;
+            return a.h < b.h;
         });
 
         std::string pack_path = output_dir + "/Z" + std::to_string(z) + ".nav";
         std::ofstream out(pack_path, std::ios::binary);
         if (out)
         {
-            uint32_t y_min = packed_results.front().y;
-            uint32_t y_max = packed_results.back().y;
-            uint32_t y_span = y_max - y_min + 1;
+            uint32_t index_offset = sizeof(PackHeader);
+            uint32_t data_offset = index_offset + (uint32_t)(packed_results.size() * sizeof(IndexEntry));
 
-            std::vector<YTableEntry> ytable(y_span, {0, 0});
+            std::map<std::vector<uint8_t>, uint32_t> data_to_offset;
+            std::vector<size_t> unique_data_indices;
+            uint32_t current_data_offset = data_offset;
+
+            std::vector<IndexEntry> index;
             for (size_t i = 0; i < packed_results.size(); ++i)
             {
-                uint32_t yi = packed_results[i].y - y_min;
-                if (ytable[yi].idx_count == 0)
-                    ytable[yi].idx_start = (uint32_t)i;
-                ytable[yi].idx_count++;
+                auto& pt = packed_results[i];
+                auto it = data_to_offset.find(pt.data);
+                uint32_t final_offset;
+                if (it != data_to_offset.end())
+                {
+                    final_offset = it->second;
+                }
+                else
+                {
+                    final_offset = current_data_offset;
+                    data_to_offset[pt.data] = current_data_offset;
+                    unique_data_indices.push_back(i);
+                    current_data_offset += (uint32_t)pt.data.size();
+                }
+                index.push_back({pt.h, final_offset, (uint32_t)pt.data.size()});
             }
 
             PackHeader ph;
             memcpy(ph.magic, "NPK2", 4);
             ph.zoom = (uint8_t)z;
-            ph.tile_count = (uint32_t)packed_results.size();
-            ph.y_min = y_min;
-            ph.y_max = y_max;
-            ph.ytable_offset = sizeof(PackHeader);
-            ph.index_offset = ph.ytable_offset + (uint32_t)(ytable.size() * sizeof(YTableEntry));
-
-            uint32_t data_offset = ph.index_offset + (uint32_t)(packed_results.size() * sizeof(IndexEntry));
-
-            std::vector<IndexEntry> index(packed_results.size());
-            uint32_t current_offset = data_offset;
-            for (size_t i = 0; i < packed_results.size(); ++i)
-            {
-                index[i].x = packed_results[i].x;
-                index[i].y = packed_results[i].y;
-                index[i].offset = current_offset;
-                index[i].size = (uint32_t)packed_results[i].data.size();
-                current_offset += index[i].size;
-            }
+            ph.tile_count = (uint32_t)index.size();
+            ph.index_offset = index_offset;
+            memset(ph.reserved, 0, sizeof(ph.reserved));
 
             out.write((char*)&ph, sizeof(PackHeader));
-            out.write((char*)ytable.data(), ytable.size() * sizeof(YTableEntry));
             out.write((char*)index.data(), index.size() * sizeof(IndexEntry));
-            for (const auto& pt : packed_results)
-                out.write((char*)pt.data.data(), pt.data.size());
-            total_generated_bytes += current_offset;
+            
+            for (size_t idx : unique_data_indices)
+                out.write((char*)packed_results[idx].data.data(), packed_results[idx].data.size());
+
+            total_generated_bytes += current_data_offset;
             total_generated_files++;
         }
         auto end = std::chrono::steady_clock::now();
@@ -620,12 +612,8 @@ private:
         std::cout << "\r\33[2K  Zoom " << std::setw(2) << z << ": "
                   << std::setw(8) << tiles.size() << " tiles ("
                   << std::fixed << std::setprecision(1) << avg_tps << " t/s), "
-                  << std::setw(8) << (size_t)merged_count << " polygons merged | ";
-        if (out.tellp() < 1024 * 1024)
-            std::cout << std::fixed << std::setprecision(2) << ((double)out.tellp() / 1024.0) << " KB";
-        else
-            std::cout << std::fixed << std::setprecision(2) << ((double)out.tellp() / 1024.0 / 1024.0) << " MB";
-        std::cout << " done in " << elapsed.count() << "s" << std::endl;
+                  << std::setw(8) << (size_t)merged_count << " polygons merged | "
+                  << std::setw(6) << (total_generated_bytes / 1024 / 1024) << " MB done in " << elapsed.count() << "s" << std::endl;
     }
 
     std::vector<uint8_t> serialize_tile(int z, int x, int y, const MappedStore& store,
@@ -657,7 +645,6 @@ private:
             Feature f = store.get(offset);
             if (f.geom_type == GEOM_POLYGON)
             {
-                // Pre-area filtering: skip small polygons at low zooms
                 if (pre_min_area > 0 && !f.points.empty())
                 {
                     double area2 = 0;
@@ -670,7 +657,6 @@ private:
                     if (std::abs(area2) * 0.5 < pre_min_area) continue;
                 }
 
-                // Collect island geometries for water hole subtraction
                 if (f.layer == "islands")
                 {
                     GEOSGeometry* ig = feature_to_geos(f, local_handle);
@@ -696,7 +682,6 @@ private:
                 lines.push_back(std::move(f));
         }
 
-        // Build island union for subtracting from water
         GEOSGeometry* island_union = nullptr;
         bool island_geoms_owned = false;
         if (!island_geoms.empty())
@@ -707,7 +692,6 @@ private:
             }
             else
             {
-                // createCollection takes ownership of the pointers
                 GEOSGeometry* coll = GEOSGeom_createCollection_r(local_handle, GEOS_GEOMETRYCOLLECTION,
                                                                    island_geoms.data(), (uint32_t)island_geoms.size());
                 island_geoms_owned = true;
@@ -772,7 +756,6 @@ private:
             auto ext_pts = project_ring(GEOSGetExteriorRing_r(local_handle, safe));
             if (ext_pts.size() < 3) return;
 
-            // Post-projection pixel area filter (water exempt)
             if (!is_water && min_pixel_area > 0)
             {
                 int16_t minx = 4096, maxx = 0, miny = 4096, maxy = 0;
@@ -798,7 +781,6 @@ private:
                 const GEOSGeometry* hole = GEOSGetInteriorRingN_r(local_handle, safe, h);
                 if (!hole) continue;
 
-                // Filter small holes (not water)
                 if (!is_water && min_hole_area_deg2 > 0)
                 {
                     const GEOSCoordSequence* hs = GEOSGeom_getCoordSeq_r(local_handle, hole);
@@ -825,7 +807,6 @@ private:
             if (!pf.rings.empty()) final_features.push_back(std::move(pf));
         };
 
-        // Merged groups (landcover + buildings only, like Python)
         for (auto& [style, geos_polys] : poly_groups)
         {
             GEOSGeometry* coll = GEOSGeom_createCollection_r(local_handle, GEOS_GEOMETRYCOLLECTION, geos_polys.data(), (uint32_t)geos_polys.size());
@@ -850,7 +831,6 @@ private:
             }
             if (!final_geom) { GEOSGeom_destroy_r(local_handle, coll); continue; }
 
-            // Sharding fallback: if merged result has > 65535 points, emit individually
             uint32_t merged_pts = count_geos_points(local_handle, final_geom);
             if (merged_pts > 65535)
             {
@@ -870,7 +850,6 @@ private:
             GEOSGeom_destroy_r(local_handle, coll); GEOSGeom_destroy_r(local_handle, final_geom);
         }
 
-        // Individual polygons (water, etc.) — clip + single simplify
         for (auto& [style, feats] : poly_individual)
         {
             uint8_t nibble = style.prio & 0x0F;
@@ -886,7 +865,6 @@ private:
                 if (!GEOSisValid_r(local_handle, clipped)) { GEOSGeometry* v = GEOSMakeValid_r(local_handle, clipped); GEOSGeom_destroy_r(local_handle, clipped); clipped = v; }
                 if (!clipped) continue;
 
-                // Subtract islands from water to create holes
                 if (is_water && island_union)
                 {
                     GEOSGeometry* diff = GEOSDifference_r(local_handle, clipped, island_union);
@@ -941,7 +919,6 @@ private:
             }
         }
 
-        // Process lines — clip with line margin, conditional simplification, no protect_esp32
         for (const auto& f : lines)
         {
             GEOSGeometry* g = feature_to_geos(f, local_handle);
@@ -966,7 +943,6 @@ private:
                 }
             }
 
-            // Conditional simplification tolerance per layer
             bool skip_simplify = (f.layer == "water" || f.layer == "roads");
             double line_tol = tolerance;
             if (f.layer == "infrastructure") line_tol = pixel_deg * 0.1;
@@ -1009,20 +985,16 @@ private:
             GEOSGeom_destroy_r(local_handle, g); GEOSGeom_destroy_r(local_handle, clipped);
         }
 
-        // Add bridge deck underlays
         auto bridge_decks = make_bridge_decks(final_features, z, x, y, local_handle);
         final_features.insert(final_features.begin(), bridge_decks.begin(), bridge_decks.end());
 
-        // Add point symbols
         for (auto& ps : point_symbols)
             final_features.push_back(ps);
 
-        // Sort by priority nibble
         std::sort(final_features.begin(), final_features.end(), [](const ProcessedFeature& a, const ProcessedFeature& b) {
             return (a.prio & 0x0F) < (b.prio & 0x0F);
         });
 
-        // Background land polygon — full tile rectangle, nibble 0, inserted first
         {
             static const uint16_t LAND_BG = utils::hex_to_rgb565(constants::LAND_BG_COLOR);
             ProcessedFeature bg{GEOM_POLYGON, LAND_BG, utils::pack_zoom_priority(0, 0), 0, {}, {}, "", "", false, false};
@@ -1030,27 +1002,22 @@ private:
             final_features.insert(final_features.begin(), std::move(bg));
         }
 
-        // --- Serialize ---
         std::vector<uint8_t> buffer;
         double t_max_merc = utils::lat_to_mercator_y(tmax);
         double t_min_merc = utils::lat_to_mercator_y(tmin);
         double merc_range = t_max_merc - t_min_merc;
 
-        // Count total features (geometry + text)
         uint16_t count = (uint16_t)std::min((size_t)0xFFFF, final_features.size() + tile_labels.size());
         uint8_t th[22] = {'N', 'A', 'V', '1', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
-        int32_t b_lmin = (int32_t)(lmin * 1e7), b_tmin = (int32_t)(tmin * 1e7), b_lmax = (int32_t)(lmax * 1e7), b_tmax = (int32_t)(tmax * 1e7);
-        memcpy(th + 4, &count, 2); memcpy(th + 6, &b_lmin, 4); memcpy(th + 10, &b_tmin, 4); memcpy(th + 14, &b_lmax, 4); memcpy(th + 18, &b_tmax, 4);
+        memcpy(th + 4, &count, 2);
         buffer.insert(buffer.end(), th, th + 22);
 
         uint16_t written = 0;
 
-        // Geometry features
         for (const auto& pf : final_features)
         {
             if (written >= 0xFFFE) break;
 
-            // Width calculation via LINE_WIDTH_PER_ZOOM
             uint8_t final_width = 1;
             if (pf.type == GEOM_LINESTRING)
             {
@@ -1075,7 +1042,6 @@ private:
             }
             if (final_width == 0) final_width = 1;
 
-            // Casing logic
             uint8_t width_byte = std::min((int)final_width, 127);
             if (pf.type == GEOM_POLYGON)
             {
@@ -1133,7 +1099,6 @@ private:
             written++;
         }
 
-        // Text features (GEOM_TEXT)
         for (const auto* label : tile_labels)
         {
             if (written >= 0xFFFE) break;
@@ -1180,7 +1145,6 @@ private:
             written++;
         }
 
-        // Patch feature count
         memcpy(buffer.data() + 4, &written, 2);
 
         GEOSGeom_destroy_r(local_handle, clip_poly); GEOSGeom_destroy_r(local_handle, clip_line);
