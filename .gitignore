@@ -3,5 +3,9 @@ build/
 .gitignore
 rsync_copy.sh
 NAVMAP/
+ROUTE/
 water-polygons-split-*/
 water-polygons-split-4326.zip
+tools/test_astar
+tools/test_astar.exe
+__pycache__

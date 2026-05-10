@@ -2,8 +2,8 @@
  * @file osmium_handler.hpp
  * @author Jordi Gauchía (jgauchia @jgauchia.com)
  * @brief OSM PBF extractor using Osmium library with mapped storage support.
- * @version 0.4.0
- * @date 2026-02
+ * @version 0.6.0
+ * @date 2026-05
  */
 
 #pragma once
@@ -251,6 +251,25 @@ public:
         feat.ref = tags.count("ref") ? tags.at("ref") : "";
         feat.old_ref = tags.count("old_ref") ? tags.at("old_ref") : "";
 
+        if (layer == "roads")
+        {
+            if (tags.count("oneway"))
+            {
+                const std::string& ow = tags.at("oneway");
+                if (ow == "yes" || ow == "1" || ow == "true")
+                    feat.oneway = 1;
+                else if (ow == "-1" || ow == "reverse")
+                    feat.oneway = 2;
+            }
+            if (tags.count("maxspeed"))
+            {
+                try { feat.maxspeed = (uint8_t)std::min(std::stoi(tags.at("maxspeed")), 255); }
+                catch (...) {}
+            }
+            for (const auto& n : w.nodes())
+                feat.osm_node_ids.push_back(n.ref());
+        }
+
         int nibble = f_cfg.priority;
 
         feat.is_bridge = (tags.count("bridge") && (tags.at("bridge") == "yes" || tags.at("bridge") == "viaduct"));
@@ -285,6 +304,10 @@ public:
 
         feat.points = std::move(way_points);
         feat.ring_ends.push_back(static_cast<uint32_t>(feat.points.size()));
+
+        if (layer == "roads" && !feat.osm_node_ids.empty())
+            road_ways.push_back(feat);
+
         features_by_zoom[min_zoom].push_back(store.append(feat));
 
         // Road labels
@@ -366,6 +389,7 @@ public:
 
     std::vector<Feature> text_features_vec;
     std::vector<Feature> point_features;
+    std::vector<Feature> road_ways;
 
     size_t stats_nodes = 0;
     size_t stats_ways = 0;
