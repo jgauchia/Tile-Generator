@@ -269,7 +269,6 @@ def heuristic_route(nodes, a, b):
 def astar_route(nodes, edges, src, dst):
     import heapq
     N = len(nodes)
-    E = len(edges)
     INF = float('inf')
     gcost = [INF] * N
     prev = [-1] * N
@@ -287,7 +286,7 @@ def astar_route(nodes, edges, src, dst):
             break
         e_end = nodes[u][3]
         for ei in range(nodes[u][2], e_end):
-            dst_n, cost, dist_m, flags, _ = edges[ei]
+            dst_n, cost, dist_m, _, _ = edges[ei]
             ng = gcost[u] + cost
             if ng < gcost[dst_n]:
                 gcost[dst_n] = ng

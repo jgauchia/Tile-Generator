@@ -155,7 +155,6 @@ private:
         {
             double half_w = char_w * rf->text.size() / 2.0;
             double half_h = label_h;
-            bool placed = false;
             for (const auto& cand : rf->coords_candidates)
             {
                 Box box{cand.lon - half_w, cand.lat - half_h, cand.lon + half_w, cand.lat + half_h};
@@ -165,11 +164,9 @@ private:
                     Feature f_copy = *rf;
                     f_copy.points = {cand};
                     result.push_back({std::move(f_copy), expand_tiles(cand.lon, cand.lat)});
-                    placed = true;
                     break;
                 }
             }
-            (void)placed;
         }
 
         return result;

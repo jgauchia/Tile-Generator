@@ -297,11 +297,6 @@ public:
 
         feat.zoom_priority = utils::pack_zoom_priority(min_zoom, nibble);
 
-        // Densify curves (not aeroways)
-        // bool is_aeroway = tags.count("aeroway") && !tags.at("aeroway").empty();
-        // if (!feat.highway_type.empty() && !is_aeroway && way_points.size() >= 2)
-        //    way_points = utils::densify_linestring(way_points, 0.0001);
-
         feat.points = std::move(way_points);
         feat.ring_ends.push_back(static_cast<uint32_t>(feat.points.size()));
 
@@ -316,7 +311,6 @@ public:
 
     void area(const osmium::Area& a)
     {
-        stats_areas++;
         if (a.from_way() && processed_areas.count(a.orig_id()))
             return;
         std::unordered_map<std::string, std::string> tags;
@@ -393,7 +387,6 @@ public:
 
     size_t stats_nodes = 0;
     size_t stats_ways = 0;
-    size_t stats_areas = 0;
     size_t stats_filtered = 0;
     size_t stats_points = 0;
     size_t stats_text_labels = 0;

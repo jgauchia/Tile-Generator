@@ -182,30 +182,6 @@ inline uint8_t meters_to_pixels(double width_meters, int zoom, double lat = 45.0
     return static_cast<uint8_t>(std::max(1, std::min(15, pixels)));
 }
 
-inline std::vector<Point> densify_linestring(const std::vector<Point>& pts, double max_seg = 0.0001)
-{
-    if (pts.size() < 2) return pts;
-    std::vector<Point> out;
-    out.push_back(pts[0]);
-    for (size_t i = 1; i < pts.size(); ++i)
-    {
-        double dx = pts[i].lon - pts[i-1].lon;
-        double dy = pts[i].lat - pts[i-1].lat;
-        double dist = std::sqrt(dx * dx + dy * dy);
-        if (dist > max_seg)
-        {
-            int n = static_cast<int>(std::ceil(dist / max_seg));
-            for (int j = 1; j < n; ++j)
-            {
-                double t = (double)j / n;
-                out.push_back({pts[i-1].lon + dx * t, pts[i-1].lat + dy * t});
-            }
-        }
-        out.push_back(pts[i]);
-    }
-    return out;
-}
-
 inline std::string split_place_name(const std::string& name, int threshold = 12)
 {
     if ((int)name.size() <= threshold) return name;
