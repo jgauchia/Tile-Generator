@@ -1,8 +1,8 @@
 /**
  * @file shapefile_loader.hpp
  * @brief Loads pre-computed ocean water polygons from shapefiles (osmdata.openstreetmap.de).
- * @version 0.4.0
- * @date 2026-02
+ * @version 0.6.0
+ * @date 2026-05
  */
 
 #pragma once

@@ -2,8 +2,8 @@
  * @file mapped_store.hpp
  * @author Jordi Gauchía (jgauchia @jgauchia.com)
  * @brief High-performance POSIX memory-mapped storage for map features.
- * @version 0.4.0
- * @date 2026-02
+ * @version 0.6.0
+ * @date 2026-05
  */
 
 #pragma once
@@ -62,7 +62,7 @@ public:
         total_size += sizeof(uint16_t) + f.layer.size();
         total_size += sizeof(uint16_t) + f.ref.size();
         total_size += sizeof(uint16_t) + f.name.size();
-        total_size += 2; // is_bridge + is_building
+        total_size += 4; // is_bridge + is_building + oneway + maxspeed
 
         if (current_offset + total_size > capacity) grow();
 
@@ -98,6 +98,8 @@ public:
         p = write_string(p, f.name);
         *p++ = f.is_bridge ? 1 : 0;
         *p++ = f.is_building ? 1 : 0;
+        *p++ = f.oneway;
+        *p++ = f.maxspeed;
 
         current_offset = p - mapped_ptr;
         return start_offset;
@@ -149,6 +151,8 @@ public:
         p = read_string(p, f.name);
         f.is_bridge = (*p++ != 0);
         f.is_building = (*p++ != 0);
+        f.oneway = *p++;
+        f.maxspeed = *p++;
 
         return f;
     }

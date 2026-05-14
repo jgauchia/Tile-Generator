@@ -4,9 +4,29 @@ NAV Tile Viewer - ESP32 Map Simulator
 
 Displays NAV binary tiles using the Delta+ZigZag+VarInt coordinate format.
 Simulates the ESP32 rendering pipeline in a 768x768 viewport.
+Supports A* routing overlay using ROUTE.bin graph files.
 
 Usage:
     python tile_viewer.py nav_dir --lat 42.5063 --lon 1.5218 [--zoom 14]
+
+Controls:
+    Left-click       Set route origin (green marker)
+    Right-click      Set route destination + compute A* route (blue track)
+    R                Clear route and reload tiles
+    [ / ]            Zoom out / in
+    Arrow keys       Pan map
+    B                Toggle background color
+    F                Toggle polygon fill
+    G                Toggle tile grid
+    H                Toggle Hilbert path
+    S                Toggle feature stats panel
+    L                Toggle color legend panel
+    Q / Escape       Quit
+
+Routing:
+    Reads ROUTE/R{lat}_{lon}.bin from the nav_dir.
+    The routing log (bottom-right panel) shows origin, destination,
+    graph stats, route length, nodes visited and A* computation time.
 """
 
 import os
@@ -121,6 +141,173 @@ def rgb565_to_rgb888(c: int) -> Tuple[int, int, int]:
 def darken_color(rgb: Tuple[int, int, int], amount: float = 0.15) -> Tuple[int, int, int]:
     """Apply subtle darkening to an RGB color (closer to OSM style)."""
     return tuple(max(0, int(v * (1 - amount))) for v in rgb)
+
+
+# ── Routing ───────────────────────────────────────────────────────────────────
+
+# ROUTE.bin v2 format constants
+ROUTE_FILE_HDR_FMT  = '<4sBBBBIIIII'   # magic(4) version reserved[3] cell_count reserved2[4]
+ROUTE_FILE_HDR_SIZE = struct.calcsize(ROUTE_FILE_HDR_FMT)
+CELL_IDX_FMT        = '<hhIIIII'       # lat_floor lon_floor node_offset node_count edge_offset edge_count reserved
+CELL_IDX_SIZE       = struct.calcsize(CELL_IDX_FMT)
+ROUTE_NODE_FMT      = '<ffI'
+ROUTE_NODE_SIZE     = struct.calcsize(ROUTE_NODE_FMT)
+ROUTE_EDGE_FMT      = '<IIHBHx'
+ROUTE_EDGE_SIZE     = struct.calcsize(ROUTE_EDGE_FMT)
+
+
+def load_cells_for_route(route_base_dir: str,
+                         src_lat: float, src_lon: float,
+                         dst_lat: float, dst_lon: float):
+    """Load one or two cells from ROUTE.bin covering src and dst, merge into a single graph."""
+    route_path = os.path.join(route_base_dir, 'ROUTE.bin')
+    if not os.path.exists(route_path):
+        return None, None, [f'Missing: {route_path}']
+
+    data = open(route_path, 'rb').read()
+    off = 0
+
+    hdr = struct.unpack_from(ROUTE_FILE_HDR_FMT, data, off)
+    off += ROUTE_FILE_HDR_SIZE
+    if hdr[0] != b'ROUT':
+        return None, None, ['Bad magic in ROUTE.bin']
+    version    = hdr[1]
+    cell_count = hdr[5]
+    if version != 2:
+        return None, None, [f'Unsupported ROUTE.bin version {version} (expected 2)']
+
+    # Read cell index
+    cell_index = []
+    for _ in range(cell_count):
+        lat_f, lon_f, n_off, n_cnt, e_off, e_cnt, _reserved = struct.unpack_from(CELL_IDX_FMT, data, off)
+        off += CELL_IDX_SIZE
+        cell_index.append((lat_f, lon_f, n_off, n_cnt, e_off, e_cnt))
+
+    nodes_base = ROUTE_FILE_HDR_SIZE + cell_count * CELL_IDX_SIZE
+    edges_base = nodes_base + sum(c[3] for c in cell_index) * ROUTE_NODE_SIZE
+
+    # Determine which cells to load
+    def cell_key(lat, lon):
+        return (int(math.floor(lat)), int(math.floor(lon)))
+
+    needed = list(dict.fromkeys([cell_key(src_lat, src_lon), cell_key(dst_lat, dst_lon)]))
+    cell_map = {(c[0], c[1]): c for c in cell_index}
+
+    # dst_node in edges are global indices.
+    # Nodes are stored as (lat, lon, edge_start, edge_end) — explicit range avoids
+    # relying on contiguous neighbours in a sparse global array.
+    total_nodes = sum(c[3] for c in cell_index)
+    all_nodes = [(999.0, 0.0, 0, 0)] * total_nodes  # placeholder: lat=999 skipped by nearest
+    all_edges = []
+    log = []
+    loaded_any = False
+
+    for lat_k, lon_k in needed:
+        entry = cell_map.get((lat_k, lon_k))
+        if entry is None:
+            log.append(f'Cell R{lat_k}_{lon_k}: not found in index')
+            continue
+
+        _, _, n_off, n_cnt, e_off, e_cnt = entry
+        edge_base = len(all_edges)
+
+        # Read all nodes of cell into a temp list to compute edge_end per node
+        cell_nodes_raw = []
+        pos = nodes_base + n_off * ROUTE_NODE_SIZE
+        for _ in range(n_cnt):
+            lat_, lon_, local_edge_off = struct.unpack_from(ROUTE_NODE_FMT, data, pos)
+            pos += ROUTE_NODE_SIZE
+            cell_nodes_raw.append((lat_, lon_, local_edge_off))
+
+        # Build (lat, lon, edge_start, edge_end) with explicit range
+        for li, (lat_, lon_, eo) in enumerate(cell_nodes_raw):
+            if li + 1 < n_cnt:
+                e_end = cell_nodes_raw[li + 1][2] + edge_base
+            else:
+                e_end = edge_base + e_cnt
+            gi = n_off + li
+            all_nodes[gi] = (lat_, lon_, eo + edge_base, e_end)
+
+        # Read edges (dst_node already global)
+        pos = edges_base + e_off * ROUTE_EDGE_SIZE
+        for _ in range(e_cnt):
+            dst_n, cost, dist_m, flags, name_idx = struct.unpack_from(ROUTE_EDGE_FMT, data, pos)
+            pos += ROUTE_EDGE_SIZE
+            all_edges.append((dst_n, cost, dist_m, flags, name_idx))
+
+        log.append(f'R{lat_k}_{lon_k}: {n_cnt} nodes, {e_cnt} edges')
+        loaded_any = True
+
+    if not loaded_any:
+        return None, None, log
+
+    return all_nodes, all_edges, log
+
+
+def nearest_node_route(nodes, lat, lon):
+    best_i, best_d = 0, float('inf')
+    for i, (nlat, nlon, _es, _ee) in enumerate(nodes):
+        if nlat > 90.0:  # sentinel node
+            continue
+        dlat = nlat - lat
+        dlon = (nlon - lon) * math.cos((nlat + lat) * 0.5 * math.pi / 180.0)
+        d = dlat * dlat + dlon * dlon
+        if d < best_d:
+            best_d = d
+            best_i = i
+    return best_i
+
+
+def heuristic_route(nodes, a, b):
+    dlat = nodes[b][0] - nodes[a][0]
+    dlon = (nodes[b][1] - nodes[a][1]) * math.cos(
+        (nodes[a][0] + nodes[b][0]) * 0.5 * math.pi / 180.0)
+    dist_m = math.sqrt(dlat * dlat + dlon * dlon) * 111319.0
+    return (dist_m / 36.1) * 10.0
+
+
+def astar_route(nodes, edges, src, dst):
+    import heapq
+    N = len(nodes)
+    INF = float('inf')
+    gcost = [INF] * N
+    prev = [-1] * N
+    visited = [False] * N
+    gcost[src] = 0
+    pq = [(heuristic_route(nodes, src, dst), 0.0, src)]
+    visited_count = 0
+    while pq:
+        f, g, u = heapq.heappop(pq)
+        if visited[u]:
+            continue
+        visited[u] = True
+        visited_count += 1
+        if u == dst:
+            break
+        e_end = nodes[u][3]
+        for ei in range(nodes[u][2], e_end):
+            dst_n, cost, dist_m, _, _ = edges[ei]
+            ng = gcost[u] + cost
+            if ng < gcost[dst_n]:
+                gcost[dst_n] = ng
+                prev[dst_n] = u
+                h = heuristic_route(nodes, dst_n, dst)
+                heapq.heappush(pq, (ng + h, ng, dst_n))
+    if gcost[dst] == INF:
+        return [], visited_count, 0.0
+    path = []
+    cur = dst
+    while cur != -1:
+        path.append(cur)
+        cur = prev[cur]
+    path.reverse()
+    dist = 0.0
+    for i in range(1, len(path)):
+        dlat = nodes[path[i]][0] - nodes[path[i - 1]][0]
+        dlon = (nodes[path[i]][1] - nodes[path[i - 1]][1]) * math.cos(
+            (nodes[path[i]][0] + nodes[path[i - 1]][0]) * 0.5 * math.pi / 180.0)
+        dist += math.sqrt(dlat * dlat + dlon * dlon) * 111319.0
+    return path, visited_count, dist
 
 
 class NavFeature:
@@ -319,6 +506,14 @@ class NAVViewer:
         # New: Priority filter
         self.priority_filter_min = 0
         self.priority_filter_max = 15
+
+        # Routing state
+        self.route_origin: Optional[Tuple[float, float]] = None
+        self.route_dest:   Optional[Tuple[float, float]] = None
+        self.route_path_coords: List[Tuple[float, float]] = []
+        self.route_graph = None
+        self.route_log:   List[str] = []
+        self.route_base_dir: str = os.path.join(os.path.dirname(os.path.abspath(nav_dir)), 'ROUTE')
 
         # New: Color to OSM tag mapping
         self.color_to_tags: Dict[str, List[str]] = {}
@@ -543,6 +738,38 @@ class NAVViewer:
         for feature in features:
             if feature.geom_type == GEOM_TEXT:
                 self._render_feature(surface, feature)
+
+        # Route overlay
+        if len(self.route_path_coords) >= 2:
+            center_x, center_y = deg2num(self.center_lat, self.center_lon, self.zoom)
+            tl_x, tl_y = center_x - 1.5, center_y - 1.5
+            pts = []
+            for rlat, rlon in self.route_path_coords:
+                rx, ry = deg2num(rlat, rlon, self.zoom)
+                pts.append((int((rx - tl_x) * TILE_SIZE), int((ry - tl_y) * TILE_SIZE)))
+            self._draw_smooth_line(surface, (0, 100, 255), pts, 4.0)
+
+        # Origin marker (green)
+        if self.route_origin:
+            center_x, center_y = deg2num(self.center_lat, self.center_lon, self.zoom)
+            tl_x, tl_y = center_x - 1.5, center_y - 1.5
+            ox, oy = deg2num(self.route_origin[0], self.route_origin[1], self.zoom)
+            sx = int((ox - tl_x) * TILE_SIZE)
+            sy = int((oy - tl_y) * TILE_SIZE)
+            if 0 <= sx < VIEWPORT_SIZE and 0 <= sy < VIEWPORT_SIZE:
+                pygame.draw.circle(surface, (0, 200, 0), (sx, sy), 8)
+                pygame.draw.circle(surface, (255, 255, 255), (sx, sy), 8, 2)
+
+        # Dest marker (red)
+        if self.route_dest:
+            center_x, center_y = deg2num(self.center_lat, self.center_lon, self.zoom)
+            tl_x, tl_y = center_x - 1.5, center_y - 1.5
+            dx_, dy_ = deg2num(self.route_dest[0], self.route_dest[1], self.zoom)
+            sx = int((dx_ - tl_x) * TILE_SIZE)
+            sy = int((dy_ - tl_y) * TILE_SIZE)
+            if 0 <= sx < VIEWPORT_SIZE and 0 <= sy < VIEWPORT_SIZE:
+                pygame.draw.circle(surface, (220, 0, 0), (sx, sy), 8)
+                pygame.draw.circle(surface, (255, 255, 255), (sx, sy), 8, 2)
 
         if self.show_tile_grid:
             self._draw_tile_grid(surface)
@@ -824,6 +1051,9 @@ def main():
     parser.add_argument('--lon', type=float, required=True, help='Center longitude')
     parser.add_argument('--zoom', type=int, default=14, help='Zoom level')
     parser.add_argument('--config', type=str, help='Features JSON config file (optional, for OSM tag mapping)')
+    parser.add_argument('--route-dir', type=str, default=None,
+                        help='Directory containing ROUTE/R{lat}_{lon}.bin files. '
+                             'Defaults to ../ROUTE relative to nav_dir.')
 
     args = parser.parse_args()
 
@@ -832,6 +1062,13 @@ def main():
         sys.exit(1)
 
     viewer = NAVViewer(args.nav_dir, args.config)
+
+    # Resolve route directory
+    if args.route_dir:
+        viewer.route_base_dir = args.route_dir
+    else:
+        # Default: sibling ROUTE/ next to nav_dir
+        viewer.route_base_dir = os.path.join(os.path.dirname(os.path.abspath(args.nav_dir)), 'ROUTE')
     viewer.set_center(args.lat, args.lon, args.zoom)
 
     pygame.init()
@@ -913,8 +1150,12 @@ def main():
                     viewer.show_hilbert_path = not viewer.show_hilbert_path
                     need_redraw = True
                 elif event.key == pygame.K_r:
-                    # Force reload tiles (clear cache)
                     viewer.last_viewport_key = None
+                    viewer.route_origin = None
+                    viewer.route_dest = None
+                    viewer.route_path_coords = []
+                    viewer.route_graph = None
+                    viewer.route_log = []
                     need_redraw = True
                 elif event.key == pygame.K_s:
                     show_stats_window = not show_stats_window
@@ -963,8 +1204,43 @@ def main():
 
                 elif event.button == 3:
                     if mx < VIEWPORT_SIZE and my < VIEWPORT_SIZE:
-                        feature_info = viewer.identify_feature_at(mx, my)
-                        viewer.selected_feature = feature_info
+                        center_x, center_y = deg2num(viewer.center_lat, viewer.center_lon, viewer.zoom)
+                        tl_x, tl_y = center_x - 1.5, center_y - 1.5
+                        dlat, dlon = num2deg(tl_x + mx / TILE_SIZE, tl_y + my / TILE_SIZE, viewer.zoom)
+                        viewer.route_dest = (dlat, dlon)
+                        viewer.route_log = viewer.route_log[:1]
+                        viewer.route_log.append(f'Dest: {dlat:.5f}, {dlon:.5f}')
+
+                        if viewer.route_origin:
+                            nodes, edges, graph_log = load_cells_for_route(
+                                viewer.route_base_dir,
+                                viewer.route_origin[0], viewer.route_origin[1],
+                                dlat, dlon)
+                            viewer.route_graph = (nodes, edges) if nodes else None
+                            for line in graph_log:
+                                viewer.route_log.append(line)
+                            if nodes:
+                                viewer.route_log.append(
+                                    f'Graph total: {len(nodes)} nodes, {len(edges)} edges')
+                            else:
+                                viewer.route_log.append('No ROUTE.bin found')
+
+                        if viewer.route_origin and viewer.route_graph:
+                            nodes, edges = viewer.route_graph
+                            src = nearest_node_route(nodes, viewer.route_origin[0], viewer.route_origin[1])
+                            dst = nearest_node_route(nodes, dlat, dlon)
+                            viewer.route_log.append(f'Src: node {src}  Dst: node {dst}')
+                            t0 = time.perf_counter()
+                            path, vis, dist = astar_route(nodes, edges, src, dst)
+                            elapsed = (time.perf_counter() - t0) * 1000
+                            if path:
+                                viewer.route_path_coords = [(nodes[i][0], nodes[i][1]) for i in path]
+                                viewer.route_log.append(f'Route: {len(path)} nodes  {dist/1000:.1f} km')
+                                viewer.route_log.append(f'Visited: {vis}/{len(nodes)} ({100*vis/len(nodes):.1f}%)')
+                                viewer.route_log.append(f'A* time: {elapsed:.2f} ms')
+                            else:
+                                viewer.route_path_coords = []
+                                viewer.route_log.append('No path found')
                         need_redraw = True
 
                 elif event.button == 4:
@@ -980,6 +1256,19 @@ def main():
 
             elif event.type == pygame.MOUSEBUTTONUP:
                 if event.button == 1:
+                    if dragging and drag_start:
+                        ddx = event.pos[0] - drag_start[0]
+                        ddy = event.pos[1] - drag_start[1]
+                        if math.sqrt(ddx * ddx + ddy * ddy) < 5 and event.pos[0] < VIEWPORT_SIZE:
+                            mx2, my2 = event.pos
+                            center_x, center_y = deg2num(viewer.center_lat, viewer.center_lon, viewer.zoom)
+                            tl_x, tl_y = center_x - 1.5, center_y - 1.5
+                            olat, olon = num2deg(tl_x + mx2 / TILE_SIZE, tl_y + my2 / TILE_SIZE, viewer.zoom)
+                            viewer.route_origin = (olat, olon)
+                            viewer.route_path_coords = []
+                            viewer.route_dest = None
+                            viewer.route_log = [f'Origin: {olat:.5f}, {olon:.5f}']
+                            need_redraw = True
                     dragging = False
 
             elif event.type == pygame.MOUSEMOTION:
@@ -1129,6 +1418,16 @@ def main():
             if viewer.available_zooms:
                 zooms_str = f"Available Zooms: {min(viewer.available_zooms)}-{max(viewer.available_zooms)}"
                 screen.blit(font_small.render(zooms_str, True, (150, 150, 150)), (10, VIEWPORT_SIZE + 30))
+
+            # Routing log (bottom of toolbar)
+            if viewer.route_log:
+                route_log_y = VIEWPORT_SIZE - 14 - len(viewer.route_log) * 16
+                screen.blit(font_small.render('── Route ──', True, (100, 180, 255)),
+                            (VIEWPORT_SIZE + 10, route_log_y - 18))
+                for line in viewer.route_log:
+                    screen.blit(font_small.render(line, True, (180, 230, 180)),
+                                (VIEWPORT_SIZE + 10, route_log_y))
+                    route_log_y += 16
 
             pygame.display.flip()
             need_redraw = False

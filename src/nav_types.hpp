@@ -2,8 +2,8 @@
  * @file nav_types.hpp
  * @author Jordi Gauchía (jgauchia @jgauchia.com)
  * @brief Basic data structures and constants for the NAV tile generator.
- * @version 0.4.0
- * @date 2026-02
+ * @version 0.6.0
+ * @date 2026-05
  */
 
 #pragma once
@@ -55,6 +55,8 @@ struct Feature
     std::map<int, uint8_t> zoom_widths;
 
     std::string highway_type;
+    uint8_t oneway = 0;
+    uint8_t maxspeed = 0;
     std::string ref;
     std::string old_ref;
     std::string name;
@@ -71,6 +73,7 @@ struct Feature
     uint16_t bg_color_rgb565 = 0;
     uint16_t border_color_rgb565 = 0;
     std::vector<Point> coords_candidates;
+    std::vector<int64_t> osm_node_ids;
 };
 
 } // namespace nav
