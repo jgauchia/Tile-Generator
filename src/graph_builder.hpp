@@ -36,9 +36,9 @@ struct CellIndexEntry
 {
     int32_t  lat_e4;
     int32_t  lon_e4;
-    uint32_t node_offset;    // index of first node in flat node array
+    uint32_t node_offset;    // global index of first node (for cellForNode / nearestNode)
     uint16_t node_count;
-    uint32_t edge_offset;    // index of first edge in flat edge array
+    uint32_t data_offset;    // byte offset from start of data block: [nodes][edges] interleaved per cell
     uint16_t edge_count;
 };
 static_assert(sizeof(CellIndexEntry) == 20, "CellIndexEntry size mismatch");
@@ -386,10 +386,14 @@ private:
             return;
         }
 
+        // Build index: node_offset is the global node index (for cellForNode/nearestNode);
+        // data_offset is the byte offset within the data block where [nodes][edges] for
+        // this cell start — allows a single seek+read per cell in the firmware loader.
         std::vector<CellIndexEntry> index;
         index.reserve(cells.size());
-        uint32_t node_off = 0;
-        uint32_t edge_off = 0;
+        uint32_t node_off  = 0;
+        uint32_t data_off  = 0;
+        uint32_t total_edges = 0;
         for (const auto& cd : cells)
         {
             CellIndexEntry ie{};
@@ -397,32 +401,35 @@ private:
             ie.lon_e4      = cd.lon_e4;
             ie.node_offset = node_off;
             ie.node_count  = (uint16_t)cd.nodes.size();
-            ie.edge_offset = edge_off;
+            ie.data_offset = data_off;
             ie.edge_count  = (uint16_t)cd.edges.size();
             index.push_back(ie);
-            node_off += ie.node_count;
-            edge_off += ie.edge_count;
+            node_off    += ie.node_count;
+            data_off    += (uint32_t)(cd.nodes.size() * sizeof(RouteNode)
+                                    + cd.edges.size() * sizeof(RouteEdge));
+            total_edges += ie.edge_count;
         }
 
         RouteFileHeader hdr{};
         memcpy(hdr.magic, "ROUT", 4);
         hdr.sub_step_e4 = 1000;
-        hdr.cell_count = (uint32_t)cells.size();
+        hdr.cell_count  = (uint32_t)cells.size();
         fwrite(&hdr, sizeof(hdr), 1, f);
 
         fwrite(index.data(), sizeof(CellIndexEntry), index.size(), f);
 
+        // Write each cell's nodes immediately followed by its edges.
         for (const auto& cd : cells)
+        {
             if (!cd.nodes.empty())
                 fwrite(cd.nodes.data(), sizeof(RouteNode), cd.nodes.size(), f);
-
-        for (const auto& cd : cells)
             if (!cd.edges.empty())
                 fwrite(cd.edges.data(), sizeof(RouteEdge), cd.edges.size(), f);
+        }
 
         fclose(f);
         printf("[GRAPH] Written: %s  (%zu cells, %u nodes, %u edges)\n",
-               path_buf, cells.size(), node_off, edge_off);
+               path_buf, cells.size(), node_off, total_edges);
     }
 };
 

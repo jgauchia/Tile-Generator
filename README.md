@@ -128,7 +128,7 @@ The routing log panel (bottom-right) shows:
 route_generator <input.pbf> <output_dir>
 ```
 
-The output directory receives a `ROUTE/ROUTE.bin` file containing the full routing graph. Internally the graph is partitioned into 1°×1° cells with an index — readers load only the cells needed for a given route.
+The output directory receives a `ROUTE/ROUTE.bin` file containing the full routing graph. Internally the graph is partitioned into 0.1°×0.1° subcells with an index — readers load only the cells needed for a given route.
 
 ### Example
 
@@ -152,7 +152,7 @@ For the full binary format specification see [`docs/route_generator.md`](docs/ro
 - **Tile container**: NPK2-Hilbert (Flat Hilbert Index) — `docs/bin_tile_format.md`
 - **Tile internal format**: NAV1 (Geometry + Text labels)
 - **Coordinates**: Web Mercator, 12-bit tile-relative space (0-4096)
-- **Routing graph**: ROUTE.bin (nodes 12B + edges 14B + string table) — `docs/route_generator.md`
+- **Routing graph**: ROUTE.bin (header 32B + index 20B/cell + nodes 12B + edges 12B, interleaved per cell) — `docs/route_generator.md`
 
 ---
 
