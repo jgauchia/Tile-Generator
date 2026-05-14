@@ -61,3 +61,28 @@ if(MSVC)
 else()
     target_compile_options(nav_generator PRIVATE -Wall -Wextra -O3 -march=native)
 endif()
+
+# Route graph generator
+add_executable(route_generator
+    src/route_main.cpp
+)
+
+target_link_libraries(route_generator
+    PRIVATE
+    ${GEOS_C_LIBRARY}
+    ${ZLIB_LIBRARIES}
+    ${EXPAT_LIBRARIES}
+    ${BZIP2_LIBRARIES}
+    ${CMAKE_THREAD_LIBS_INIT}
+    ${GDAL_LIBRARIES}
+)
+
+if(nlohmann_json_FOUND)
+    target_link_libraries(route_generator PRIVATE nlohmann_json::nlohmann_json)
+endif()
+
+if(MSVC)
+    target_compile_options(route_generator PRIVATE /O2 /W3)
+else()
+    target_compile_options(route_generator PRIVATE -Wall -Wextra -O3 -march=native)
+endif()

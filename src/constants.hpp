@@ -1,8 +1,8 @@
 /**
  * @file constants.hpp
  * @brief Rendering constants and per-zoom lookup tables (ported from Python constants.py).
- * @version 0.4.0
- * @date 2026-02
+ * @version 0.6.0
+ * @date 2026-05
  */
 
 #pragma once
