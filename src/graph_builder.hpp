@@ -2,7 +2,7 @@
  * @file graph_builder.hpp
  * @author Jordi Gauchía (jgauchia @jgauchia.com)
  * @brief Builds ROUTE.bin routing graph files from road features extracted by OSMHandler.
- * @version 0.6.0
+ * @version 0.7.0
  * @date 2026-05
  */
 
@@ -22,27 +22,26 @@
 namespace nav {
 
 #pragma pack(push, 1)
-// File header — 32 bytes, version=2
+// File header — 32 bytes
 struct RouteFileHeader
 {
     char     magic[4];       // "ROUT"
-    uint8_t  version;        // 2
-    uint8_t  reserved[3];
+    uint32_t sub_step_e4;    // 1000 for 0.1 deg
     uint32_t cell_count;
-    uint32_t reserved2[4];   // padding to 32B
+    uint32_t reserved[5];    // padding to 32B
 };
 
-// Per-cell index entry — 24 bytes
+// Per-cell index entry — 20 bytes
 struct CellIndexEntry
 {
-    int16_t  lat_floor;
-    int16_t  lon_floor;
-    uint32_t node_offset;    // index of first node in flat node array (= global node base)
-    uint32_t node_count;
+    int32_t  lat_e4;
+    int32_t  lon_e4;
+    uint32_t node_offset;    // index of first node in flat node array
+    uint16_t node_count;
     uint32_t edge_offset;    // index of first edge in flat edge array
-    uint32_t edge_count;
-    uint32_t reserved;       // padding to 24B
+    uint16_t edge_count;
 };
+static_assert(sizeof(CellIndexEntry) == 20, "CellIndexEntry size mismatch");
 
 struct RouteNode
 {
@@ -50,16 +49,17 @@ struct RouteNode
     float    lon;
     uint32_t edge_offset;    // index into this cell's edge block (relative to cell edge_offset)
 };
+static_assert(sizeof(RouteNode) == 12, "RouteNode size mismatch");
 
 struct RouteEdge
 {
-    uint32_t dst_node;       // index into this cell's node block (relative to cell node_offset)
+    uint32_t dst_node;       // global index
     uint32_t cost;
     uint16_t dist_m;
     uint8_t  flags;
-    uint16_t name_idx;
     uint8_t  reserved;
 };
+static_assert(sizeof(RouteEdge) == 12, "RouteEdge size mismatch");
 #pragma pack(pop)
 
 class GraphBuilder
@@ -87,7 +87,7 @@ public:
     {
         if (ways_.empty()) return;
 
-        // Pass 1: collect segments per cell (each segment assigned to cell of src node)
+        // Pass 1: collect segments per cell
         std::unordered_map<uint64_t, std::vector<SegmentData>> cell_segments;
 
         for (const WayData& wd : ways_)
@@ -121,9 +121,7 @@ public:
                     seg.maxspeed   = wd.maxspeed;
                     seg.name       = wd.name;
 
-                    int src_lf = (int)std::floor(seg.src_pt.lat);
-                    int src_lo = (int)std::floor(seg.src_pt.lon);
-                    cell_segments[cell_key_of(src_lf, src_lo)].push_back(seg);
+                    cell_segments[cell_key_of((float)seg.src_pt.lat, (float)seg.src_pt.lon)].push_back(seg);
 
                     if (wd.oneway != 1)
                     {
@@ -131,9 +129,7 @@ public:
                         std::swap(rev.src_osm_id, rev.dst_osm_id);
                         std::swap(rev.src_pt,     rev.dst_pt);
                         rev.oneway = (wd.oneway == 2) ? 1 : 0;
-                        int dst_lf = (int)std::floor(rev.src_pt.lat);
-                        int dst_lo = (int)std::floor(rev.src_pt.lon);
-                        cell_segments[cell_key_of(dst_lf, dst_lo)].push_back(rev);
+                        cell_segments[cell_key_of((float)rev.src_pt.lat, (float)rev.src_pt.lon)].push_back(rev);
                     }
 
                     seg_start = i;
@@ -143,7 +139,6 @@ public:
         }
 
         // Pass 2: assign a global node index to every unique OSM node id across all cells
-        // Node ordering: iterate cells in deterministic order, assign indices as nodes appear
         std::vector<uint64_t> cell_keys;
         cell_keys.reserve(cell_segments.size());
         for (const auto& [key, _] : cell_segments)
@@ -151,10 +146,9 @@ public:
         std::sort(cell_keys.begin(), cell_keys.end());
 
         std::unordered_map<int64_t, uint32_t> global_node_index;
-        // Pre-pass: allocate global indices in cell order so each cell's nodes are contiguous
         struct CellNodeRange { uint32_t base; uint32_t count; };
         std::unordered_map<uint64_t, CellNodeRange> cell_node_ranges;
-        std::vector<std::pair<float,float>> global_coords; // lat,lon for each global node
+        std::vector<std::pair<float,float>> global_coords; 
 
         for (uint64_t key : cell_keys)
         {
@@ -177,22 +171,18 @@ public:
             cell_node_ranges[key] = {base, cnt};
         }
 
-        // Pass 3: build per-cell edge lists using global dst_node indices
+        // Pass 3: build per-cell edge lists
         std::vector<CellData> cells;
         cells.reserve(cell_keys.size());
 
         for (uint64_t key : cell_keys)
         {
-            int lat_floor = (int)(key >> 32);
-            int lon_floor = (int)(key & 0xFFFFFFFF);
-            if ((uint32_t)lon_floor >= 0x80000000u)
-                lon_floor = (int)(lon_floor - 0x100000000ull);
+            int32_t lat_e4 = (int32_t)(key >> 32);
+            int32_t lon_e4 = (int32_t)(key & 0xFFFFFFFF);
 
             const auto& segs = cell_segments.at(key);
             const CellNodeRange& range = cell_node_ranges.at(key);
 
-            // Local node index within this cell (global_idx - range.base)
-            // edge_offset is relative to this cell's edge block
             std::unordered_map<uint32_t, std::vector<RouteEdge>> node_edges;
 
             for (const SegmentData& seg : segs)
@@ -201,7 +191,6 @@ public:
                 uint32_t dst_global = global_node_index.at(seg.dst_osm_id);
                 if (src_global == dst_global) continue;
 
-                // src must be local to this cell
                 if (src_global < range.base || src_global >= range.base + range.count)
                     continue;
 
@@ -212,18 +201,17 @@ public:
                                           | ((seg.hw_class & 0x07) << 1));
 
                 RouteEdge e{};
-                e.dst_node = dst_global;   // global index
+                e.dst_node = dst_global;
                 e.cost     = cost;
                 e.dist_m   = dm;
                 e.flags    = flags;
-                e.name_idx = 0;
+                e.reserved = 0;
                 node_edges[src_global].push_back(e);
             }
 
-            // Build RouteNode array for this cell (local index = global - range.base)
             CellData cd;
-            cd.lat_floor = lat_floor;
-            cd.lon_floor = lon_floor;
+            cd.lat_e4 = lat_e4;
+            cd.lon_e4 = lon_e4;
             cd.nodes.resize(range.count);
             for (uint32_t li = 0; li < range.count; ++li)
             {
@@ -233,7 +221,6 @@ public:
                 cd.nodes[li].edge_offset = 0;
             }
 
-            // Flatten edges, assign edge_offset (relative to this cell's edge block)
             uint32_t offset = 0;
             for (uint32_t li = 0; li < range.count; ++li)
             {
@@ -249,7 +236,7 @@ public:
             }
 
             if (cd.nodes.empty()) continue;
-            print_stats(lat_floor, lon_floor, cd.nodes, cd.edges, range.base);
+            print_stats(lat_e4, lon_e4, cd.nodes, cd.edges, range.base);
             cells.push_back(std::move(cd));
         }
 
@@ -260,8 +247,8 @@ public:
 private:
     struct CellData
     {
-        int                    lat_floor;
-        int                    lon_floor;
+        int32_t                lat_e4;
+        int32_t                lon_e4;
         std::vector<RouteNode> nodes;
         std::vector<RouteEdge> edges;
     };
@@ -293,9 +280,11 @@ private:
     std::vector<WayData>             ways_;
     std::string                      output_dir_;
 
-    static uint64_t cell_key_of(int lat_floor, int lon_floor)
+    static uint64_t cell_key_of(float lat, float lon)
     {
-        return ((uint64_t)(uint32_t)lat_floor << 32) | (uint32_t)lon_floor;
+        int32_t lat_e4 = (int32_t)std::floor(lat * 10.0f) * 1000;
+        int32_t lon_e4 = (int32_t)std::floor(lon * 10.0f) * 1000;
+        return ((uint64_t)(uint32_t)lat_e4 << 32) | (uint32_t)lon_e4;
     }
 
     uint8_t classify(const std::string& hw)
@@ -329,7 +318,7 @@ private:
         return (float)(6371000.0 * 2.0 * atan2(sqrt(a), sqrt(1.0 - a)));
     }
 
-    void print_stats(int lat_floor, int lon_floor,
+    void print_stats(int32_t lat_e4, int32_t lon_e4,
                      const std::vector<RouteNode>& nodes,
                      const std::vector<RouteEdge>& edges,
                      uint32_t global_base)
@@ -338,7 +327,6 @@ private:
         uint32_t e = (uint32_t)edges.size();
         if (n == 0) return;
 
-        // BFS from node 0 (local indices; dst_node is global so remap to local)
         std::vector<bool> visited(n, false);
         std::queue<uint32_t> q;
         q.push(0);
@@ -366,8 +354,8 @@ private:
             class_count[(edge.flags >> 1) & 7]++;
         }
 
-        printf("[GRAPH] Cell R%d_%d: %u nodes, %u edges\n",
-               lat_floor, lon_floor, n, e);
+        printf("[GRAPH] Cell E4:%d_%d: %u nodes, %u edges\n",
+               lat_e4, lon_e4, n, e);
         printf("[GRAPH]   Giant component : %u / %u (%.1f%%)\n",
                reachable, n, 100.0f * reachable / n);
         printf("[GRAPH]   Oneway edges    : %u (%.1f%%)\n",
@@ -377,9 +365,9 @@ private:
         printf("\n");
 
         if (reachable < n * 0.95f)
-            fprintf(stderr, "[GRAPH] WARNING: giant component < 95%% in R%d_%d"
+            fprintf(stderr, "[GRAPH] WARNING: giant component < 95%% in E4:%d_%d"
                             " — check intersection detection\n",
-                    lat_floor, lon_floor);
+                    lat_e4, lon_e4);
     }
 
     void write_route_bin(const std::vector<struct CellData>& cells)
@@ -398,7 +386,6 @@ private:
             return;
         }
 
-        // Build cell index
         std::vector<CellIndexEntry> index;
         index.reserve(cells.size());
         uint32_t node_off = 0;
@@ -406,33 +393,29 @@ private:
         for (const auto& cd : cells)
         {
             CellIndexEntry ie{};
-            ie.lat_floor   = (int16_t)cd.lat_floor;
-            ie.lon_floor   = (int16_t)cd.lon_floor;
+            ie.lat_e4      = cd.lat_e4;
+            ie.lon_e4      = cd.lon_e4;
             ie.node_offset = node_off;
-            ie.node_count  = (uint32_t)cd.nodes.size();
+            ie.node_count  = (uint16_t)cd.nodes.size();
             ie.edge_offset = edge_off;
-            ie.edge_count  = (uint32_t)cd.edges.size();
+            ie.edge_count  = (uint16_t)cd.edges.size();
             index.push_back(ie);
             node_off += ie.node_count;
             edge_off += ie.edge_count;
         }
 
-        // File header
         RouteFileHeader hdr{};
         memcpy(hdr.magic, "ROUT", 4);
-        hdr.version    = 2;
+        hdr.sub_step_e4 = 1000;
         hdr.cell_count = (uint32_t)cells.size();
         fwrite(&hdr, sizeof(hdr), 1, f);
 
-        // Cell index
         fwrite(index.data(), sizeof(CellIndexEntry), index.size(), f);
 
-        // All nodes (concatenated)
         for (const auto& cd : cells)
             if (!cd.nodes.empty())
                 fwrite(cd.nodes.data(), sizeof(RouteNode), cd.nodes.size(), f);
 
-        // All edges (concatenated)
         for (const auto& cd : cells)
             if (!cd.edges.empty())
                 fwrite(cd.edges.data(), sizeof(RouteEdge), cd.edges.size(), f);
