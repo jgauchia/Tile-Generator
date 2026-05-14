@@ -1,4 +1,4 @@
-# Tile-Generator (v0.5.0)
+# Tile-Generator
 
 C++ toolset for generating optimized vector map tiles from OpenStreetMap PBF files, targeting ESP32-based GPS navigators.
 
