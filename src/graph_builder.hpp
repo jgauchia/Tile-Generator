@@ -282,8 +282,8 @@ private:
 
     static uint64_t cell_key_of(float lat, float lon)
     {
-        int32_t lat_e4 = (int32_t)std::floor(lat * 10.0f) * 1000;
-        int32_t lon_e4 = (int32_t)std::floor(lon * 10.0f) * 1000;
+        int32_t lat_e4 = (int32_t)std::floor(lat * 20.0f) * 500;
+        int32_t lon_e4 = (int32_t)std::floor(lon * 20.0f) * 500;
         return ((uint64_t)(uint32_t)lat_e4 << 32) | (uint32_t)lon_e4;
     }
 
@@ -412,7 +412,7 @@ private:
 
         RouteFileHeader hdr{};
         memcpy(hdr.magic, "ROUT", 4);
-        hdr.sub_step_e4 = 1000;
+        hdr.sub_step_e4 = 500;
         hdr.cell_count  = (uint32_t)cells.size();
         fwrite(&hdr, sizeof(hdr), 1, f);
 
