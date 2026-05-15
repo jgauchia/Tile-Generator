@@ -307,6 +307,10 @@ public:
 
         // Road labels
         create_road_label(feat.points, feat.ref, feat.old_ref, feat.highway_type, feat.color_rgb565);
+
+        // Waterway labels
+        if (tags.count("waterway"))
+            create_waterway_label(feat.points, tags.at("waterway"), feat.name);
     }
 
     void area(const osmium::Area& a)
@@ -390,6 +394,7 @@ public:
     size_t stats_filtered = 0;
     size_t stats_points = 0;
     size_t stats_text_labels = 0;
+    size_t stats_waterway_labels = 0;
 
     double bbox_min_lon = 180, bbox_min_lat = 90;
     double bbox_max_lon = -180, bbox_max_lat = -90;
@@ -399,6 +404,7 @@ private:
     MappedStore& store;
     int min_zoom_range, max_zoom_range;
     std::unordered_map<std::string, int> road_label_counters;
+    std::unordered_map<std::string, int> waterway_label_counters;
 
     std::string get_highway_type(const std::unordered_map<std::string, std::string>& tags)
     {
@@ -609,6 +615,65 @@ private:
         feat.ring_ends.push_back(1);
         feat.coords_candidates = candidates;
         text_features_vec.push_back(std::move(feat));
+    }
+
+    void create_waterway_label(const std::vector<Point>& coords,
+                               const std::string& waterway_type,
+                               const std::string& name)
+    {
+        if (name.empty()) return;
+        if (waterway_type != "river" && waterway_type != "stream" && waterway_type != "canal")
+            return;
+
+        int spacing;
+        if (waterway_type == "river") spacing = 4;
+        else if (waterway_type == "canal") spacing = 8;
+        else spacing = 12;
+
+        waterway_label_counters[name]++;
+        if (waterway_label_counters[name] % spacing != 1)
+            return;
+
+        int label_idx = waterway_label_counters[name] / spacing;
+
+        int min_zoom;
+        if (waterway_type == "river") min_zoom = 10;
+        else if (waterway_type == "canal") min_zoom = 12;
+        else min_zoom = 14;
+
+        if (min_zoom > max_zoom_range) return;
+        if (coords.size() < 2) return;
+
+        // Alternate sub-segment position to spread labels along the waterway
+        double start_ratio, end_ratio;
+        switch (label_idx % 3)
+        {
+            case 0: start_ratio = 0.10; end_ratio = 0.55; break;
+            case 1: start_ratio = 0.45; end_ratio = 0.90; break;
+            default: start_ratio = 0.25; end_ratio = 0.75; break;
+        }
+        size_t i_start = static_cast<size_t>(coords.size() * start_ratio);
+        size_t i_end = static_cast<size_t>(coords.size() * end_ratio);
+        if (i_end <= i_start) i_end = i_start + 1;
+        if (i_end >= coords.size()) i_end = coords.size() - 1;
+        std::vector<Point> path(coords.begin() + i_start, coords.begin() + i_end + 1);
+        if (path.size() < 2) return;
+
+        Feature feat;
+        feat.id = 0;
+        feat.geom_type = GEOM_TEXT_LINE;
+        feat.color_rgb565 = 0x4C16; // #4a80b0 dark blue
+        feat.bg_color_rgb565 = 0;
+        feat.border_color_rgb565 = 0;
+        feat.zoom_priority = utils::pack_zoom_priority(min_zoom, 12);
+        feat.font_size = 0;
+        std::string name_trunc = name.substr(0, 255);
+        feat.text.assign(name_trunc.begin(), name_trunc.end());
+        feat.population = 0;
+        feat.points = std::move(path);
+        feat.ring_ends.push_back(static_cast<uint32_t>(feat.points.size()));
+        text_features_vec.push_back(std::move(feat));
+        stats_waterway_labels++;
     }
 };
 

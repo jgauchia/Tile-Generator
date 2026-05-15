@@ -63,6 +63,7 @@ GEOM_POINT = 1
 GEOM_LINESTRING = 2
 GEOM_POLYGON = 3
 GEOM_TEXT = 4
+GEOM_TEXT_LINE = 5
 
 
 def deg2num(lat_deg: float, lon_deg: float, zoom: int) -> Tuple[float, float]:
@@ -400,6 +401,18 @@ def read_nav_tile(path: str, tile_x: int, tile_y: int) -> List[NavFeature]:
                         text_len = payload[4]
                         feature.text = payload[5:5 + text_len].decode('utf-8', errors='replace')
                         feature.font_size = feature.width
+                elif feature.geom_type == GEOM_TEXT_LINE:
+                    if len(payload) >= 1:
+                        path_count = payload[0]
+                        off = 1
+                        for _ in range(path_count):
+                            px, py = struct.unpack('<hh', payload[off:off+4])
+                            feature.coords.append((px, py))
+                            off += 4
+                        text_len = payload[off]
+                        off += 1
+                        feature.text = payload[off:off + text_len].decode('utf-8', errors='replace')
+                        feature.font_size = feature.width
                 else:
                     offset = 0
                     last_x, last_y = 0, 0
@@ -456,6 +469,18 @@ def read_nav_tile_from_bytes(data: bytes, tile_x: int, tile_y: int) -> List[NavF
                     feature.coords.append((px, py))
                     text_len = payload[4]
                     feature.text = payload[5:5 + text_len].decode('utf-8', errors='replace')
+                    feature.font_size = feature.width
+            elif feature.geom_type == GEOM_TEXT_LINE:
+                if len(payload) >= 1:
+                    path_count = payload[0]
+                    off = 1
+                    for _ in range(path_count):
+                        px, py = struct.unpack('<hh', payload[off:off+4])
+                        feature.coords.append((px, py))
+                        off += 4
+                    text_len = payload[off]
+                    off += 1
+                    feature.text = payload[off:off + text_len].decode('utf-8', errors='replace')
                     feature.font_size = feature.width
             else:
                 offset = 0
@@ -718,7 +743,7 @@ class NAVViewer:
         # FOUR-PASS RENDERING: bridges (needs_casing) drawn after at-grade roads
         # Pass 1: Non-bridge, non-text features (polygons + at-grade road cores)
         for feature in features:
-            if feature.geom_type == GEOM_TEXT:
+            if feature.geom_type in (GEOM_TEXT, GEOM_TEXT_LINE):
                 continue
             if feature.geom_type == GEOM_LINESTRING and feature.needs_casing:
                 continue
@@ -738,6 +763,8 @@ class NAVViewer:
         for feature in features:
             if feature.geom_type == GEOM_TEXT:
                 self._render_feature(surface, feature)
+            elif feature.geom_type == GEOM_TEXT_LINE:
+                self._render_text_line(surface, feature)
 
         # Route overlay
         if len(self.route_path_coords) >= 2:
@@ -870,6 +897,89 @@ class NAVViewer:
         casing_width = feature.width + 1.0  # +1px border (0.5px each side)
         self._draw_smooth_line(surface, casing_color, pts, casing_width)
 
+    def _render_text_line(self, surface: pygame.Surface, feature: NavFeature):
+        """Render curvilinear text along a polyline path."""
+        if len(feature.coords) < 2 or not feature.text:
+            return
+
+        pts = [self._tile_coord_to_screen(feature.tile_x, feature.tile_y, x, y)
+               for x, y in feature.coords]
+
+        # Cumulative distances along path
+        dists = [0.0]
+        for i in range(1, len(pts)):
+            dx = pts[i][0] - pts[i-1][0]
+            dy = pts[i][1] - pts[i-1][1]
+            dists.append(dists[-1] + math.hypot(dx, dy))
+        path_length = dists[-1]
+        if path_length < 1:
+            return
+
+        color = rgb565_to_rgb888(feature.color_rgb565)
+        font_sizes = {0: 15, 1: 17, 2: 20}
+        size = font_sizes.get(feature.font_size, 15)
+        text_font = pygame.font.SysFont(None, size)
+
+        # Measure total text width
+        char_widths = []
+        for ch in feature.text:
+            w = text_font.size(ch)[0]
+            char_widths.append(w)
+        total_text_w = sum(char_widths)
+
+        if total_text_w > path_length:
+            return
+
+        # Check if text runs right-to-left on screen — if so, reverse
+        start_d = (path_length - total_text_w) / 2.0
+        end_d = start_d + total_text_w
+        sx, sy = self._interp_path(pts, dists, start_d)
+        ex, ey = self._interp_path(pts, dists, end_d)
+        if ex < sx:
+            pts = pts[::-1]
+            dists = [0.0]
+            for i in range(1, len(pts)):
+                dx = pts[i][0] - pts[i-1][0]
+                dy = pts[i][1] - pts[i-1][1]
+                dists.append(dists[-1] + math.hypot(dx, dy))
+
+        cursor = (path_length - total_text_w) / 2.0
+        for i, ch in enumerate(feature.text):
+            cw = char_widths[i]
+            mid_d = cursor + cw / 2.0
+            cx, cy = self._interp_path(pts, dists, mid_d)
+
+            # Angle from nearby points
+            d0 = max(0, mid_d - 1)
+            d1 = min(path_length, mid_d + 1)
+            ax, ay = self._interp_path(pts, dists, d0)
+            bx, by = self._interp_path(pts, dists, d1)
+            angle = math.degrees(math.atan2(-(by - ay), bx - ax))
+
+            char_surf = text_font.render(ch, True, color)
+            rotated = pygame.transform.rotate(char_surf, angle)
+            rect = rotated.get_rect(center=(int(cx), int(cy)))
+            surface.blit(rotated, rect)
+            cursor += cw
+
+    @staticmethod
+    def _interp_path(pts, dists, d):
+        """Interpolate a position along a polyline at cumulative distance d."""
+        if d <= 0:
+            return float(pts[0][0]), float(pts[0][1])
+        if d >= dists[-1]:
+            return float(pts[-1][0]), float(pts[-1][1])
+        for i in range(1, len(dists)):
+            if dists[i] >= d:
+                seg_len = dists[i] - dists[i-1]
+                if seg_len < 1e-9:
+                    return float(pts[i][0]), float(pts[i][1])
+                t = (d - dists[i-1]) / seg_len
+                x = pts[i-1][0] + t * (pts[i][0] - pts[i-1][0])
+                y = pts[i-1][1] + t * (pts[i][1] - pts[i-1][1])
+                return x, y
+        return float(pts[-1][0]), float(pts[-1][1])
+
     def _render_feature(self, surface: pygame.Surface, feature: NavFeature):
         if not feature.coords: return
         color = rgb565_to_rgb888(feature.color_rgb565)
@@ -1000,7 +1110,7 @@ class NAVViewer:
 
         for f in self.cached_features:
             # By type
-            type_name = ['?', 'Point', 'Line', 'Polygon', 'Text'][f.geom_type if f.geom_type < 5 else 0]
+            type_name = ['?', 'Point', 'Line', 'Polygon', 'Text', 'TextLine'][f.geom_type if f.geom_type < 6 else 0]
             stats['by_type'][type_name] = stats['by_type'].get(type_name, 0) + 1
 
             # By priority

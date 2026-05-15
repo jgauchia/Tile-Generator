@@ -94,14 +94,19 @@ private:
     std::vector<PlacedLabel> resolve_text_labels(const std::vector<Feature>& all_text, int zoom)
     {
         std::vector<PlacedLabel> result;
-        std::vector<const Feature*> place_names, road_labels;
+        std::vector<const Feature*> place_names, road_labels, waterway_labels;
 
         for (const auto& f : all_text)
         {
             int min_z = f.zoom_priority >> 4;
             if (min_z > zoom) continue;
-            if (f.geom_type != GEOM_TEXT) continue;
             if (f.points.empty()) continue;
+            if (f.geom_type == GEOM_TEXT_LINE)
+            {
+                waterway_labels.push_back(&f);
+                continue;
+            }
+            if (f.geom_type != GEOM_TEXT) continue;
             if (f.coords_candidates.empty())
                 place_names.push_back(&f);
             else
@@ -136,6 +141,24 @@ private:
             return tiles;
         };
 
+        auto expand_tiles_bbox = [&](double lon0, double lat0, double lon1, double lat1) -> std::vector<TileCoord> {
+            int tx0 = static_cast<int>(utils::lon_to_x(lon0, zoom));
+            int tx1 = static_cast<int>(utils::lon_to_x(lon1, zoom));
+            int ty0 = static_cast<int>(utils::lat_to_y(lat0, zoom));
+            int ty1 = static_cast<int>(utils::lat_to_y(lat1, zoom));
+            if (ty0 > ty1) std::swap(ty0, ty1);
+            std::unordered_set<int64_t> seen;
+            std::vector<TileCoord> tiles;
+            for (int tx = tx0; tx <= tx1; ++tx)
+                for (int ty = ty0; ty <= ty1; ++ty)
+                {
+                    int64_t key = ((int64_t)tx << 32) | (int64_t)(uint32_t)ty;
+                    if (seen.insert(key).second)
+                        tiles.push_back({tx, ty});
+                }
+            return tiles;
+        };
+
         // Place names first (higher pop = placed first)
         for (const auto* pf : place_names)
         {
@@ -166,6 +189,28 @@ private:
                     result.push_back({std::move(f_copy), expand_tiles(cand.lon, cand.lat)});
                     break;
                 }
+            }
+        }
+
+        // Waterway labels — collision via path bbox + minimum spacing
+        double ww_min_margin = tile_w_deg * 3;  // at least 3 tiles of spacing between labels
+        for (const auto* wf : waterway_labels)
+        {
+            double min_lon = 180, max_lon = -180, min_lat = 90, max_lat = -90;
+            for (const auto& pt : wf->points)
+            {
+                if (pt.lon < min_lon) min_lon = pt.lon;
+                if (pt.lon > max_lon) max_lon = pt.lon;
+                if (pt.lat < min_lat) min_lat = pt.lat;
+                if (pt.lat > max_lat) max_lat = pt.lat;
+            }
+            double margin_lon = std::max(ww_min_margin, (max_lon - min_lon) * 0.5);
+            double margin_lat = std::max(ww_min_margin, (max_lat - min_lat) * 0.5);
+            Box box{min_lon - margin_lon, min_lat - margin_lat, max_lon + margin_lon, max_lat + margin_lat};
+            if (!check_overlap(box))
+            {
+                placed_boxes.push_back(box);
+                result.push_back({*wf, expand_tiles_bbox(min_lon, min_lat, max_lon, max_lat)});
             }
         }
 
@@ -1096,9 +1141,11 @@ private:
             written++;
         }
 
+        // Text features (GEOM_TEXT)
         for (const auto* label : tile_labels)
         {
             if (written >= 0xFFFE) break;
+            if (label->geom_type != GEOM_TEXT) continue;
 
             double lon = label->points[0].lon, lat = label->points[0].lat;
             int16_t px = (int16_t)((lon - lmin) / (lmax - lmin) * 4096);
@@ -1138,6 +1185,57 @@ private:
                               (uint8_t)(coord_count & 0xFF), (uint8_t)(coord_count >> 8),
                               (uint8_t)(text_payload.size() & 0xFF), (uint8_t)(text_payload.size() >> 8)};
             buffer.insert(buffer.end(), th2, th2 + 13);
+            buffer.insert(buffer.end(), text_payload.begin(), text_payload.end());
+            written++;
+        }
+
+        // Curvilinear text features (GEOM_TEXT_LINE)
+        for (const auto* label : tile_labels)
+        {
+            if (written >= 0xFFFE) break;
+            if (label->geom_type != GEOM_TEXT_LINE) continue;
+            if (label->points.size() < 2) continue;
+
+            std::vector<uint8_t> text_payload;
+            uint8_t path_count = (uint8_t)std::min((size_t)255, label->points.size());
+            text_payload.push_back(path_count);
+
+            int min_px = 32767, min_py = 32767, max_px = -32768, max_py = -32768;
+            for (uint8_t i = 0; i < path_count; ++i)
+            {
+                double lon = label->points[i].lon, lat = label->points[i].lat;
+                int16_t px = (int16_t)((lon - lmin) / (lmax - lmin) * 4096);
+                double m_y = utils::lat_to_mercator_y(lat);
+                int16_t py = (int16_t)((t_max_merc - m_y) / merc_range * 4096);
+                text_payload.push_back(px & 0xFF); text_payload.push_back(px >> 8);
+                text_payload.push_back(py & 0xFF); text_payload.push_back(py >> 8);
+                if (px < min_px) min_px = px;
+                if (px > max_px) max_px = px;
+                if (py < min_py) min_py = py;
+                if (py > max_py) max_py = py;
+            }
+
+            const auto& text_bytes = label->text;
+            uint8_t text_len = (uint8_t)text_bytes.size();
+            text_payload.push_back(text_len);
+            text_payload.insert(text_payload.end(), text_bytes.begin(), text_bytes.end());
+
+            int pad = (4 - (text_payload.size() % 4)) % 4;
+            for (int p = 0; p < pad; ++p) text_payload.push_back(0);
+
+            uint16_t coord_count = (uint16_t)(text_payload.size() / 4);
+
+            uint8_t bx0 = (uint8_t)std::max(0, std::min(255, min_px >> 4));
+            uint8_t by0 = (uint8_t)std::max(0, std::min(255, min_py >> 4));
+            uint8_t bx1 = (uint8_t)std::max(0, std::min(255, max_px >> 4));
+            uint8_t by1 = (uint8_t)std::max(0, std::min(255, max_py >> 4));
+
+            uint8_t th[13] = {GEOM_TEXT_LINE, (uint8_t)(label->color_rgb565 & 0xFF), (uint8_t)(label->color_rgb565 >> 8),
+                             label->zoom_priority, label->font_size,
+                             bx0, by0, bx1, by1,
+                             (uint8_t)(coord_count & 0xFF), (uint8_t)(coord_count >> 8),
+                             (uint8_t)(text_payload.size() & 0xFF), (uint8_t)(text_payload.size() >> 8)};
+            buffer.insert(buffer.end(), th, th + 13);
             buffer.insert(buffer.end(), text_payload.begin(), text_payload.end());
             written++;
         }

@@ -18,6 +18,7 @@ const uint8_t GEOM_POINT = 1;
 const uint8_t GEOM_LINESTRING = 2;
 const uint8_t GEOM_POLYGON = 3;
 const uint8_t GEOM_TEXT = 4;
+const uint8_t GEOM_TEXT_LINE = 5;
 
 #pragma pack(push, 1)
 struct PackHeader
