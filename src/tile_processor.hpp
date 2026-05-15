@@ -2,7 +2,7 @@
  * @file tile_processor.hpp
  * @author Jordi Gauchía (jgauchia @jgauchia.com)
  * @brief Optimized tile generation engine with Pure Hilbert Indexing and NAV-PACK container support.
- * @version 0.6.0
+ * @version 0.7.0
  * @date 2026-03
  */
 

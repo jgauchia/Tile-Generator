@@ -2,7 +2,7 @@
  * @file osmium_handler.hpp
  * @author Jordi Gauchía (jgauchia @jgauchia.com)
  * @brief OSM PBF extractor using Osmium library with mapped storage support.
- * @version 0.6.0
+ * @version 0.7.0
  * @date 2026-05
  */
 
