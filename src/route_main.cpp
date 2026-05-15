@@ -2,7 +2,7 @@
  * @file route_main.cpp
  * @author Jordi Gauchía (jgauchia @jgauchia.com)
  * @brief Standalone routing graph generator. Reads an OSM PBF and writes ROUTE/R{lat}_{lon}.bin.
- * @version 0.6.0
+ * @version 0.7.0
  * @date 2026-05
  */
 

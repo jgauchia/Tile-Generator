@@ -51,7 +51,7 @@ route_generator <input.pbf> <output_dir>
 # Output: /data/maps/ROUTE/ROUTE.bin
 ```
 
-The graph is internally partitioned into **0.1°×0.1° subcells** and stored in a single `ROUTE.bin` file with a cell index. Readers load only the cells that cover the route bounding box.
+The graph is internally partitioned into **0.05°×0.05° subcells** and stored in a single `ROUTE.bin` file with a cell index. Readers load only the cells needed for the route on-demand.
 
 ---
 
@@ -79,7 +79,7 @@ Each cell's nodes and edges are stored **contiguously** in the data block. The `
 | Offset | Type | Field | Description |
 |---|---|---|---|
 | 0 | char[4] | magic | `"ROUT"` |
-| 4 | uint32 | sub_step_e4 | grid step × 10000; `1000` = 0.1° cells |
+| 4 | uint32 | sub_step_e4 | grid step × 10000; `500` = 0.05° cells |
 | 8 | uint32 | cell_count | number of cells in the index |
 | 12 | uint32[5] | reserved | padding to 32 bytes |
 
@@ -87,8 +87,8 @@ Each cell's nodes and edges are stored **contiguously** in the data block. The `
 
 | Offset | Type | Field | Description |
 |---|---|---|---|
-| 0 | int32 | lat_e4 | SW corner latitude × 10000, snapped to 0.1° grid |
-| 4 | int32 | lon_e4 | SW corner longitude × 10000, snapped to 0.1° grid |
+| 0 | int32 | lat_e4 | SW corner latitude × 10000, snapped to 0.05° grid |
+| 4 | int32 | lon_e4 | SW corner longitude × 10000, snapped to 0.05° grid |
 | 8 | uint32 | node_offset | global index of first node (used for nearest-node lookup) |
 | 12 | uint16 | node_count | number of nodes in this cell |
 | 14 | uint32 | data_offset | byte offset from start of data block to this cell's `Node[0]` |
