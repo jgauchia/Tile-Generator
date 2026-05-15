@@ -128,7 +128,7 @@ The routing log panel (bottom-right) shows:
 route_generator <input.pbf> <output_dir>
 ```
 
-The output directory receives a `ROUTE/ROUTE.bin` file containing the full routing graph. Internally the graph is partitioned into 0.1°×0.1° subcells with an index — readers load only the cells needed for a given route.
+The output directory receives a `ROUTE/ROUTE.bin` file containing the full routing graph. Internally the graph is partitioned into 0.05°×0.05° subcells with an index — readers load only the cells needed for the route on-demand.
 
 ### Example
 
