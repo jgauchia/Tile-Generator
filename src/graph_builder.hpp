@@ -40,7 +40,7 @@ static const float PROFILE_SPEED_KMH[3][7] = {
 struct RouteFileHeader
 {
     char     magic[4];       // "ROUT"
-    uint32_t sub_step_e4;    // 1000 for 0.1 deg
+    uint32_t sub_step_e4;    // 500 for 0.05 deg
     uint32_t cell_count;
     uint32_t reserved[5];    // padding to 32B
 };
@@ -92,7 +92,6 @@ public:
         wd.hw_class  = classify(f.highway_type);
         wd.oneway    = f.oneway;
         wd.maxspeed  = f.maxspeed;
-        wd.name      = f.name;
         ways_.push_back(std::move(wd));
 
         for (int64_t id : ways_.back().node_ids)
@@ -103,8 +102,88 @@ public:
     {
         if (ways_.empty()) return;
 
-        // Pass 1: collect segments per cell
+        // Pass 1: collect segments per cell, splitting cross-cell segments at boundaries.
+        // A segment whose src and dst fall in different 0.05° cells is split at each
+        // cell-boundary crossing so every resulting sub-segment is wholly contained
+        // within one cell.  Synthetic split nodes get negative OSM IDs (unique, never
+        // collide with real OSM IDs which are always positive).
         std::unordered_map<uint64_t, std::vector<SegmentData>> cell_segments;
+        int64_t synthetic_id = -1;  // decrements for each new synthetic node
+
+        auto emit_segment = [&](SegmentData seg)
+        {
+            // Split the segment at every cell-boundary it crosses.  We iterate
+            // until src and dst are in the same cell.
+            while (true)
+            {
+                uint64_t src_cell = cell_key_of((float)seg.src_pt.lat, (float)seg.src_pt.lon);
+                uint64_t dst_cell = cell_key_of((float)seg.dst_pt.lat, (float)seg.dst_pt.lon);
+                if (src_cell == dst_cell)
+                {
+                    cell_segments[src_cell].push_back(seg);
+                    return;
+                }
+
+                // Find the nearest cell boundary between src and dst.
+                // Cell step = 0.05° = 1/20°.  Boundary is at multiples of 0.05°.
+                constexpr double STEP = 1.0 / 20.0;   // 0.05°
+
+                double lat1 = seg.src_pt.lat, lon1 = seg.src_pt.lon;
+                double lat2 = seg.dst_pt.lat, lon2 = seg.dst_pt.lon;
+
+                // t* = parameter in [0,1] where the segment first exits the src cell
+                double t_best = 2.0;
+
+                // Lat boundaries crossed
+                if (lat2 != lat1)
+                {
+                    double lat_lo = std::floor(lat1 / STEP) * STEP;
+                    double lat_hi = lat_lo + STEP;
+                    double boundary = (lat2 > lat1) ? lat_hi : lat_lo;
+                    double t = (boundary - lat1) / (lat2 - lat1);
+                    if (t > 1e-9 && t < t_best) t_best = t;
+                }
+
+                // Lon boundaries crossed
+                if (lon2 != lon1)
+                {
+                    double lon_lo = std::floor(lon1 / STEP) * STEP;
+                    double lon_hi = lon_lo + STEP;
+                    double boundary = (lon2 > lon1) ? lon_hi : lon_lo;
+                    double t = (boundary - lon1) / (lon2 - lon1);
+                    if (t > 1e-9 && t < t_best) t_best = t;
+                }
+
+                if (t_best > 1.0)
+                {
+                    // Numerically the cells differ but no boundary found — emit as-is.
+                    cell_segments[src_cell].push_back(seg);
+                    return;
+                }
+
+                // Interpolate split point
+                Point split_pt;
+                split_pt.lat = lat1 + t_best * (lat2 - lat1);
+                split_pt.lon = lon1 + t_best * (lon2 - lon1);
+
+                float head_dist = seg.dist_m * (float)t_best;
+                float tail_dist = seg.dist_m * (float)(1.0 - t_best);
+
+                int64_t split_id = synthetic_id--;
+
+                // Head segment: src → split_pt  (stays in src_cell)
+                SegmentData head = seg;
+                head.dst_osm_id  = split_id;
+                head.dst_pt      = split_pt;
+                head.dist_m      = head_dist;
+                cell_segments[src_cell].push_back(head);
+
+                // Tail segment: split_pt → dst  (may still cross more boundaries → loop)
+                seg.src_osm_id = split_id;
+                seg.src_pt     = split_pt;
+                seg.dist_m     = tail_dist;
+            }
+        };
 
         for (const WayData& wd : ways_)
         {
@@ -135,9 +214,8 @@ public:
                     seg.hw_class   = wd.hw_class;
                     seg.oneway     = wd.oneway;
                     seg.maxspeed   = wd.maxspeed;
-                    seg.name       = wd.name;
 
-                    cell_segments[cell_key_of((float)seg.src_pt.lat, (float)seg.src_pt.lon)].push_back(seg);
+                    emit_segment(seg);
 
                     if (wd.oneway != 1)
                     {
@@ -145,7 +223,7 @@ public:
                         std::swap(rev.src_osm_id, rev.dst_osm_id);
                         std::swap(rev.src_pt,     rev.dst_pt);
                         rev.oneway = (wd.oneway == 2) ? 1 : 0;
-                        cell_segments[cell_key_of((float)rev.src_pt.lat, (float)rev.src_pt.lon)].push_back(rev);
+                        emit_segment(rev);
                     }
 
                     seg_start = i;
@@ -154,7 +232,13 @@ public:
             }
         }
 
-        // Pass 2: assign a global node index to every unique OSM node id across all cells
+        // Pass 2: assign a global node index to every unique OSM node id across all cells.
+        // Rule: a node is registered in the cell where it first appears as a src_osm_id.
+        // Nodes that only appear as dst_osm_id (pure sinks in this cell) are registered
+        // after all src nodes of their cell so they still get a valid global index, but
+        // they must not block space in a cell whose src list never references them.
+        // This ensures that for every segment in cell C, src_global is always within
+        // C's CellNodeRange — the fundamental invariant for Pass 3 edge emission.
         std::vector<uint64_t> cell_keys;
         cell_keys.reserve(cell_segments.size());
         for (const auto& [key, _] : cell_segments)
@@ -164,8 +248,10 @@ public:
         std::unordered_map<int64_t, uint32_t> global_node_index;
         struct CellNodeRange { uint32_t base; uint32_t count; };
         std::unordered_map<uint64_t, CellNodeRange> cell_node_ranges;
-        std::vector<std::pair<float,float>> global_coords; 
+        std::vector<std::pair<float,float>> global_coords;
 
+        // First sub-pass: register each node in the cell where it appears as src.
+        // This guarantees src_global ∈ [range.base, range.base+range.count) for all segs.
         for (uint64_t key : cell_keys)
         {
             const auto& segs = cell_segments.at(key);
@@ -177,14 +263,24 @@ public:
                     global_node_index[seg.src_osm_id] = (uint32_t)global_coords.size();
                     global_coords.push_back({(float)seg.src_pt.lat, (float)seg.src_pt.lon});
                 }
+            }
+            uint32_t cnt = (uint32_t)global_coords.size() - base;
+            cell_node_ranges[key] = {base, cnt};
+        }
+
+        // Second sub-pass: register dst nodes that were not yet seen as src anywhere.
+        // These are true terminals (dead-ends or cross-cell targets already registered).
+        for (uint64_t key : cell_keys)
+        {
+            const auto& segs = cell_segments.at(key);
+            for (const auto& seg : segs)
+            {
                 if (!global_node_index.count(seg.dst_osm_id))
                 {
                     global_node_index[seg.dst_osm_id] = (uint32_t)global_coords.size();
                     global_coords.push_back({(float)seg.dst_pt.lat, (float)seg.dst_pt.lon});
                 }
             }
-            uint32_t cnt = (uint32_t)global_coords.size() - base;
-            cell_node_ranges[key] = {base, cnt};
         }
 
         // Pass 3: build per-cell edge lists
@@ -206,9 +302,6 @@ public:
                 uint32_t src_global = global_node_index.at(seg.src_osm_id);
                 uint32_t dst_global = global_node_index.at(seg.dst_osm_id);
                 if (src_global == dst_global) continue;
-
-                if (src_global < range.base || src_global >= range.base + range.count)
-                    continue;
 
                 float    spd   = speed_ms(seg.hw_class, seg.maxspeed);
                 if (spd <= 0.0f) continue;   // inaccessible for this profile
@@ -277,20 +370,18 @@ private:
         uint8_t              hw_class;
         uint8_t              oneway;
         uint8_t              maxspeed;
-        std::string          name;
     };
 
     struct SegmentData
     {
-        int64_t     src_osm_id;
-        int64_t     dst_osm_id;
-        Point       src_pt;
-        Point       dst_pt;
-        float       dist_m;
-        uint8_t     hw_class;
-        uint8_t     oneway;
-        uint8_t     maxspeed;
-        std::string name;
+        int64_t src_osm_id;
+        int64_t dst_osm_id;
+        Point   src_pt;
+        Point   dst_pt;
+        float   dist_m;
+        uint8_t hw_class;
+        uint8_t oneway;
+        uint8_t maxspeed;
     };
 
     std::unordered_map<int64_t, int> node_ref_count_;
