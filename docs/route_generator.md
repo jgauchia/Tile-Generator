@@ -1,6 +1,6 @@
 # Route Generator
 
-`route_generator` builds a single A\* routing graph file (`ROUTE/ROUTE.bin`) from an OSM PBF extract. It is independent from the tile generator — you can use it with vector tiles, PNG tiles, or any other map source.
+`route_generator` builds A\* routing graph files from an OSM PBF extract. It generates **three independent ROUTE.bin files** — one per routing profile — in separate subdirectories. It is independent from the tile generator and can be used with vector tiles, PNG tiles, or any other map source.
 
 ---
 
@@ -31,34 +31,87 @@ The binary is produced at `build/route_generator`.
 ## Usage
 
 ```bash
-route_generator <input.pbf> <output_dir> [--profile car|pedestrian|bike]
+route_generator <input.pbf> <output_dir>
 ```
 
 | Argument | Description |
 |---|---|
 | `input.pbf` | OSM PBF extract (any region) |
-| `output_dir` | Directory where `ROUTE/` will be created |
-| `--profile` | Routing profile (default: `car`) |
+| `output_dir` | Directory where `ROUTE/` subdirectories will be created |
+
+The generator always produces all three profiles in a single run:
+
+```
+<output_dir>/ROUTE/CAR/ROUTE.bin
+<output_dir>/ROUTE/BIKE/ROUTE.bin
+<output_dir>/ROUTE/WALK/ROUTE.bin
+```
 
 ### Example
 
 ```bash
-# Car routing (default)
 ./route_generator andorra-251227.osm.pbf .
-# Output: ./ROUTE/ROUTE.bin
+# Output:
+#   ./ROUTE/CAR/ROUTE.bin
+#   ./ROUTE/BIKE/ROUTE.bin
+#   ./ROUTE/WALK/ROUTE.bin
 
-# Pedestrian routing
-./route_generator andorra-251227.osm.pbf . --profile pedestrian
-
-# Bike routing
-./route_generator andorra-251227.osm.pbf . --profile bike
-
-# Larger region
-./route_generator catalonia-latest.osm.pbf /data/maps --profile car
-# Output: /data/maps/ROUTE/ROUTE.bin
+./route_generator catalonia-latest.osm.pbf /data/maps
+# Output:
+#   /data/maps/ROUTE/CAR/ROUTE.bin
+#   /data/maps/ROUTE/BIKE/ROUTE.bin
+#   /data/maps/ROUTE/WALK/ROUTE.bin
 ```
 
-The graph is internally partitioned into **0.05°×0.05° subcells** and stored in a single `ROUTE.bin` file with a cell index. Readers load only the cells needed for the route on-demand.
+The graph is internally partitioned into **0.05°×0.05° subcells** and stored in a single `ROUTE.bin` file per profile with a cell index. Readers load only the cells needed for the route on-demand.
+
+---
+
+## Routing profiles
+
+Each profile controls which roads are included and at what speed. The `cost` field in each edge encodes travel time in tenths of second: `cost = (dist_m / speed_ms) × 10`.
+
+| hw_class | Car | Walk | Bike |
+|---|---|---|---|
+| 0 — service / track | 20 km/h | 5 km/h | 10 km/h |
+| 1 — residential / living\_street | 25 km/h | 5 km/h | 15 km/h |
+| 2 — tertiary / unclassified | 50 km/h | 5 km/h | 18 km/h |
+| 3 — secondary | 70 km/h | 5 km/h | 20 km/h |
+| 4 — primary | 90 km/h | 5 km/h | 22 km/h |
+| 5 — trunk | 110 km/h | — | — |
+| 6 — motorway | 130 km/h | — | — |
+
+`—` means the road type is inaccessible for that profile; edges are not generated.
+
+**Car**: uses OSM `maxspeed` tag when present to override the base speed. Residential roads are penalised (25 km/h) vs arterials to prefer main roads. Footways, cycleways, pedestrian zones, paths and steps are excluded.
+
+**Walk**: constant 5 km/h on all accessible roads. Motorway and trunk are excluded. Includes footway, path, pedestrian, cycleway.
+
+**Bike**: 10–22 km/h depending on road class. Motorway, trunk, footway and steps are excluded.
+
+---
+
+## Using with IceNav-v3 (ESP32)
+
+Copy all three profile subdirectories to the SD card alongside `NAVMAP/`:
+
+```
+/sdcard/
+  NAVMAP/          ← vector tiles
+  ROUTE/
+    CAR/
+      ROUTE.bin    ← car routing graph
+    BIKE/
+      ROUTE.bin    ← bike routing graph
+    WALK/
+      ROUTE.bin    ← pedestrian routing graph
+  TRK/
+  WPT/
+```
+
+The active profile is selected in **Device Settings → Routing Profile** (Car / Bike / Pedestrian). IceNav-v3 loads the corresponding `ROUTE.bin` automatically. Changing the profile takes effect on the next route calculation.
+
+The A\* heuristic speed is derived from the selected profile — no manual configuration needed and no mismatch between graph costs and heuristic is possible.
 
 ---
 
@@ -135,69 +188,39 @@ Edges for node `i` span `edge[node[i].edge_offset .. node[i+1].edge_offset - 1]`
 
 ---
 
-## Routing profiles
-
-The `--profile` flag controls which roads are included and at what speed. The `cost` field encodes travel time in tenths of second: `cost = (dist_m / speed_ms) × 10`.
-
-| hw_class | Car | Pedestrian | Bike |
-|---|---|---|---|
-| 0 — service / track | 20 km/h | 5 km/h | 10 km/h |
-| 1 — residential / living\_street | 25 km/h | 5 km/h | 15 km/h |
-| 2 — tertiary / unclassified | 50 km/h | 5 km/h | 18 km/h |
-| 3 — secondary | 70 km/h | 5 km/h | 20 km/h |
-| 4 — primary | 90 km/h | 5 km/h | 22 km/h |
-| 5 — trunk | 110 km/h | — | — |
-| 6 — motorway | 130 km/h | — | — |
-
-`—` means the road type is inaccessible for that profile; edges are not generated.
-
-**Car** (default): uses OSM `maxspeed` tag when present to override the base speed. Residential roads are slightly penalised (25 km/h) vs arterials to prefer main roads. Footways, cycleways, pedestrian zones, paths and steps are excluded.
-
-**Pedestrian**: constant 5 km/h on all accessible roads. Motorway and trunk are excluded. Includes footway, path, pedestrian, cycleway.
-
-**Bike**: 10–22 km/h depending on road class. Motorway, trunk, footway and steps are excluded.
-
----
-
 ## Console output
 
-The generator prints per-cell statistics to stdout:
+The generator prints per-profile and per-cell statistics to stdout:
 
 ```
+Route generator
+Input  : andorra-251227.osm.pbf (38.3 MB)
+Output : ./ROUTE/{CAR,BIKE,WALK}/ROUTE.bin
+
+=== Profile: car ===
+Pass 1: Scanning relations...
+Pass 2: Extracting road ways...
+Ways processed : 38412
+Road ways found: 12853 (filtered: 25559)
+Building routing graph...
 [GRAPH] Cell E4:415000_10000: 6244 nodes, 12766 edges
 [GRAPH]   Giant component : 6015 / 6244 (96.3%)
 [GRAPH]   Oneway edges    : 1846 (14.5%)
 [GRAPH]   Classes (0-6)   : 5551 2659 904 1063 1759 830 0
-[GRAPH] Written: ROUTE/ROUTE.bin  (1 cells, 6244 nodes, 12766 edges)
+[GRAPH] Written: ./ROUTE/CAR/ROUTE.bin  (1 cells, 6244 nodes, 12766 edges)
+Profile done in 12s
+
+=== Profile: bike ===
+...
+[GRAPH] Written: ./ROUTE/BIKE/ROUTE.bin  (1 cells, 7102 nodes, 14330 edges)
+Profile done in 11s
+
+=== Profile: pedestrian ===
+...
+[GRAPH] Written: ./ROUTE/WALK/ROUTE.bin  (1 cells, 7580 nodes, 15210 edges)
+Profile done in 11s
+
+All profiles done in 34s
 ```
 
 A warning is printed to stderr if the giant connected component is below 95% — this usually indicates a problem with intersection detection.
-
----
-
-## Using with tile_viewer.py
-
-```bash
-# Generate tiles and routing graph separately
-./nav_generator andorra.pbf NAVMAP features.json
-./route_generator andorra.pbf .
-
-# Open viewer with both
-python tile_viewer.py NAVMAP --lat 42.5069 --lon 1.5218 --route-dir ROUTE
-```
-
-See [`docs/tile_viewer.md`](tile_viewer.md) for routing interaction details.
-
----
-
-## Using with IceNav-v3 (ESP32)
-
-Copy `ROUTE/ROUTE.bin` to the SD card alongside `NAVMAP/`:
-
-```
-/sdcard/
-  NAVMAP/   ← vector tiles
-  ROUTE/    ← routing graph
-  TRK/
-  WPT/
-```

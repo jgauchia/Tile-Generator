@@ -128,20 +128,8 @@ public:
 
 static void print_usage()
 {
-    std::cout << "Usage: route_generator <input.pbf> <output_dir> [--profile car|pedestrian|bike]" << std::endl;
-    std::cout << "  Generates <output_dir>/ROUTE/ROUTE.bin" << std::endl;
-    std::cout << "  --profile car         Light vehicle, penalises residential streets (default)" << std::endl;
-    std::cout << "  --profile pedestrian  ~5 km/h everywhere, no motorway/trunk" << std::endl;
-    std::cout << "  --profile bike        10-22 km/h, no motorway/trunk/steps" << std::endl;
-}
-
-static nav::RoutingProfile parse_profile(const std::string& s)
-{
-    if (s == "pedestrian") return nav::RoutingProfile::Pedestrian;
-    if (s == "bike")       return nav::RoutingProfile::Bike;
-    if (s == "car")        return nav::RoutingProfile::Car;
-    std::cerr << "Unknown profile '" << s << "', using 'car'" << std::endl;
-    return nav::RoutingProfile::Car;
+    std::cout << "Usage: route_generator <input.pbf> <output_dir>" << std::endl;
+    std::cout << "  Generates ROUTE/CAR/ROUTE.bin, ROUTE/BIKE/ROUTE.bin, ROUTE/PEDESTRIAN/ROUTE.bin" << std::endl;
 }
 
 static const char* profile_name(nav::RoutingProfile p)
@@ -156,7 +144,7 @@ static const char* profile_name(nav::RoutingProfile p)
 
 int main(int argc, char* argv[])
 {
-    if (argc < 3)
+    if (argc != 3)
     {
         print_usage();
         return 1;
@@ -164,27 +152,12 @@ int main(int argc, char* argv[])
 
     std::string input_pbf  = argv[1];
     std::string output_dir = argv[2];
-    nav::RoutingProfile profile = nav::RoutingProfile::Car;
-
-    for (int i = 3; i < argc; ++i)
-    {
-        std::string arg = argv[i];
-        if (arg == "--profile" && i + 1 < argc)
-            profile = parse_profile(argv[++i]);
-        else
-        {
-            std::cerr << "Unknown argument: " << arg << std::endl;
-            print_usage();
-            return 1;
-        }
-    }
 
     std::cout << "Route generator" << std::endl;
     std::cout << "Input  : " << input_pbf << " ("
               << std::fixed << std::setprecision(1)
               << (std::filesystem::file_size(input_pbf) / 1024.0 / 1024.0) << " MB)" << std::endl;
-    std::cout << "Output : " << output_dir << "/ROUTE/" << std::endl;
-    std::cout << "Profile: " << profile_name(profile) << std::endl;
+    std::cout << "Output : " << output_dir << "/ROUTE/{CAR,BIKE,WALK}/ROUTE.bin" << std::endl;
 
     try
     {
@@ -198,60 +171,81 @@ int main(int argc, char* argv[])
         return 1;
     }
 
-    auto start_time = std::chrono::steady_clock::now();
+    auto total_start = std::chrono::steady_clock::now();
 
-    try
+    static const nav::RoutingProfile ALL_PROFILES[] = {
+        nav::RoutingProfile::Car,
+        nav::RoutingProfile::Bike,
+        nav::RoutingProfile::Pedestrian,
+    };
+
+    for (nav::RoutingProfile profile : ALL_PROFILES)
     {
-        index_type index;
-        location_handler_type location_handler{index};
-        RouteHandler route_handler;
-        route_handler.profile = profile;
+        std::cout << "\n=== Profile: " << profile_name(profile) << " ===" << std::endl;
 
-        std::cout << "Pass 1: Scanning relations..." << std::endl;
-        osmium::area::MultipolygonManager<osmium::area::Assembler> mp_manager{
-            osmium::area::Assembler::config_type{}};
-        osmium::io::Reader reader1{input_pbf, osmium::osm_entity_bits::relation};
-        osmium::apply(reader1, mp_manager);
-        reader1.close();
-        mp_manager.prepare_for_lookup();
+        auto start_time = std::chrono::steady_clock::now();
 
-        std::cout << "Pass 2: Extracting road ways..." << std::endl;
-        osmium::io::Reader reader2{input_pbf};
-        osmium::apply(reader2, location_handler, route_handler,
-                      mp_manager.handler([](osmium::memory::Buffer&&) {}));
-        reader2.close();
+        try
+        {
+            index_type index;
+            location_handler_type location_handler{index};
+            RouteHandler route_handler;
+            route_handler.profile = profile;
 
-        std::cout << "Ways processed : " << route_handler.stats_ways << std::endl;
-        std::cout << "Road ways found: " << route_handler.road_ways.size()
-                  << " (filtered: " << route_handler.stats_filtered << ")" << std::endl;
+            std::cout << "Pass 1: Scanning relations..." << std::endl;
+            osmium::area::MultipolygonManager<osmium::area::Assembler> mp_manager{
+                osmium::area::Assembler::config_type{}};
+            osmium::io::Reader reader1{input_pbf, osmium::osm_entity_bits::relation};
+            osmium::apply(reader1, mp_manager);
+            reader1.close();
+            mp_manager.prepare_for_lookup();
 
-        // Per-class breakdown to verify motorway/trunk coverage
-        std::unordered_map<std::string, size_t> hw_counts;
-        for (const auto& f : route_handler.road_ways)
-            hw_counts[f.highway_type]++;
-        for (const auto& [hw, cnt] : hw_counts)
-            std::cout << "  " << hw << ": " << cnt << std::endl;
+            std::cout << "Pass 2: Extracting road ways..." << std::endl;
+            osmium::io::Reader reader2{input_pbf};
+            osmium::apply(reader2, location_handler, route_handler,
+                          mp_manager.handler([](osmium::memory::Buffer&&) {}));
+            reader2.close();
 
-        std::cout << "Building routing graph..." << std::endl;
-        nav::GraphBuilder graph_builder(output_dir, profile);
-        for (const auto& f : route_handler.road_ways)
-            graph_builder.add_way(f);
-        graph_builder.build_and_write();
+            std::cout << "Ways processed : " << route_handler.stats_ways << std::endl;
+            std::cout << "Road ways found: " << route_handler.road_ways.size()
+                      << " (filtered: " << route_handler.stats_filtered << ")" << std::endl;
 
-        auto end_time = std::chrono::steady_clock::now();
-        std::chrono::duration<double> elapsed = end_time - start_time;
-        int total_sec = static_cast<int>(elapsed.count());
-        int m = total_sec / 60;
-        int s = total_sec % 60;
-        std::cout << "\nDone in ";
-        if (m > 0) std::cout << m << "m ";
-        std::cout << s << "s" << std::endl;
+            std::unordered_map<std::string, size_t> hw_counts;
+            for (const auto& f : route_handler.road_ways)
+                hw_counts[f.highway_type]++;
+            for (const auto& [hw, cnt] : hw_counts)
+                std::cout << "  " << hw << ": " << cnt << std::endl;
+
+            std::cout << "Building routing graph..." << std::endl;
+            nav::GraphBuilder graph_builder(output_dir, profile);
+            for (const auto& f : route_handler.road_ways)
+                graph_builder.add_way(f);
+            graph_builder.build_and_write();
+
+            auto end_time = std::chrono::steady_clock::now();
+            std::chrono::duration<double> elapsed = end_time - start_time;
+            int total_sec = static_cast<int>(elapsed.count());
+            int m = total_sec / 60;
+            int s = total_sec % 60;
+            std::cout << "Profile done in ";
+            if (m > 0) std::cout << m << "m ";
+            std::cout << s << "s" << std::endl;
+        }
+        catch (const std::exception& e)
+        {
+            std::cerr << "Error [" << profile_name(profile) << "]: " << e.what() << std::endl;
+            return 1;
+        }
     }
-    catch (const std::exception& e)
-    {
-        std::cerr << "Error: " << e.what() << std::endl;
-        return 1;
-    }
+
+    auto total_end = std::chrono::steady_clock::now();
+    std::chrono::duration<double> total_elapsed = total_end - total_start;
+    int total_sec = static_cast<int>(total_elapsed.count());
+    int m = total_sec / 60;
+    int s = total_sec % 60;
+    std::cout << "\nAll profiles done in ";
+    if (m > 0) std::cout << m << "m ";
+    std::cout << s << "s" << std::endl;
 
     return 0;
 }

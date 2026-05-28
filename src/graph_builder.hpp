@@ -482,14 +482,24 @@ private:
                     lat_e4, lon_e4);
     }
 
+    const char* profile_subdir() const
+    {
+        switch (profile_)
+        {
+            case RoutingProfile::Pedestrian: return "WALK";
+            case RoutingProfile::Bike:       return "BIKE";
+            default:                         return "CAR";
+        }
+    }
+
     void write_route_bin(const std::vector<struct CellData>& cells)
     {
         char dir_buf[256];
-        snprintf(dir_buf, sizeof(dir_buf), "%s/ROUTE", output_dir_.c_str());
+        snprintf(dir_buf, sizeof(dir_buf), "%s/ROUTE/%s", output_dir_.c_str(), profile_subdir());
         std::filesystem::create_directories(dir_buf);
 
         char path_buf[256];
-        snprintf(path_buf, sizeof(path_buf), "%s/ROUTE/ROUTE.bin", output_dir_.c_str());
+        snprintf(path_buf, sizeof(path_buf), "%s/ROUTE/%s/ROUTE.bin", output_dir_.c_str(), profile_subdir());
 
         FILE* f = fopen(path_buf, "wb");
         if (!f)
