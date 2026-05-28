@@ -70,10 +70,13 @@ struct RouteEdge
     uint32_t dst_node;       // global index
     uint32_t cost;
     uint16_t dist_m;
-    uint8_t  flags;
+    uint8_t  flags;          // bit0=oneway, bits1-3=hw_class, bit4=reverse-only (backward A*)
     uint8_t  reserved;
 };
 static_assert(sizeof(RouteEdge) == 12, "RouteEdge size mismatch");
+
+static constexpr uint8_t EDGE_FLAG_REVERSE = 0x10;  // set on edges emitted only for backward search
+
 #pragma pack(pop)
 
 class GraphBuilder
@@ -283,7 +286,67 @@ public:
             }
         }
 
-        // Pass 3: build per-cell edge lists
+        // Build a lookup: global_node_index → cell_key, for O(1) reverse-edge placement.
+        // cell_keys is sorted ascending; cell_node_ranges[key].base is monotonically
+        // increasing in that order, so we can binary-search by base+count.
+        // We build a flat sorted array of (base, key) pairs for the binary search.
+        struct CellBase { uint32_t base; uint64_t key; };
+        std::vector<CellBase> cell_bases;
+        cell_bases.reserve(cell_keys.size());
+        for (uint64_t k : cell_keys)
+            cell_bases.push_back({cell_node_ranges.at(k).base, k});
+        // Already sorted because cell_keys is sorted and bases are assigned in order.
+
+        auto cell_key_for_node = [&](uint32_t gi) -> uint64_t
+        {
+            // Binary search: find last entry with base <= gi.
+            uint32_t lo = 0, hi = (uint32_t)cell_bases.size();
+            if (hi == 0) return 0;
+            hi--;
+            while (lo < hi)
+            {
+                uint32_t mid = lo + (hi - lo + 1) / 2;
+                if (cell_bases[mid].base <= gi) lo = mid; else hi = mid - 1;
+            }
+            const CellNodeRange& r = cell_node_ranges.at(cell_bases[lo].key);
+            if (gi >= r.base && gi < r.base + r.count)
+                return cell_bases[lo].key;
+            return 0;
+        };
+
+        // Pass 3: build per-cell edge lists.
+        // Pre-pass 3a: collect reverse edges keyed by the cell that owns dst_global.
+        struct PendingEdge { uint32_t node; RouteEdge edge; };
+        std::unordered_map<uint64_t, std::vector<PendingEdge>> reverse_by_cell;
+
+        for (uint64_t key : cell_keys)
+        {
+            const auto& segs = cell_segments.at(key);
+            for (const SegmentData& seg : segs)
+            {
+                uint32_t src_global = global_node_index.at(seg.src_osm_id);
+                uint32_t dst_global = global_node_index.at(seg.dst_osm_id);
+                if (src_global == dst_global) continue;
+                float spd = speed_ms(seg.hw_class, seg.maxspeed);
+                if (spd <= 0.0f) continue;
+                uint32_t cost = (uint32_t)((seg.dist_m / spd) * 10.0f);
+                uint16_t dm   = (uint16_t)std::min((float)UINT16_MAX, seg.dist_m);
+                uint8_t  bf   = (uint8_t)((seg.oneway == 1 ? 1 : 0)
+                                         | ((seg.hw_class & 0x07) << 1));
+
+                RouteEdge rev{};
+                rev.dst_node = src_global;
+                rev.cost     = cost;
+                rev.dist_m   = dm;
+                rev.flags    = (uint8_t)(bf | EDGE_FLAG_REVERSE);
+                rev.reserved = 0;
+
+                uint64_t dst_cell = cell_key_for_node(dst_global);
+                if (dst_cell != 0)
+                    reverse_by_cell[dst_cell].push_back({dst_global, rev});
+            }
+        }
+
         std::vector<CellData> cells;
         cells.reserve(cell_keys.size());
 
@@ -304,7 +367,7 @@ public:
                 if (src_global == dst_global) continue;
 
                 float    spd   = speed_ms(seg.hw_class, seg.maxspeed);
-                if (spd <= 0.0f) continue;   // inaccessible for this profile
+                if (spd <= 0.0f) continue;
                 uint32_t cost  = (uint32_t)((seg.dist_m / spd) * 10.0f);
                 uint16_t dm    = (uint16_t)std::min((float)UINT16_MAX, seg.dist_m);
                 uint8_t  flags = (uint8_t)((seg.oneway == 1 ? 1 : 0)
@@ -317,6 +380,14 @@ public:
                 e.flags    = flags;
                 e.reserved = 0;
                 node_edges[src_global].push_back(e);
+            }
+
+            // Add reverse edges collected in pre-pass 3a for this cell.
+            auto rev_it = reverse_by_cell.find(key);
+            if (rev_it != reverse_by_cell.end())
+            {
+                for (const PendingEdge& pe : rev_it->second)
+                    node_edges[pe.node].push_back(pe.edge);
             }
 
             CellData cd;
