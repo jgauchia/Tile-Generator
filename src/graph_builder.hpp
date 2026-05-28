@@ -21,6 +21,20 @@
 
 namespace nav {
 
+enum class RoutingProfile { Car, Pedestrian, Bike };
+
+// Speed table [profile][hw_class 0-6] in km/h. 0 = inaccessible (edge skipped).
+// hw_class: 0=service/track, 1=living_street/residential, 2=tertiary/unclassified,
+//           3=secondary, 4=primary, 5=trunk, 6=motorway
+static const float PROFILE_SPEED_KMH[3][7] = {
+    // Car: penalises residential/service vs arterials; prohibits nothing below class 5
+    { 20,  25,  50,  70,  90, 110, 130 },
+    // Pedestrian: flat 5 km/h everywhere; no motorway/trunk
+    {  5,   5,   5,   5,   5,   0,   0 },
+    // Bike: slow on service, faster on cycleway-class roads, no motorway/trunk
+    { 10,  15,  18,  20,  22,   0,   0 },
+};
+
 #pragma pack(push, 1)
 // File header — 32 bytes
 struct RouteFileHeader
@@ -65,7 +79,9 @@ static_assert(sizeof(RouteEdge) == 12, "RouteEdge size mismatch");
 class GraphBuilder
 {
 public:
-    explicit GraphBuilder(const std::string& output_dir) : output_dir_(output_dir) {}
+    explicit GraphBuilder(const std::string& output_dir,
+                          RoutingProfile profile = RoutingProfile::Car)
+        : output_dir_(output_dir), profile_(profile) {}
 
     void add_way(const Feature& f)
     {
@@ -195,6 +211,7 @@ public:
                     continue;
 
                 float    spd   = speed_ms(seg.hw_class, seg.maxspeed);
+                if (spd <= 0.0f) continue;   // inaccessible for this profile
                 uint32_t cost  = (uint32_t)((seg.dist_m / spd) * 10.0f);
                 uint16_t dm    = (uint16_t)std::min((float)UINT16_MAX, seg.dist_m);
                 uint8_t  flags = (uint8_t)((seg.oneway == 1 ? 1 : 0)
@@ -279,6 +296,7 @@ private:
     std::unordered_map<int64_t, int> node_ref_count_;
     std::vector<WayData>             ways_;
     std::string                      output_dir_;
+    RoutingProfile                   profile_;
 
     static uint64_t cell_key_of(float lat, float lon)
     {
@@ -299,13 +317,16 @@ private:
         return 0;
     }
 
+    // Returns speed in m/s for the active profile. Returns 0 if inaccessible.
     float speed_ms(uint8_t hw_class, uint8_t maxspeed)
     {
-        static const float base_kmh[7] = {20, 30, 50, 70, 90, 110, 130};
-        float kmh = (maxspeed > 0 && maxspeed < 255)
-                    ? (float)maxspeed
-                    : base_kmh[hw_class];
-        return kmh / 3.6f;
+        int pidx = (int)profile_;
+        float base_kmh = PROFILE_SPEED_KMH[pidx][hw_class & 0x07];
+        if (base_kmh <= 0.0f) return 0.0f;
+        // maxspeed tag overrides base speed only for car profile
+        if (profile_ == RoutingProfile::Car && maxspeed > 0 && maxspeed < 255)
+            base_kmh = (float)maxspeed;
+        return base_kmh / 3.6f;
     }
 
     static float haversine_m(double lat1, double lon1, double lat2, double lon2)

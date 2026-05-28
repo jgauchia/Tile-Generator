@@ -31,23 +31,30 @@ The binary is produced at `build/route_generator`.
 ## Usage
 
 ```bash
-route_generator <input.pbf> <output_dir>
+route_generator <input.pbf> <output_dir> [--profile car|pedestrian|bike]
 ```
 
 | Argument | Description |
 |---|---|
 | `input.pbf` | OSM PBF extract (any region) |
 | `output_dir` | Directory where `ROUTE/` will be created |
+| `--profile` | Routing profile (default: `car`) |
 
 ### Example
 
 ```bash
-# Generate routing graph for Andorra
+# Car routing (default)
 ./route_generator andorra-251227.osm.pbf .
 # Output: ./ROUTE/ROUTE.bin
 
-# Generate for a larger region
-./route_generator catalonia-latest.osm.pbf /data/maps
+# Pedestrian routing
+./route_generator andorra-251227.osm.pbf . --profile pedestrian
+
+# Bike routing
+./route_generator andorra-251227.osm.pbf . --profile bike
+
+# Larger region
+./route_generator catalonia-latest.osm.pbf /data/maps --profile car
 # Output: /data/maps/ROUTE/ROUTE.bin
 ```
 
@@ -116,17 +123,39 @@ Edges for node `i` span `edge[node[i].edge_offset .. node[i+1].edge_offset - 1]`
 
 ### Highway classes (bits 1–3 of flags)
 
-| Value | `highway=` tags | Default speed |
-|---|---|---|
-| 0 | service / track / other | 20 km/h |
-| 1 | living_street / residential | 30 km/h |
-| 2 | unclassified / tertiary / tertiary_link | 50 km/h |
-| 3 | secondary / secondary_link | 70 km/h |
-| 4 | primary / primary_link | 90 km/h |
-| 5 | trunk / trunk_link | 110 km/h |
-| 6 | motorway / motorway_link | 130 km/h |
+| Value | `highway=` tags |
+|---|---|
+| 0 | service / track / other |
+| 1 | living_street / residential |
+| 2 | unclassified / tertiary / tertiary_link |
+| 3 | secondary / secondary_link |
+| 4 | primary / primary_link |
+| 5 | trunk / trunk_link |
+| 6 | motorway / motorway_link |
 
-If `maxspeed` is set in OSM and is in the range 1–254 km/h, it overrides the default speed for cost calculation.
+---
+
+## Routing profiles
+
+The `--profile` flag controls which roads are included and at what speed. The `cost` field encodes travel time in tenths of second: `cost = (dist_m / speed_ms) × 10`.
+
+| hw_class | Car | Pedestrian | Bike |
+|---|---|---|---|
+| 0 — service / track | 20 km/h | 5 km/h | 10 km/h |
+| 1 — residential / living\_street | 25 km/h | 5 km/h | 15 km/h |
+| 2 — tertiary / unclassified | 50 km/h | 5 km/h | 18 km/h |
+| 3 — secondary | 70 km/h | 5 km/h | 20 km/h |
+| 4 — primary | 90 km/h | 5 km/h | 22 km/h |
+| 5 — trunk | 110 km/h | — | — |
+| 6 — motorway | 130 km/h | — | — |
+
+`—` means the road type is inaccessible for that profile; edges are not generated.
+
+**Car** (default): uses OSM `maxspeed` tag when present to override the base speed. Residential roads are slightly penalised (25 km/h) vs arterials to prefer main roads. Footways, cycleways, pedestrian zones, paths and steps are excluded.
+
+**Pedestrian**: constant 5 km/h on all accessible roads. Motorway and trunk are excluded. Includes footway, path, pedestrian, cycleway.
+
+**Bike**: 10–22 km/h depending on road class. Motorway, trunk, footway and steps are excluded.
 
 ---
 

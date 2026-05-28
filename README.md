@@ -125,8 +125,14 @@ The routing log panel (bottom-right) shows:
 ### Usage
 
 ```bash
-route_generator <input.pbf> <output_dir>
+route_generator <input.pbf> <output_dir> [--profile car|pedestrian|bike]
 ```
+
+| Flag | Description |
+|---|---|
+| `--profile car` | Light vehicle — penalises residential, excludes footways (default) |
+| `--profile pedestrian` | ~5 km/h everywhere, excludes motorway/trunk |
+| `--profile bike` | 10–22 km/h, excludes motorway/trunk/steps |
 
 The output directory receives a `ROUTE/ROUTE.bin` file containing the full routing graph. Internally the graph is partitioned into 0.05°×0.05° subcells with an index — readers load only the cells needed for the route on-demand.
 
@@ -136,9 +142,12 @@ The output directory receives a `ROUTE/ROUTE.bin` file containing the full routi
 # Build tile generator and route generator
 cd build && cmake .. && make -j$(nproc)
 
-# Generate routing graph for Andorra
+# Generate routing graph for Andorra (car profile, default)
 ./route_generator andorra-251227.osm.pbf .
 # → ./ROUTE/ROUTE.bin
+
+# Pedestrian routing
+./route_generator andorra-251227.osm.pbf . --profile pedestrian
 
 # Copy to SD card alongside tiles
 rsync -av NAVMAP/ /media/sdcard/NAVMAP/
