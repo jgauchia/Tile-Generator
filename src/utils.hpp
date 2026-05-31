@@ -2,7 +2,7 @@
  * @file utils.hpp
  * @author Jordi Gauchía (jgauchia @jgauchia.com)
  * @brief Geographic projection and bitwise utility functions.
- * @version 0.7.0
+ * @version 0.8.0
  * @date 2026-05
  */
 

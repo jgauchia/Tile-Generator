@@ -122,13 +122,21 @@ The routing log panel (bottom-right) shows:
 
 `route_generator` builds A\* routing graph files from the same OSM PBF. It runs independently from tile generation — use it with vector tiles, PNG tiles, or any map source.
 
+A single run generates all three routing profiles at once:
+
+```
+ROUTE/CAR/ROUTE.bin
+ROUTE/BIKE/ROUTE.bin
+ROUTE/WALK/ROUTE.bin
+```
+
 ### Usage
 
 ```bash
 route_generator <input.pbf> <output_dir>
 ```
 
-The output directory receives a `ROUTE/ROUTE.bin` file containing the full routing graph. Internally the graph is partitioned into 0.05°×0.05° subcells with an index — readers load only the cells needed for the route on-demand.
+Internally the graph is partitioned into 0.05°×0.05° subcells with an index — readers load only the cells needed for the route on-demand.
 
 ### Example
 
@@ -136,16 +144,18 @@ The output directory receives a `ROUTE/ROUTE.bin` file containing the full routi
 # Build tile generator and route generator
 cd build && cmake .. && make -j$(nproc)
 
-# Generate routing graph for Andorra
+# Generate all three routing profiles for Andorra
 ./route_generator andorra-251227.osm.pbf .
-# → ./ROUTE/ROUTE.bin
+# → ./ROUTE/CAR/ROUTE.bin
+# → ./ROUTE/BIKE/ROUTE.bin
+# → ./ROUTE/WALK/ROUTE.bin
 
 # Copy to SD card alongside tiles
 rsync -av NAVMAP/ /media/sdcard/NAVMAP/
 rsync -av ROUTE/  /media/sdcard/ROUTE/
 ```
 
-For the full binary format specification see [`docs/route_generator.md`](docs/route_generator.md).
+For the full binary format and profile speed tables see [`docs/route_generator.md`](docs/route_generator.md).
 
 ## Internal Format Details
 
