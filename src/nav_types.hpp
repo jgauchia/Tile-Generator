@@ -2,7 +2,7 @@
  * @file nav_types.hpp
  * @author Jordi Gauchía (jgauchia @jgauchia.com)
  * @brief Basic data structures and constants for the NAV tile generator.
- * @version 0.7.0
+ * @version 0.8.0
  * @date 2026-05
  */
 
