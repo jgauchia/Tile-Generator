@@ -626,6 +626,7 @@ private:
         uint32_t tiles_high = max_y - min_y + 1;
         uint32_t flat_count = tiles_wide * tiles_high;
 
+        uint64_t zoom_bytes = 0;
         std::string pack_path = output_dir + "/Z" + std::to_string(z) + ".nav";
         std::ofstream out(pack_path, std::ios::binary);
         if (out)
@@ -662,6 +663,7 @@ private:
             for (const auto& pt : packed_results)
                 out.write((char*)pt.data.data(), pt.data.size());
 
+            zoom_bytes = current_data_offset;
             total_generated_bytes += current_data_offset;
             total_generated_files++;
         }
@@ -672,7 +674,7 @@ private:
                   << std::setw(8) << tiles.size() << " tiles ("
                   << std::fixed << std::setprecision(1) << avg_tps << " t/s), "
                   << std::setw(8) << (size_t)merged_count << " polygons merged | "
-                  << std::setw(6) << std::setprecision(1) << (current_data_offset / 1024.0 / 1024.0) << " MB done in " << elapsed.count() << "s" << std::endl;
+                  << std::setw(6) << std::setprecision(1) << (zoom_bytes / 1024.0 / 1024.0) << " MB done in " << elapsed.count() << "s" << std::endl;
     }
 
     /**
