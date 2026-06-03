@@ -4,8 +4,7 @@ C++ toolset for generating optimized vector map tiles from OpenStreetMap PBF fil
 
 ## Features
 
-- **Pure Hilbert Indexing (New)**: Uses a space-filling curve for both data ordering and indexing, ensuring maximum spatial locality and optimized SD card seek patterns.
-- **Binary Tile Deduplication (New)**: Identifies identical tiles (e.g., land/ocean background) and reuses data blocks, significantly reducing final file size.
+- **Flat 2D Array Index**: O(1) tile lookup using a rectangular bounding box. No search required — one seek to the index entry, one read of 8 bytes.
 - **High-Performance C++ Engine**: OSM PBF parsing and tile generation using GEOS, GDAL, and Libosmium.
 - **Efficient Binary Format**: Packed NPK2 containers with Delta+ZigZag+VarInt coordinate encoding.
 - **Memory-Mapped Storage**: Uses `mmap` for feature storage, allowing processing of large PBF files with minimal RAM.
@@ -19,7 +18,7 @@ The generator operates in multiple passes to ensure topological consistency and 
 1. **Pass 1 (Relations)**: Scans PBF for administrative boundaries and water multipolygons.
 2. **Pass 2 (Features)**: Extracts nodes and ways, applying semantic filtering and layer assignment.
 3. **Pass 3 (Water)**: Integrates global water polygons from external Shapefiles (using GDAL/OGR).
-4. **Pass 4 (Tiles)**: Parallel clipping, simplification (GEOS), and NPK2-Hilbert packaging.
+4. **Pass 4 (Tiles)**: Parallel clipping, simplification (GEOS), and NPK2 packaging.
 
 ## Dependencies & Installation
 
@@ -97,7 +96,6 @@ python3 tile_viewer.py <output_dir> --lat <latitude> --lon <longitude> --config 
 | `B` | Toggle background color (white/black) |
 | `F` | Toggle polygon fill |
 | `G` | Toggle tile grid |
-| `H` | Toggle Hilbert path (spatial locality check) |
 | `S` / `L` | Toggle stats / legend panels |
 | `Q` / Escape | Quit |
 
@@ -159,7 +157,7 @@ For the full binary format and profile speed tables see [`docs/route_generator.m
 
 ## Internal Format Details
 
-- **Tile container**: NPK2-Hilbert (Flat Hilbert Index) — `docs/bin_tile_format.md`
+- **Tile container**: NPK2 (Flat 2D Array Index, O(1) lookup) — `docs/bin_tile_format.md`
 - **Tile internal format**: NAV1 (Geometry + Text labels)
 - **Coordinates**: Web Mercator, 12-bit tile-relative space (0-4096)
 - **Routing graph**: ROUTE.bin (header 32B + index 20B/cell + nodes 12B + edges 12B, interleaved per cell) — `docs/route_generator.md`

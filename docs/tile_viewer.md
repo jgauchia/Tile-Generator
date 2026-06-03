@@ -1,12 +1,11 @@
 # NAV Tile Viewer - ESP32 Map Simulator (v0.5.0)
 
-`tile_viewer.py` is a specialized simulator for the **v0.5.0 Pure Hilbert binary format**. It mirrors the exact rendering logic of the IceNav ESP32 firmware while providing advanced diagnostic tools for map optimization.
+`tile_viewer.py` is a specialized simulator for the **NPK2 flat 2D index binary format**. It mirrors the exact rendering logic of the IceNav ESP32 firmware while providing advanced diagnostic tools for map validation.
 
-## New Features (v0.5.0)
+## Features
 
-- **Pure Hilbert Indexing Support**: Directly parses the new flat index structure and performs tile lookups using Hilbert distance ($O(\log N)$).
-- **Optimization Statistics**: Real-time display of **Space Savings** and **Unique vs Total Tiles** per zoom level, validating the effectiveness of the deduplication engine.
-- **Hilbert Path Visualization (Key `H`)**: Draws a recursive fractal path connecting tiles in their physical storage order, visually confirming the spatial locality of the data.
+- **NPK2 Flat Index Support**: Parses the `MapHeader` bounding box and resolves tiles by direct O(1) position calculation.
+- **Pack Statistics**: Real-time display of tile count, bounding box dimensions, origin coordinates, and file size per zoom level.
 - **Four-Pass Rendering Simulation**: Automatically draws layers in the correct order (Polygons → Road Casings → Road Cores → Text Labels).
 - **Reverse Tag Mapping**: When launched with `--config features.json`, identifies original OSM tags based on binary color.
 
@@ -21,11 +20,10 @@ The simulator mirrors the IceNav-v3 firmware's four-pass logic:
 3. **Pass 3**: Road cores (original color and width).
 4. **Pass 4**: Text labels on top of everything.
 
-### Hilbert Lookup Logic
+### Tile Lookup Logic
 ```python
-# Tile search algorithm implemented in the viewer
-h_id = xy_to_hilbert(tile_x, tile_y, zoom)
-entry = index.get(h_id) # O(1) in Python dictionary / O(log N) on ESP32
+# O(1) lookup — no Hilbert conversion, no binary search
+entry = index.get((tile_x, tile_y))  # dict keyed by (x, y)
 ```
 
 ---
@@ -35,7 +33,6 @@ entry = index.get(h_id) # O(1) in Python dictionary / O(log N) on ESP32
 ### Keyboard Controls
 - **Arrow Keys**: Pan map.
 - **`[` / `]`**: Zoom out / zoom in.
-- **`H`**: Toggle **Hilbert Path** (Diagnostic mode).
 - **`G`**: Toggle tile grid and coordinate labels.
 - **`B`**: Toggle background color (White/Black).
 - **`F`**: Toggle polygon fill.
@@ -54,10 +51,10 @@ entry = index.get(h_id) # O(1) in Python dictionary / O(log N) on ESP32
 
 ## Sidebar Panels
 
-### NPK2 Optimization (New)
-Displays the efficiency of the deduplication engine:
-- **Unique data**: Ratio of unique physical tiles to total logical tiles.
-- **Space savings**: Percentage of storage saved by reusing tile data.
+### NPK2 Pack Statistics
+Displays per-zoom information:
+- **Tiles**: Total tile count and bounding box dimensions (wide×high).
+- **Origin**: Bottom-left tile coordinate of the bounding box.
 - **Pack size**: Actual size of the `.nav` file on disk.
 
 ### Query Statistics

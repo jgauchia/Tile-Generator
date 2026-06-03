@@ -1,7 +1,7 @@
 /**
  * @file tile_processor.hpp
  * @author Jordi Gauchía (jgauchia @jgauchia.com)
- * @brief Optimized tile generation engine with Pure Hilbert Indexing and NAV-PACK container support.
+ * @brief Tile generation engine with flat 2D array index (NPK2). O(1) lookup via rectangular bounding box.
  * @version 0.8.0
  * @date 2026-03
  */
@@ -34,8 +34,21 @@ namespace nav {
 class TileProcessor
 {
 public:
+    /**
+     * @brief Construct a TileProcessor that writes output files to the given directory.
+     * @param out_dir Destination directory for generated Z{zoom}.nav files.
+     */
     TileProcessor(const std::string& out_dir) : output_dir(out_dir) {}
 
+    /**
+     * @brief Generate NPK2 tile files for all zoom levels in [min_z, max_z].
+     * @param features_by_zoom Feature offset arrays indexed by zoom bucket (0–17).
+     * @param store            Memory-mapped feature store.
+     * @param min_z            First zoom level to process.
+     * @param max_z            Last zoom level to process (inclusive).
+     * @param text_features    Label features resolved per zoom before tile generation.
+     * @param point_features   POI features rendered as fixed-size polygon symbols.
+     */
     void process_all(std::vector<size_t> (&features_by_zoom)[18], MappedStore& store,
                      int min_z, int max_z,
                      const std::vector<Feature>& text_features,
@@ -50,7 +63,9 @@ public:
         }
     }
 
+    /** @brief Total bytes written across all generated .nav files. */
     uint64_t get_total_bytes() const { return total_generated_bytes; }
+    /** @brief Number of .nav files generated. */
     size_t get_total_files() const { return total_generated_files; }
 
 private:
@@ -68,7 +83,7 @@ private:
         std::size_t operator()(const TileCoord& k) const
         { return std::hash<int>()(k.x) ^ (std::hash<int>()(k.y) << 1); }
     };
-    struct PackedTile { uint32_t x, y; uint64_t h; std::vector<uint8_t> data; };
+    struct PackedTile { uint32_t x, y; std::vector<uint8_t> data; };
 
     struct ProcessedFeature
     {
@@ -90,7 +105,12 @@ private:
         std::vector<TileCoord> tiles;
     };
 
-    // --- Collision detection for text labels ---
+    /**
+     * @brief Resolve text label placement for a zoom level using bounding-box collision detection.
+     * @param all_text All text and place-name features in the dataset.
+     * @param zoom     Target zoom level.
+     * @return Placed labels with their assigned tile coordinates; overlapping candidates are discarded.
+     */
     std::vector<PlacedLabel> resolve_text_labels(const std::vector<Feature>& all_text, int zoom)
     {
         std::vector<PlacedLabel> result;
@@ -172,6 +192,12 @@ private:
         return result;
     }
 
+    /**
+     * @brief Count total coordinate points in a GEOS geometry (recursive over collections).
+     * @param handle GEOS thread-local context.
+     * @param g      Geometry to count. May be nullptr or empty.
+     * @return Total number of coordinate points.
+     */
     uint32_t count_geos_points(GEOSContextHandle_t handle, const GEOSGeometry* g)
     {
         if (!g || GEOSisEmpty_r(handle, g)) return 0;
@@ -204,6 +230,12 @@ private:
         return 0;
     }
 
+    /**
+     * @brief Convert a nav::Feature polygon or linestring to a GEOS geometry for clipping.
+     * @param f      Source feature with ring_ends and points populated.
+     * @param handle GEOS thread-local context.
+     * @return Caller-owned GEOSGeometry*, or nullptr if the feature is degenerate.
+     */
     GEOSGeometry* feature_to_geos(const Feature& f, GEOSContextHandle_t handle)
     {
         if (f.ring_ends.empty()) return nullptr;
@@ -251,7 +283,14 @@ private:
         }
     }
 
-    // Convert GEOM_POINT features to polygon symbols for a given zoom/tile
+    /**
+     * @brief Build square polygon symbols for GEOM_POINT features visible in a tile.
+     * @param point_features All POI features in the dataset.
+     * @param z              Current zoom level.
+     * @param tile_x         Tile X coordinate.
+     * @param tile_y         Tile Y coordinate.
+     * @return ProcessedFeature list with one polygon per visible point.
+     */
     std::vector<ProcessedFeature> make_point_symbols(const std::vector<Feature>& point_features,
                                                       int z, int tile_x, int tile_y)
     {
@@ -316,7 +355,15 @@ private:
         return result;
     }
 
-    // Generate bridge deck underlay polygons (z >= 16)
+    /**
+     * @brief Generate bridge deck underlay polygons from road linestrings (zoom >= 16 only).
+     * @param line_features Processed linestring features for the current tile.
+     * @param z             Current zoom level; returns empty if z < 16.
+     * @param tile_x        Tile X coordinate.
+     * @param tile_y        Tile Y coordinate.
+     * @param handle        GEOS thread-local context.
+     * @return Polygon features representing bridge deck surfaces.
+     */
     std::vector<ProcessedFeature> make_bridge_decks(const std::vector<ProcessedFeature>& line_features,
                                                      int z, int tile_x, int tile_y,
                                                      GEOSContextHandle_t handle)
@@ -413,6 +460,13 @@ private:
         return result;
     }
 
+    /**
+     * @brief Extract a bridge deck polygon from a GEOS geometry and append it to result.
+     * @param handle GEOS thread-local context.
+     * @param poly   Clipped bridge deck polygon geometry.
+     * @param result Output list to append the decoded ProcessedFeature to.
+     * @param z      Current zoom level (used for coordinate scaling).
+     */
     void extract_deck_polygon(GEOSContextHandle_t handle, const GEOSGeometry* poly,
                                std::vector<ProcessedFeature>& result, int z, int /*tile_x*/, int /*tile_y*/)
     {
@@ -441,6 +495,14 @@ private:
         result.push_back(std::move(pf));
     }
 
+    /**
+     * @brief Generate the NPK2 tile file for a single zoom level.
+     * @param features_by_zoom Feature offset arrays indexed by zoom bucket (0–17).
+     * @param store            Memory-mapped feature store.
+     * @param z                Zoom level to process.
+     * @param placed_labels    Pre-resolved text label placements for this zoom.
+     * @param point_features   POI features rendered as polygon symbols.
+     */
     void process_zoom_level(std::vector<size_t> (&features_by_zoom)[18], MappedStore& store, int z,
                             const std::vector<PlacedLabel>& placed_labels,
                             const std::vector<Feature>& point_features)
@@ -526,7 +588,6 @@ private:
 
                     packed_results[idx].x = (uint32_t)tw.coord.x;
                     packed_results[idx].y = (uint32_t)tw.coord.y;
-                    packed_results[idx].h = utils::xy_to_hilbert(packed_results[idx].x, packed_results[idx].y, z);
                     packed_results[idx].data = serialize_tile(z, tw.coord.x, tw.coord.y,
                                                               store, tw.offsets, handle, m,
                                                               tile_labels, pt_syms);
@@ -551,54 +612,55 @@ private:
         }
         for (auto& w : workers) w.join();
 
-        // 1. Sort by Hilbert index to define physical AND index order
-        std::sort(packed_results.begin(), packed_results.end(), [](const PackedTile& a, const PackedTile& b) {
-            return a.h < b.h;
-        });
+        // Compute bounding box of tiles in this zoom level
+        uint32_t min_x = UINT32_MAX, min_y = UINT32_MAX;
+        uint32_t max_x = 0, max_y = 0;
+        for (const auto& pt : packed_results)
+        {
+            if (pt.x < min_x) min_x = pt.x;
+            if (pt.x > max_x) max_x = pt.x;
+            if (pt.y < min_y) min_y = pt.y;
+            if (pt.y > max_y) max_y = pt.y;
+        }
+        uint32_t tiles_wide = max_x - min_x + 1;
+        uint32_t tiles_high = max_y - min_y + 1;
+        uint32_t flat_count = tiles_wide * tiles_high;
 
         std::string pack_path = output_dir + "/Z" + std::to_string(z) + ".nav";
         std::ofstream out(pack_path, std::ios::binary);
         if (out)
         {
-            uint32_t index_offset = sizeof(PackHeader);
-            uint32_t data_offset = index_offset + (uint32_t)(packed_results.size() * sizeof(IndexEntry));
+            uint32_t data_offset = sizeof(MapHeader) + flat_count * sizeof(IndexEntry);
 
-            std::map<std::vector<uint8_t>, uint32_t> data_to_offset;
-            std::vector<size_t> unique_data_indices;
+            // Write header
+            MapHeader mh;
+            memcpy(mh.magic, "NPK2", 4);
+            mh.zoom = (uint8_t)z;
+            mh.tiles_wide = tiles_wide;
+            mh.tiles_high = tiles_high;
+            mh.bottom_left[0] = min_x;
+            mh.bottom_left[1] = min_y;
+            out.write((char*)&mh, sizeof(MapHeader));
+
+            // Reserve index table (all zeros = empty slot)
+            std::vector<IndexEntry> index(flat_count, {0, 0});
+
+            // Write tile data and fill index
             uint32_t current_data_offset = data_offset;
-
-            std::vector<IndexEntry> index;
-            for (size_t i = 0; i < packed_results.size(); ++i)
+            for (const auto& pt : packed_results)
             {
-                auto& pt = packed_results[i];
-                auto it = data_to_offset.find(pt.data);
-                uint32_t final_offset;
-                if (it != data_to_offset.end())
-                {
-                    final_offset = it->second;
-                }
-                else
-                {
-                    final_offset = current_data_offset;
-                    data_to_offset[pt.data] = current_data_offset;
-                    unique_data_indices.push_back(i);
-                    current_data_offset += (uint32_t)pt.data.size();
-                }
-                index.push_back({pt.h, final_offset, (uint32_t)pt.data.size()});
+                uint32_t x_off = pt.x - min_x;
+                uint32_t y_off = pt.y - min_y;
+                uint32_t flat_idx = y_off * tiles_wide + x_off;
+                index[flat_idx].offset = current_data_offset;
+                index[flat_idx].size   = (uint32_t)pt.data.size();
+                current_data_offset += (uint32_t)pt.data.size();
             }
 
-            PackHeader ph;
-            memcpy(ph.magic, "NPK2", 4);
-            ph.zoom = (uint8_t)z;
-            ph.tile_count = (uint32_t)index.size();
-            ph.index_offset = index_offset;
-            memset(ph.reserved, 0, sizeof(ph.reserved));
+            out.write((char*)index.data(), flat_count * sizeof(IndexEntry));
 
-            out.write((char*)&ph, sizeof(PackHeader));
-            out.write((char*)index.data(), index.size() * sizeof(IndexEntry));
-            
-            for (size_t idx : unique_data_indices)
-                out.write((char*)packed_results[idx].data.data(), packed_results[idx].data.size());
+            for (const auto& pt : packed_results)
+                out.write((char*)pt.data.data(), pt.data.size());
 
             total_generated_bytes += current_data_offset;
             total_generated_files++;
@@ -613,6 +675,19 @@ private:
                   << std::setw(6) << (total_generated_bytes / 1024 / 1024) << " MB done in " << elapsed.count() << "s" << std::endl;
     }
 
+    /**
+     * @brief Serialize one tile to NAV1 binary format (geometry clip, simplify, encode).
+     * @param z             Zoom level.
+     * @param x             Tile X coordinate.
+     * @param y             Tile Y coordinate.
+     * @param store         Memory-mapped feature store.
+     * @param offsets       Feature offsets within the store that intersect this tile.
+     * @param local_handle  GEOS thread-local context for geometry operations.
+     * @param merged_out    Incremented by the number of polygons merged in this tile.
+     * @param tile_labels   Pre-placed text label features for this tile.
+     * @param point_symbols Pre-built polygon symbols for POI features in this tile.
+     * @return Raw bytes of the complete NAV1 tile block ready to write to disk.
+     */
     std::vector<uint8_t> serialize_tile(int z, int x, int y, const MappedStore& store,
                                          const std::vector<size_t>& offsets,
                                          GEOSContextHandle_t local_handle, size_t& merged_out,
