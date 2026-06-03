@@ -672,7 +672,7 @@ private:
                   << std::setw(8) << tiles.size() << " tiles ("
                   << std::fixed << std::setprecision(1) << avg_tps << " t/s), "
                   << std::setw(8) << (size_t)merged_count << " polygons merged | "
-                  << std::setw(6) << (total_generated_bytes / 1024 / 1024) << " MB done in " << elapsed.count() << "s" << std::endl;
+                  << std::setw(6) << std::setprecision(1) << (current_data_offset / 1024.0 / 1024.0) << " MB done in " << elapsed.count() << "s" << std::endl;
     }
 
     /**
