@@ -164,27 +164,19 @@ Each cell's nodes and edges are stored **contiguously** in the data block. The `
 
 Edges for node `i` span `edge[node[i].edge_offset .. node[i+1].edge_offset - 1]` within the cell's edge block. For the last node, the range ends at `edge_count`.
 
-### Edge (12 bytes)
+### Edge (8 bytes)
 
 | Offset | Type | Field | Description |
 |---|---|---|---|
 | 0 | uint32 | dst_node | destination global node index |
 | 4 | uint32 | cost | travel time in tenths of second |
-| 8 | uint16 | dist_m | segment length in metres (capped at 65535) |
-| 10 | uint8 | flags | `bit0` = oneway, `bits1-3` = highway class (0–6) |
-| 11 | uint8 | reserved | always 0 |
 
-### Highway classes (bits 1–3 of flags)
-
-| Value | `highway=` tags |
-|---|---|
-| 0 | service / track / other |
-| 1 | living_street / residential |
-| 2 | unclassified / tertiary / tertiary_link |
-| 3 | secondary / secondary_link |
-| 4 | primary / primary_link |
-| 5 | trunk / trunk_link |
-| 6 | motorway / motorway_link |
+> **Note:** earlier versions stored an extra `dist_m` (uint16), `flags` (uint8, oneway +
+> highway class) and a `reserved` byte per edge (12-byte edge). These were not read by the
+> firmware router — A\* only uses `dst_node` and `cost` — so they were removed, shrinking the
+> edge record from 12 to 8 bytes (the edge block is the dominant part of the file). The
+> oneway constraint and per-class speed are already baked into the graph during generation
+> (reverse edges are omitted for oneways; `cost` already encodes the class-dependent speed).
 
 ---
 

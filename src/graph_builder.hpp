@@ -68,12 +68,9 @@ static_assert(sizeof(RouteNode) == 12, "RouteNode size mismatch");
 struct RouteEdge
 {
     uint32_t dst_node;       // global index
-    uint32_t cost;
-    uint16_t dist_m;
-    uint8_t  flags;
-    uint8_t  reserved;
+    uint32_t cost;           // travel time in tenths of second
 };
-static_assert(sizeof(RouteEdge) == 12, "RouteEdge size mismatch");
+static_assert(sizeof(RouteEdge) == 8, "RouteEdge size mismatch");
 #pragma pack(pop)
 
 class GraphBuilder
@@ -296,6 +293,8 @@ public:
             const CellNodeRange& range = cell_node_ranges.at(key);
 
             std::unordered_map<uint32_t, std::vector<RouteEdge>> node_edges;
+            uint32_t oneway_count = 0;
+            uint32_t class_count[7] = {};
 
             for (const SegmentData& seg : segs)
             {
@@ -306,17 +305,14 @@ public:
                 float    spd   = speed_ms(seg.hw_class, seg.maxspeed);
                 if (spd <= 0.0f) continue;   // inaccessible for this profile
                 uint32_t cost  = (uint32_t)((seg.dist_m / spd) * 10.0f);
-                uint16_t dm    = (uint16_t)std::min((float)UINT16_MAX, seg.dist_m);
-                uint8_t  flags = (uint8_t)((seg.oneway == 1 ? 1 : 0)
-                                          | ((seg.hw_class & 0x07) << 1));
 
                 RouteEdge e{};
                 e.dst_node = dst_global;
                 e.cost     = cost;
-                e.dist_m   = dm;
-                e.flags    = flags;
-                e.reserved = 0;
                 node_edges[src_global].push_back(e);
+
+                if (seg.oneway == 1) oneway_count++;
+                class_count[seg.hw_class & 0x07]++;
             }
 
             CellData cd;
@@ -346,7 +342,8 @@ public:
             }
 
             if (cd.nodes.empty()) continue;
-            print_stats(lat_e4, lon_e4, cd.nodes, cd.edges, range.base);
+            print_stats(lat_e4, lon_e4, cd.nodes, cd.edges, range.base,
+                        oneway_count, class_count);
             cells.push_back(std::move(cd));
         }
 
@@ -433,7 +430,9 @@ private:
     void print_stats(int32_t lat_e4, int32_t lon_e4,
                      const std::vector<RouteNode>& nodes,
                      const std::vector<RouteEdge>& edges,
-                     uint32_t global_base)
+                     uint32_t global_base,
+                     uint32_t oneway_count,
+                     const uint32_t class_count[7])
     {
         uint32_t n = (uint32_t)nodes.size();
         uint32_t e = (uint32_t)edges.size();
@@ -456,14 +455,6 @@ private:
                 uint32_t v = v_global - global_base;
                 if (!visited[v]) { visited[v] = true; q.push(v); }
             }
-        }
-
-        uint32_t oneway_count = 0;
-        uint32_t class_count[7] = {};
-        for (const auto& edge : edges)
-        {
-            if (edge.flags & 1) oneway_count++;
-            class_count[(edge.flags >> 1) & 7]++;
         }
 
         printf("[GRAPH] Cell E4:%d_%d: %u nodes, %u edges\n",
