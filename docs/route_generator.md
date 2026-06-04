@@ -154,13 +154,13 @@ Each cell's nodes and edges are stored **contiguously** in the data block. The `
 | 14 | uint32 | data_offset | byte offset from start of data block to this cell's `Node[0]` |
 | 18 | uint16 | edge_count | number of edges in this cell |
 
-### Node (12 bytes)
+### Node (10 bytes)
 
 | Offset | Type | Field | Description |
 |---|---|---|---|
 | 0 | float | lat | latitude in degrees |
 | 4 | float | lon | longitude in degrees |
-| 8 | uint32 | edge_offset | index of first outgoing edge within this cell's edge block |
+| 8 | uint16 | edge_offset | index of first outgoing edge within this cell's edge block |
 
 Edges for node `i` span `edge[node[i].edge_offset .. node[i+1].edge_offset - 1]` within the cell's edge block. For the last node, the range ends at `edge_count`.
 

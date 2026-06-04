@@ -61,9 +61,9 @@ struct RouteNode
 {
     float    lat;
     float    lon;
-    uint32_t edge_offset;    // index into this cell's edge block (relative to cell edge_offset)
+    uint16_t edge_offset;    // index into this cell's edge block (< edge_count, which is uint16)
 };
-static_assert(sizeof(RouteNode) == 12, "RouteNode size mismatch");
+static_assert(sizeof(RouteNode) == 10, "RouteNode size mismatch");
 
 struct RouteEdge
 {
@@ -331,7 +331,7 @@ public:
             for (uint32_t li = 0; li < range.count; ++li)
             {
                 uint32_t gi = range.base + li;
-                cd.nodes[li].edge_offset = offset;
+                cd.nodes[li].edge_offset = (uint16_t)offset;
                 auto it = node_edges.find(gi);
                 if (it != node_edges.end())
                 {
@@ -509,6 +509,11 @@ private:
         uint32_t total_edges = 0;
         for (const auto& cd : cells)
         {
+            if (cd.nodes.size() > UINT16_MAX || cd.edges.size() > UINT16_MAX)
+                fprintf(stderr, "[GRAPH] WARNING: cell E4:%d_%d exceeds uint16 limit"
+                                " (%zu nodes, %zu edges) — counts/edge_offset will wrap\n",
+                        cd.lat_e4, cd.lon_e4, cd.nodes.size(), cd.edges.size());
+
             CellIndexEntry ie{};
             ie.lat_e4      = cd.lat_e4;
             ie.lon_e4      = cd.lon_e4;

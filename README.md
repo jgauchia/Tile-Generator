@@ -162,7 +162,7 @@ For the full binary format and profile speed tables see [`docs/route_generator.m
 - **Color palette**: per-pack global RGB565 table; features store a 1-byte color index
 - **Feature header**: 8 fixed bytes + varint `coord_count`/`payload_size`
 - **Coordinates**: Web Mercator, 12-bit tile-relative space (0-4096)
-- **Routing graph**: ROUTE.bin (header 32B + index 20B/cell + nodes 12B + edges 8B, interleaved per cell) — `docs/route_generator.md`
+- **Routing graph**: ROUTE.bin (header 32B + index 20B/cell + nodes 10B + edges 8B, interleaved per cell) — `docs/route_generator.md`
 
 ---
 
