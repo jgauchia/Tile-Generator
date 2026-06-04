@@ -18,14 +18,17 @@ Controls:
     B                Toggle background color
     F                Toggle polygon fill
     G                Toggle tile grid
-    H                Toggle Hilbert path
     S                Toggle feature stats panel
     L                Toggle color legend panel
+    P                Cycle routing profile (WALK -> BIKE -> CAR)
     Q / Escape       Quit
 
 Routing:
-    Reads ROUTE/R{lat}_{lon}.bin from the nav_dir.
-    The routing log (bottom-right panel) shows origin, destination,
+    Reads ROUTE/{CAR,BIKE,WALK}/ROUTE.bin alongside the nav_dir.
+    Active profile defaults to WALK; switch it with the Route button or the P key.
+    On each right-click (or profile change) it loads every cell in the origin→destination
+    bounding box (+1 cell margin) and runs A* over that subgraph.
+    The routing log (bottom-right panel) shows origin, destination, profile,
     graph stats, route length, nodes visited and A* computation time.
 """
 
@@ -74,52 +77,6 @@ def deg2num(lat_deg: float, lon_deg: float, zoom: int) -> Tuple[float, float]:
     return xtile, ytile
 
 
-def xy_to_hilbert(x: int, y: int, z: int) -> int:
-    """Convert (x,y) tile coordinates to Hilbert index."""
-    def rot(n, x, y, rx, ry):
-        if ry == 0:
-            if rx == 1:
-                x = n - 1 - x
-                y = n - 1 - y
-            return y, x
-        return x, y
-
-    rx, ry, d = 0, 0, 0
-    n = 1 << z
-    s = n // 2
-    while s > 0:
-        rx = 1 if (x & s) > 0 else 0
-        ry = 1 if (y & s) > 0 else 0
-        d += s * s * ((3 * rx) ^ ry)
-        x, y = rot(s, x, y, rx, ry)
-        s //= 2
-    return d
-
-
-def hilbert_to_xy(d: int, z: int) -> Tuple[int, int]:
-    """Convert Hilbert index to (x,y) tile coordinates."""
-    def rot(n, x, y, rx, ry):
-        if ry == 0:
-            if rx == 1:
-                x = n - 1 - x
-                y = n - 1 - y
-            return y, x
-        return x, y
-
-    n = 1 << z
-    x, y = 0, 0
-    t = d
-    s = 1
-    while s < n:
-        rx = 1 & (t // 2)
-        ry = 1 & (t ^ rx)
-        x, y = rot(s, x, y, rx, ry)
-        x += s * rx
-        y += s * ry
-        t //= 4
-        s *= 2
-    return x, y
-
 
 def num2deg(xtile: float, ytile: float, zoom: int) -> Tuple[float, float]:
     """Convert fractional tile numbers to lat/lon."""
@@ -145,53 +102,71 @@ def darken_color(rgb: Tuple[int, int, int], amount: float = 0.15) -> Tuple[int, 
 
 # ── Routing ───────────────────────────────────────────────────────────────────
 
-# ROUTE.bin v2 format constants
-ROUTE_FILE_HDR_FMT  = '<4sBBBBIIIII'   # magic(4) version reserved[3] cell_count reserved2[4]
+# ROUTE.bin format constants (NPK route graph, interleaved per cell).
+# Must match graph_builder.hpp / route_types.hpp.
+ROUTE_FILE_HDR_FMT  = '<4sII5I'        # magic(4) sub_step_e4 cell_count reserved[5]  = 32B
 ROUTE_FILE_HDR_SIZE = struct.calcsize(ROUTE_FILE_HDR_FMT)
-CELL_IDX_FMT        = '<hhIIIII'       # lat_floor lon_floor node_offset node_count edge_offset edge_count reserved
+CELL_IDX_FMT        = '<iiIHIH'        # lat_e4 lon_e4 node_offset node_count data_offset edge_count = 20B
 CELL_IDX_SIZE       = struct.calcsize(CELL_IDX_FMT)
-ROUTE_NODE_FMT      = '<ffI'
+ROUTE_NODE_FMT      = '<ffI'           # lat lon edge_offset(u32)  = 12B
 ROUTE_NODE_SIZE     = struct.calcsize(ROUTE_NODE_FMT)
-ROUTE_EDGE_FMT      = '<IIHBHx'
+ROUTE_EDGE_FMT      = '<IIHBB'         # dst_node cost dist_m flags reserved = 12B
 ROUTE_EDGE_SIZE     = struct.calcsize(ROUTE_EDGE_FMT)
 
 
 def load_cells_for_route(route_base_dir: str,
                          src_lat: float, src_lon: float,
                          dst_lat: float, dst_lon: float):
-    """Load one or two cells from ROUTE.bin covering src and dst, merge into a single graph."""
+    """Load every cell in the origin→destination bounding box (±1 cell margin) from
+    ROUTE.bin and merge them into a single graph for A*.
+
+    The firmware pages cells on demand as A* expands, so it never needs a precomputed
+    box. The viewer loads statically, so it must include the cells between origin and
+    destination — loading only the two endpoint cells would leave the graph disconnected.
+    """
     route_path = os.path.join(route_base_dir, 'ROUTE.bin')
     if not os.path.exists(route_path):
         return None, None, [f'Missing: {route_path}']
 
     data = open(route_path, 'rb').read()
-    off = 0
 
-    hdr = struct.unpack_from(ROUTE_FILE_HDR_FMT, data, off)
-    off += ROUTE_FILE_HDR_SIZE
+    hdr = struct.unpack_from(ROUTE_FILE_HDR_FMT, data, 0)
     if hdr[0] != b'ROUT':
         return None, None, ['Bad magic in ROUTE.bin']
-    version    = hdr[1]
-    cell_count = hdr[5]
-    if version != 2:
-        return None, None, [f'Unsupported ROUTE.bin version {version} (expected 2)']
+    sub_step_e4 = hdr[1] if hdr[1] > 0 else 500
+    cell_count  = hdr[2]
 
-    # Read cell index
+    # Read cell index: lat_e4 lon_e4 node_offset node_count data_offset edge_count
+    off = ROUTE_FILE_HDR_SIZE
     cell_index = []
     for _ in range(cell_count):
-        lat_f, lon_f, n_off, n_cnt, e_off, e_cnt, _reserved = struct.unpack_from(CELL_IDX_FMT, data, off)
+        lat_e4, lon_e4, n_off, n_cnt, d_off, e_cnt = struct.unpack_from(CELL_IDX_FMT, data, off)
         off += CELL_IDX_SIZE
-        cell_index.append((lat_f, lon_f, n_off, n_cnt, e_off, e_cnt))
+        cell_index.append((lat_e4, lon_e4, n_off, n_cnt, d_off, e_cnt))
 
-    nodes_base = ROUTE_FILE_HDR_SIZE + cell_count * CELL_IDX_SIZE
-    edges_base = nodes_base + sum(c[3] for c in cell_index) * ROUTE_NODE_SIZE
-
-    # Determine which cells to load
-    def cell_key(lat, lon):
-        return (int(math.floor(lat)), int(math.floor(lon)))
-
-    needed = list(dict.fromkeys([cell_key(src_lat, src_lon), cell_key(dst_lat, dst_lon)]))
+    # Data block starts right after header + index. Each cell stores its nodes
+    # immediately followed by its edges at data_base + data_offset (interleaved).
+    data_base = ROUTE_FILE_HDR_SIZE + cell_count * CELL_IDX_SIZE
     cell_map = {(c[0], c[1]): c for c in cell_index}
+
+    def snap_e4(v):
+        return int(math.floor(v * 10000.0 / sub_step_e4) * sub_step_e4)
+
+    # Bounding box of origin and destination, expanded by one cell on each side.
+    lat_lo = min(snap_e4(src_lat), snap_e4(dst_lat)) - sub_step_e4
+    lat_hi = max(snap_e4(src_lat), snap_e4(dst_lat)) + sub_step_e4
+    lon_lo = min(snap_e4(src_lon), snap_e4(dst_lon)) - sub_step_e4
+    lon_hi = max(snap_e4(src_lon), snap_e4(dst_lon)) + sub_step_e4
+
+    needed = []
+    lat = lat_lo
+    while lat <= lat_hi:
+        lon = lon_lo
+        while lon <= lon_hi:
+            if (lat, lon) in cell_map:
+                needed.append((lat, lon))
+            lon += sub_step_e4
+        lat += sub_step_e4
 
     # dst_node in edges are global indices.
     # Nodes are stored as (lat, lon, edge_start, edge_end) — explicit range avoids
@@ -205,15 +180,14 @@ def load_cells_for_route(route_base_dir: str,
     for lat_k, lon_k in needed:
         entry = cell_map.get((lat_k, lon_k))
         if entry is None:
-            log.append(f'Cell R{lat_k}_{lon_k}: not found in index')
             continue
 
-        _, _, n_off, n_cnt, e_off, e_cnt = entry
+        _, _, n_off, n_cnt, d_off, e_cnt = entry
         edge_base = len(all_edges)
 
         # Read all nodes of cell into a temp list to compute edge_end per node
         cell_nodes_raw = []
-        pos = nodes_base + n_off * ROUTE_NODE_SIZE
+        pos = data_base + d_off
         for _ in range(n_cnt):
             lat_, lon_, local_edge_off = struct.unpack_from(ROUTE_NODE_FMT, data, pos)
             pos += ROUTE_NODE_SIZE
@@ -228,18 +202,18 @@ def load_cells_for_route(route_base_dir: str,
             gi = n_off + li
             all_nodes[gi] = (lat_, lon_, eo + edge_base, e_end)
 
-        # Read edges (dst_node already global)
-        pos = edges_base + e_off * ROUTE_EDGE_SIZE
+        # Edges follow the cell's nodes within the same data block (dst_node global).
+        pos = data_base + d_off + n_cnt * ROUTE_NODE_SIZE
         for _ in range(e_cnt):
-            dst_n, cost, dist_m, flags, name_idx = struct.unpack_from(ROUTE_EDGE_FMT, data, pos)
+            dst_n, cost, dist_m, flags, _reserved = struct.unpack_from(ROUTE_EDGE_FMT, data, pos)
             pos += ROUTE_EDGE_SIZE
-            all_edges.append((dst_n, cost, dist_m, flags, name_idx))
+            all_edges.append((dst_n, cost, dist_m, flags))
 
-        log.append(f'R{lat_k}_{lon_k}: {n_cnt} nodes, {e_cnt} edges')
+        log.append(f'E4:{lat_k}_{lon_k}: {n_cnt} nodes, {e_cnt} edges')
         loaded_any = True
 
     if not loaded_any:
-        return None, None, log
+        return None, None, log + ['No cells in route bbox']
 
     return all_nodes, all_edges, log
 
@@ -286,7 +260,9 @@ def astar_route(nodes, edges, src, dst):
             break
         e_end = nodes[u][3]
         for ei in range(nodes[u][2], e_end):
-            dst_n, cost, dist_m, _, _ = edges[ei]
+            dst_n, cost, dist_m, _flags = edges[ei]
+            if dst_n >= N:
+                continue  # edge points to a node outside the loaded bbox subgraph
             ng = gcost[u] + cost
             if ng < gcost[dst_n]:
                 gcost[dst_n] = ng
@@ -362,76 +338,15 @@ def _read_varint(buffer: bytes, offset: int) -> Tuple[int, int]:
         shift += 7
 
 
-def read_nav_tile(path: str, tile_x: int, tile_y: int) -> List[NavFeature]:
-    """Read optimized NAV tile file and return list of features with rings."""
+def read_nav_tile_from_bytes(data: bytes, tile_x: int, tile_y: int, palette: List[int]) -> List[NavFeature]:
+    """Read NAV tile from raw bytes (NPK2 pack, global color palette)."""
     features = []
     try:
-        with open(path, 'rb') as f:
-            magic = f.read(4)
-            if magic != NAV_MAGIC:
-                return features
-
-            feature_count = struct.unpack('<H', f.read(2))[0]
-            f.read(16)  # Skip global tile BBox
-
-            for _ in range(feature_count):
-                feature = NavFeature()
-                feature.tile_x = tile_x
-                feature.tile_y = tile_y
-
-                feature.geom_type = struct.unpack('<B', f.read(1))[0]
-                feature.color_rgb565 = struct.unpack('<H', f.read(2))[0]
-                feature.zoom_priority = struct.unpack('<B', f.read(1))[0]
-
-                # Width byte encoding: bit 7 = casing flag, bits 0-6 = actual width
-                width_byte = struct.unpack('<B', f.read(1))[0]
-                feature.needs_casing = (width_byte & 0x80) != 0
-                feature.width = (width_byte & 0x7F) / 2.0  # half-pixels to pixels
-
-                feature.bbox = struct.unpack('<BBBB', f.read(4))
-                coord_count = struct.unpack('<H', f.read(2))[0]
-                payload_size = struct.unpack('<H', f.read(2))[0]
-                payload = f.read(payload_size)
-
-                if feature.geom_type == GEOM_TEXT:
-                    if len(payload) >= 5:
-                        px, py = struct.unpack('<hh', payload[0:4])
-                        feature.coords.append((px, py))
-                        text_len = payload[4]
-                        feature.text = payload[5:5 + text_len].decode('utf-8', errors='replace')
-                        feature.font_size = feature.width
-                else:
-                    offset = 0
-                    last_x, last_y = 0, 0
-                    for _ in range(coord_count):
-                        zx, offset = _read_varint(payload, offset)
-                        zy, offset = _read_varint(payload, offset)
-                        last_x += _zigzag_decode(zx)
-                        last_y += _zigzag_decode(zy)
-                        feature.coords.append((last_x, last_y))
-
-                    if feature.geom_type == GEOM_POLYGON:
-                        ring_count = struct.unpack('<H', payload[offset:offset + 2])[0]
-                        offset += 2
-                        for _ in range(ring_count):
-                            feature.ring_ends.append(struct.unpack('<H', payload[offset:offset + 2])[0])
-                            offset += 2
-
-                features.append(feature)
-    except Exception as e:
-        logger.debug(f"Error reading tile {path}: {e}")
-    return features
-
-
-def read_nav_tile_from_bytes(data: bytes, tile_x: int, tile_y: int) -> List[NavFeature]:
-    """Read NAV tile from raw bytes (for NPK1 pack support)."""
-    features = []
-    try:
-        if len(data) < 22 or data[:4] != NAV_MAGIC:
+        if len(data) < 6 or data[:4] != NAV_MAGIC:
             return features
 
         feature_count = struct.unpack('<H', data[4:6])[0]
-        pos = 22  # Skip header (4 magic + 2 count + 16 bbox)
+        pos = 6  # Skip tile header (4 magic + 2 count)
 
         for _ in range(feature_count):
             feature = NavFeature()
@@ -439,15 +354,16 @@ def read_nav_tile_from_bytes(data: bytes, tile_x: int, tile_y: int) -> List[NavF
             feature.tile_y = tile_y
 
             feature.geom_type = data[pos]; pos += 1
-            feature.color_rgb565 = struct.unpack('<H', data[pos:pos+2])[0]; pos += 2
+            color_index = data[pos]; pos += 1
+            feature.color_rgb565 = palette[color_index] if color_index < len(palette) else 0xFFFF
             feature.zoom_priority = data[pos]; pos += 1
             width_byte = data[pos]; pos += 1
             feature.needs_casing = (width_byte & 0x80) != 0
             feature.width = (width_byte & 0x7F) / 2.0
 
             feature.bbox = struct.unpack('<BBBB', data[pos:pos+4]); pos += 4
-            coord_count = struct.unpack('<H', data[pos:pos+2])[0]; pos += 2
-            payload_size = struct.unpack('<H', data[pos:pos+2])[0]; pos += 2
+            coord_count, pos = _read_varint(data, pos)
+            payload_size, pos = _read_varint(data, pos)
             payload = data[pos:pos+payload_size]; pos += payload_size
 
             if feature.geom_type == GEOM_TEXT:
@@ -486,6 +402,7 @@ class NAVViewer:
         self.nav_dir = nav_dir
         self.available_zooms: Set[int] = set()
         self.pack_index: Dict[int, Dict[Tuple[int, int], Tuple[str, int, int]]] = {}
+        self.pack_palette: Dict[int, List[int]] = {}
         self.dedup_stats: Dict[int, Dict[str, float]] = {}  # Stats per zoom
         self._index_tiles()
 
@@ -495,7 +412,6 @@ class NAVViewer:
         self.background_color = (255, 255, 255)
         self.fill_polygons = True
         self.show_tile_grid = False
-        self.show_hilbert_path = False
 
         self.last_query_stats = {}
         self.cached_features: Optional[List[NavFeature]] = None
@@ -514,80 +430,81 @@ class NAVViewer:
         self.route_graph = None
         self.route_log:   List[str] = []
         self.route_base_dir: str = os.path.join(os.path.dirname(os.path.abspath(nav_dir)), 'ROUTE')
+        self.route_profiles = ['WALK', 'BIKE', 'CAR']
+        self.route_profile: str = 'WALK'   # default profile when none specified
 
         # New: Color to OSM tag mapping
         self.color_to_tags: Dict[str, List[str]] = {}
         if config_file:
             self._load_config(config_file)
 
+    def route_profile_dir(self) -> str:
+        """Directory holding the active profile's ROUTE.bin (route_base_dir/<PROFILE>)."""
+        return os.path.join(self.route_base_dir, self.route_profile)
+
     def _index_tiles(self):
-        """Build an index of available zoom levels on disk (individual tiles + NPK1 packs)."""
+        """Build an index of available zoom levels from the NPK2 pack files on disk."""
         if not os.path.isdir(self.nav_dir):
             return
         for name in os.listdir(self.nav_dir):
             full = os.path.join(self.nav_dir, name)
-            if name.isdigit() and os.path.isdir(full):
-                self.available_zooms.add(int(name))
-            elif name.startswith('Z') and name.endswith('.nav') and os.path.isfile(full):
+            if name.startswith('Z') and name.endswith('.nav') and os.path.isfile(full):
                 self._index_pack_file(full)
 
     def _index_pack_file(self, pack_path: str):
-        """Parse Pure Hilbert NPK2 pack header + index and store tile offsets."""
+        """Parse NPK2 pack header and build (x,y) -> (pack_path, offset, size) index."""
         try:
             with open(pack_path, 'rb') as f:
                 magic = f.read(4)
                 if magic != b'NPK2':
                     return
                 zoom = struct.unpack('<B', f.read(1))[0]
-                # Header: magic(4), zoom(1), count(4), index_off(4), reserved(16)
-                tile_count, index_off = struct.unpack('<II', f.read(8))
-                f.read(16) # Skip reserved
-                
-                f.seek(index_off)
-                index = {}
-                offsets_seen = set()
-                total_indexed_size = 0
-                unique_data_size = 0
-                
-                # IndexEntry: h(8), offset(4), size(4)
-                for _ in range(tile_count):
-                    h, offset, size = struct.unpack('<QII', f.read(16))
-                    index[h] = (pack_path, offset, size)
-                    total_indexed_size += size
-                    if offset not in offsets_seen:
-                        offsets_seen.add(offset)
-                        unique_data_size += size
-                
+                tiles_wide, tiles_high = struct.unpack('<II', f.read(8))
+                min_x, min_y = struct.unpack('<II', f.read(8))
+                color_count = struct.unpack('<H', f.read(2))[0]
+
+                flat_count = tiles_wide * tiles_high
+                index: Dict[Tuple[int, int], Tuple[str, int, int]] = {}
+                tile_count = 0
+
+                for flat_idx in range(flat_count):
+                    offset, size = struct.unpack('<II', f.read(8))
+                    if size == 0:
+                        continue
+                    x = min_x + (flat_idx % tiles_wide)
+                    y = min_y + (flat_idx // tiles_wide)
+                    index[(x, y)] = (pack_path, offset, size)
+                    tile_count += 1
+
+                palette = list(struct.unpack(f'<{color_count}H', f.read(color_count * 2))) if color_count else []
+
                 self.pack_index[zoom] = index
+                self.pack_palette[zoom] = palette
                 self.available_zooms.add(zoom)
-                
-                # Calculate deduplication savings
-                savings = 0
-                if total_indexed_size > 0:
-                    savings = (1.0 - (unique_data_size / total_indexed_size)) * 100
-                
+
                 self.dedup_stats[zoom] = {
                     'total_tiles': tile_count,
-                    'unique_tiles': len(offsets_seen),
-                    'savings_pct': savings,
-                    'file_size_mb': os.path.getsize(pack_path) / (1024*1024)
+                    'tiles_wide': tiles_wide,
+                    'tiles_high': tiles_high,
+                    'min_x': min_x,
+                    'min_y': min_y,
+                    'palette_colors': color_count,
+                    'file_size_mb': os.path.getsize(pack_path) / (1024 * 1024)
                 }
-                
-                logger.info(f"Indexed Hilbert pack Z{zoom}: {tile_count} tiles, "
-                            f"Savings: {savings:.1f}%, Size: {self.dedup_stats[zoom]['file_size_mb']:.2f} MB")
+
+                logger.info(f"Indexed NPK2 pack Z{zoom}: {tile_count} tiles, "
+                            f"bbox {tiles_wide}x{tiles_high} @ ({min_x},{min_y}), "
+                            f"{color_count} palette colors, "
+                            f"Size: {self.dedup_stats[zoom]['file_size_mb']:.2f} MB")
         except Exception as e:
             logger.warning(f"Could not index pack {pack_path}: {e}")
 
     def _read_tile_from_pack(self, zoom: int, tx: int, ty: int) -> List[NavFeature]:
-        """Read a single tile's NAV data using Hilbert ID lookup."""
+        """Read a single tile's NAV data using O(1) flat index lookup."""
         zindex = self.pack_index.get(zoom)
         if not zindex:
             return []
-        
-        # Convert (x,y) to Hilbert index for lookup
-        h_id = xy_to_hilbert(tx, ty, zoom)
-        entry = zindex.get(h_id)
-        
+        entry = zindex.get((tx, ty))
         if not entry:
             return []
         pack_path, offset, size = entry
@@ -595,9 +512,9 @@ class NAVViewer:
             with open(pack_path, 'rb') as f:
                 f.seek(offset)
                 tile_data = f.read(size)
-            return read_nav_tile_from_bytes(tile_data, tx, ty)
+            return read_nav_tile_from_bytes(tile_data, tx, ty, self.pack_palette.get(zoom, []))
         except Exception as e:
-            logger.debug(f"Error reading Hilbert tile {tx}/{ty} (H:{h_id}) from pack: {e}")
+            logger.debug(f"Error reading tile {tx}/{ty} from pack: {e}")
             return []
 
     def _load_config(self, config_file: str):
@@ -644,9 +561,6 @@ class NAVViewer:
                     tiles.append((tx, ty))
         return tiles
 
-    def _get_tile_path(self, x: int, y: int) -> str:
-        return os.path.join(self.nav_dir, str(self.zoom), str(x), f"{y}.nav")
-
     @property
     def bbox(self) -> Tuple[float, float, float, float]:
         """Return the (min_lon, min_lat, max_lon, max_lat) of the current viewport."""
@@ -674,17 +588,9 @@ class NAVViewer:
         tiles = self._get_tiles_for_viewport()
         all_features = []
         loaded = 0
-        use_pack = self.zoom in self.pack_index
 
         for tx, ty in tiles:
-            if use_pack:
-                features = self._read_tile_from_pack(self.zoom, tx, ty)
-            else:
-                path = self._get_tile_path(tx, ty)
-                if os.path.exists(path):
-                    features = read_nav_tile(path, tx, ty)
-                else:
-                    features = []
+            features = self._read_tile_from_pack(self.zoom, tx, ty)
             if features:
                 all_features.extend([f for f in features if f.min_zoom <= self.zoom])
                 loaded += 1
@@ -773,34 +679,6 @@ class NAVViewer:
 
         if self.show_tile_grid:
             self._draw_tile_grid(surface)
-
-        if self.show_hilbert_path:
-            self._draw_hilbert_path(surface)
-
-    def _draw_hilbert_path(self, surface: pygame.Surface):
-        """Draw a line connecting tiles in Hilbert order."""
-        if self.zoom not in self.pack_index:
-            return
-        
-        # Get sorted Hilbert IDs present in the current zoom
-        h_ids = sorted(self.pack_index[self.zoom].keys())
-        points = []
-        
-        # Identify viewport boundaries
-        center_x, center_y = deg2num(self.center_lat, self.center_lon, self.zoom)
-        tl_x, tl_y = center_x - 1.5, center_y - 1.5
-        
-        for h in h_ids:
-            tx, ty = hilbert_to_xy(h, self.zoom)
-            # Only draw if tile is near the viewport
-            if tl_x - 1 <= tx <= tl_x + 4 and tl_y - 1 <= ty <= tl_y + 4:
-                sx, sy = self._tile_coord_to_screen(tx, ty, 2048, 2048)
-                points.append((sx, sy))
-        
-        if len(points) >= 2:
-            pygame.draw.lines(surface, (255, 50, 50), False, points, 2)
-            for p in points:
-                pygame.draw.circle(surface, (255, 50, 50), p, 4)
 
     def _tile_coord_to_screen(self, tx: int, ty: int, px: int, py: int) -> Tuple[int, int]:
         """Convert relative tile coordinate (0-4096) to viewport pixels."""
@@ -954,8 +832,7 @@ class NAVViewer:
                 sx, sy = int((tx - tl_x) * TILE_SIZE), int((ty - tl_y) * TILE_SIZE)
                 pygame.draw.rect(surface, grid_color, (sx, sy, TILE_SIZE, TILE_SIZE), 1)
                 
-                path = self._get_tile_path(tx, ty)
-                exists = os.path.exists(path) or (self.zoom in self.pack_index and (tx, ty) in self.pack_index[self.zoom])
+                exists = self.zoom in self.pack_index and (tx, ty) in self.pack_index[self.zoom]
                 color = (0, 0, 0) if exists else (150, 50, 50)
                 label = font.render(f"{tx}/{ty}", True, color, (255, 255, 255))
                 surface.blit(label, (sx + 5, sy + 5))
@@ -1052,8 +929,12 @@ def main():
     parser.add_argument('--zoom', type=int, default=14, help='Zoom level')
     parser.add_argument('--config', type=str, help='Features JSON config file (optional, for OSM tag mapping)')
     parser.add_argument('--route-dir', type=str, default=None,
-                        help='Directory containing ROUTE/R{lat}_{lon}.bin files. '
-                             'Defaults to ../ROUTE relative to nav_dir.')
+                        help='ROUTE base dir holding CAR/BIKE/WALK subfolders, OR a single '
+                             'profile dir containing ROUTE.bin. Defaults to ../ROUTE relative to nav_dir.')
+    parser.add_argument('--route-profile', type=str, default='WALK',
+                        choices=['CAR', 'BIKE', 'WALK'],
+                        help='Initial routing profile (default: WALK). Switchable in-app with the '
+                             'Route button or the P key.')
 
     args = parser.parse_args()
 
@@ -1063,12 +944,22 @@ def main():
 
     viewer = NAVViewer(args.nav_dir, args.config)
 
-    # Resolve route directory
+    # Resolve route directory and initial profile.
     if args.route_dir:
-        viewer.route_base_dir = args.route_dir
+        base = args.route_dir
     else:
         # Default: sibling ROUTE/ next to nav_dir
-        viewer.route_base_dir = os.path.join(os.path.dirname(os.path.abspath(args.nav_dir)), 'ROUTE')
+        base = os.path.join(os.path.dirname(os.path.abspath(args.nav_dir)), 'ROUTE')
+
+    viewer.route_profile = args.route_profile
+    if os.path.exists(os.path.join(base, 'ROUTE.bin')):
+        # route_dir points straight at a profile folder: pin it, disable the selector.
+        viewer.route_base_dir = os.path.dirname(os.path.abspath(base))
+        pinned = os.path.basename(os.path.abspath(base)).upper()
+        viewer.route_profiles = [pinned]
+        viewer.route_profile = pinned
+    else:
+        viewer.route_base_dir = base
     viewer.set_center(args.lat, args.lon, args.zoom)
 
     pygame.init()
@@ -1090,9 +981,10 @@ def main():
     grid_button_rect = pygame.Rect(VIEWPORT_SIZE + 10, button_margin * 3 + button_height * 2, button_width, button_height)
     stats_button_rect = pygame.Rect(VIEWPORT_SIZE + 10, button_margin * 4 + button_height * 3, button_width, button_height)
     legend_button_rect = pygame.Rect(VIEWPORT_SIZE + 10, button_margin * 5 + button_height * 4, button_width, button_height)
+    profile_button_rect = pygame.Rect(VIEWPORT_SIZE + 10, button_margin * 6 + button_height * 5, button_width, button_height)
 
     # Priority filter sliders
-    slider_y_base = button_margin * 6 + button_height * 5 + 40
+    slider_y_base = button_margin * 7 + button_height * 6 + 40
     slider_height = 20
     min_priority_slider_rect = pygame.Rect(VIEWPORT_SIZE + 10, slider_y_base, button_width, slider_height)
     max_priority_slider_rect = pygame.Rect(VIEWPORT_SIZE + 10, slider_y_base + 40, button_width, slider_height)
@@ -1106,6 +998,42 @@ def main():
     need_redraw = True
     running = True
     pan_speed_base = 0.01
+
+    def compute_route():
+        """(Re)load the bbox subgraph for the active profile and run A* origin→dest."""
+        if not (viewer.route_origin and viewer.route_dest):
+            return
+        olat, olon = viewer.route_origin
+        dlat, dlon = viewer.route_dest
+        viewer.route_log = [f'Origin: {olat:.5f}, {olon:.5f}',
+                            f'Dest: {dlat:.5f}, {dlon:.5f}',
+                            f'Profile: {viewer.route_profile}']
+
+        nodes, edges, graph_log = load_cells_for_route(
+            viewer.route_profile_dir(), olat, olon, dlat, dlon)
+        viewer.route_graph = (nodes, edges) if nodes else None
+        for line in graph_log:
+            viewer.route_log.append(line)
+        if not nodes:
+            viewer.route_log.append('No ROUTE.bin found')
+            viewer.route_path_coords = []
+            return
+
+        viewer.route_log.append(f'Graph total: {len(nodes)} nodes, {len(edges)} edges')
+        src = nearest_node_route(nodes, olat, olon)
+        dst = nearest_node_route(nodes, dlat, dlon)
+        viewer.route_log.append(f'Src: node {src}  Dst: node {dst}')
+        t0 = time.perf_counter()
+        path, vis, dist = astar_route(nodes, edges, src, dst)
+        elapsed = (time.perf_counter() - t0) * 1000
+        if path:
+            viewer.route_path_coords = [(nodes[i][0], nodes[i][1]) for i in path]
+            viewer.route_log.append(f'Route: {len(path)} nodes  {dist/1000:.1f} km')
+            viewer.route_log.append(f'Visited: {vis}/{len(nodes)} ({100*vis/len(nodes):.1f}%)')
+            viewer.route_log.append(f'A* time: {elapsed:.2f} ms')
+        else:
+            viewer.route_path_coords = []
+            viewer.route_log.append('No path found')
 
     while running:
         for event in pygame.event.get():
@@ -1146,9 +1074,6 @@ def main():
                 elif event.key == pygame.K_g:
                     viewer.show_tile_grid = not viewer.show_tile_grid
                     need_redraw = True
-                elif event.key == pygame.K_h:
-                    viewer.show_hilbert_path = not viewer.show_hilbert_path
-                    need_redraw = True
                 elif event.key == pygame.K_r:
                     viewer.last_viewport_key = None
                     viewer.route_origin = None
@@ -1164,6 +1089,11 @@ def main():
                 elif event.key == pygame.K_l:
                     show_legend_window = not show_legend_window
                     show_stats_window = False  # Close stats if legend opened
+                    need_redraw = True
+                elif event.key == pygame.K_p:
+                    idx = viewer.route_profiles.index(viewer.route_profile)
+                    viewer.route_profile = viewer.route_profiles[(idx + 1) % len(viewer.route_profiles)]
+                    compute_route()
                     need_redraw = True
                 elif event.key in (pygame.K_q, pygame.K_ESCAPE):
                     running = False
@@ -1187,6 +1117,11 @@ def main():
                     elif legend_button_rect.collidepoint(mx, my):
                         show_legend_window = not show_legend_window
                         need_redraw = True
+                    elif profile_button_rect.collidepoint(mx, my):
+                        idx = viewer.route_profiles.index(viewer.route_profile)
+                        viewer.route_profile = viewer.route_profiles[(idx + 1) % len(viewer.route_profiles)]
+                        compute_route()  # recompute on the new profile if origin+dest are set
+                        need_redraw = True
                     elif min_priority_slider_rect.collidepoint(mx, my):
                         # Set min priority from slider position
                         ratio = (mx - min_priority_slider_rect.x) / min_priority_slider_rect.width
@@ -1208,39 +1143,7 @@ def main():
                         tl_x, tl_y = center_x - 1.5, center_y - 1.5
                         dlat, dlon = num2deg(tl_x + mx / TILE_SIZE, tl_y + my / TILE_SIZE, viewer.zoom)
                         viewer.route_dest = (dlat, dlon)
-                        viewer.route_log = viewer.route_log[:1]
-                        viewer.route_log.append(f'Dest: {dlat:.5f}, {dlon:.5f}')
-
-                        if viewer.route_origin:
-                            nodes, edges, graph_log = load_cells_for_route(
-                                viewer.route_base_dir,
-                                viewer.route_origin[0], viewer.route_origin[1],
-                                dlat, dlon)
-                            viewer.route_graph = (nodes, edges) if nodes else None
-                            for line in graph_log:
-                                viewer.route_log.append(line)
-                            if nodes:
-                                viewer.route_log.append(
-                                    f'Graph total: {len(nodes)} nodes, {len(edges)} edges')
-                            else:
-                                viewer.route_log.append('No ROUTE.bin found')
-
-                        if viewer.route_origin and viewer.route_graph:
-                            nodes, edges = viewer.route_graph
-                            src = nearest_node_route(nodes, viewer.route_origin[0], viewer.route_origin[1])
-                            dst = nearest_node_route(nodes, dlat, dlon)
-                            viewer.route_log.append(f'Src: node {src}  Dst: node {dst}')
-                            t0 = time.perf_counter()
-                            path, vis, dist = astar_route(nodes, edges, src, dst)
-                            elapsed = (time.perf_counter() - t0) * 1000
-                            if path:
-                                viewer.route_path_coords = [(nodes[i][0], nodes[i][1]) for i in path]
-                                viewer.route_log.append(f'Route: {len(path)} nodes  {dist/1000:.1f} km')
-                                viewer.route_log.append(f'Visited: {vis}/{len(nodes)} ({100*vis/len(nodes):.1f}%)')
-                                viewer.route_log.append(f'A* time: {elapsed:.2f} ms')
-                            else:
-                                viewer.route_path_coords = []
-                                viewer.route_log.append('No path found')
+                        compute_route()
                         need_redraw = True
 
                 elif event.button == 4:
@@ -1314,6 +1217,9 @@ def main():
             legend_text = "Legend" + (" ✓" if show_legend_window else "")
             draw_button(screen, legend_text, legend_button_rect, button_bg, button_fg, button_border, font_small)
 
+            draw_button(screen, f"Route: {viewer.route_profile}", profile_button_rect,
+                        button_bg, button_fg, button_border, font_small)
+
             info_color = (200, 200, 200)
 
             # Priority filter sliders
@@ -1347,13 +1253,12 @@ def main():
                 screen.blit(font_small.render(f"  Features: {s.get('features', 0)}", True, (150, 150, 150)), (VIEWPORT_SIZE + 10, stats_y + 32))
                 screen.blit(font_small.render(f"  Time: {s.get('time_ms', 0):.0f}ms", True, (150, 150, 150)), (VIEWPORT_SIZE + 10, stats_y + 46))
 
-            # Deduplication statistics
+            # Pack statistics (NPK2)
             dedup_y = stats_y + 70
             if viewer.zoom in viewer.dedup_stats:
                 ds = viewer.dedup_stats[viewer.zoom]
-                screen.blit(font_small.render(f"  Unique data: {ds['unique_tiles']}/{ds['total_tiles']}", True, (150, 150, 150)), (VIEWPORT_SIZE + 10, dedup_y + 18))
-                savings_color = (100, 255, 100) if ds['savings_pct'] > 10 else (150, 150, 150)
-                screen.blit(font_small.render(f"  Space savings: {ds['savings_pct']:.1f}%", True, savings_color), (VIEWPORT_SIZE + 10, dedup_y + 32))
+                screen.blit(font_small.render(f"  Tiles: {ds['total_tiles']} ({ds['tiles_wide']}x{ds['tiles_high']})", True, (150, 150, 150)), (VIEWPORT_SIZE + 10, dedup_y + 18))
+                screen.blit(font_small.render(f"  Origin: ({ds['min_x']},{ds['min_y']})", True, (150, 150, 150)), (VIEWPORT_SIZE + 10, dedup_y + 32))
                 screen.blit(font_small.render(f"  Pack size: {ds['file_size_mb']:.2f} MB", True, (150, 150, 150)), (VIEWPORT_SIZE + 10, dedup_y + 46))
 
             # Feature Identification (Right-click)

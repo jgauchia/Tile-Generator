@@ -1,7 +1,7 @@
 /**
  * @file nav_types.hpp
  * @author Jordi Gauchía (jgauchia @jgauchia.com)
- * @brief Basic data structures and constants for the NAV tile generator.
+ * @brief Data structures shared between generator and firmware: MapHeader (NPK2 flat index) and IndexEntry.
  * @version 0.8.0
  * @date 2026-05
  */
@@ -20,18 +20,18 @@ const uint8_t GEOM_POLYGON = 3;
 const uint8_t GEOM_TEXT = 4;
 
 #pragma pack(push, 1)
-struct PackHeader
+struct MapHeader
 {
-    char magic[4];    // "NPK2"
+    char magic[4];         // "NPK2"
     uint8_t zoom;
-    uint32_t tile_count;
-    uint32_t index_offset;   // file offset to tile index
-    uint32_t reserved[4];    // for future use
+    uint32_t tiles_wide;
+    uint32_t tiles_high;
+    uint32_t bottom_left[2]; // [0]=min_x, [1]=min_y
+    uint16_t color_count;    // number of RGB565 entries in the global palette
 };
 
 struct IndexEntry
 {
-    uint64_t h;       // Hilbert index
     uint32_t offset;
     uint32_t size;
 };

@@ -1,7 +1,7 @@
 /**
  * @file tile_processor.hpp
  * @author Jordi Gauchía (jgauchia @jgauchia.com)
- * @brief Optimized tile generation engine with Pure Hilbert Indexing and NAV-PACK container support.
+ * @brief Tile generation engine with flat 2D array index (NPK2). O(1) lookup via rectangular bounding box.
  * @version 0.8.0
  * @date 2026-03
  */
@@ -34,8 +34,21 @@ namespace nav {
 class TileProcessor
 {
 public:
+    /**
+     * @brief Construct a TileProcessor that writes output files to the given directory.
+     * @param out_dir Destination directory for generated Z{zoom}.nav files.
+     */
     TileProcessor(const std::string& out_dir) : output_dir(out_dir) {}
 
+    /**
+     * @brief Generate NPK2 tile files for all zoom levels in [min_z, max_z].
+     * @param features_by_zoom Feature offset arrays indexed by zoom bucket (0–17).
+     * @param store            Memory-mapped feature store.
+     * @param min_z            First zoom level to process.
+     * @param max_z            Last zoom level to process (inclusive).
+     * @param text_features    Label features resolved per zoom before tile generation.
+     * @param point_features   POI features rendered as fixed-size polygon symbols.
+     */
     void process_all(std::vector<size_t> (&features_by_zoom)[18], MappedStore& store,
                      int min_z, int max_z,
                      const std::vector<Feature>& text_features,
@@ -50,7 +63,9 @@ public:
         }
     }
 
+    /** @brief Total bytes written across all generated .nav files. */
     uint64_t get_total_bytes() const { return total_generated_bytes; }
+    /** @brief Number of .nav files generated. */
     size_t get_total_files() const { return total_generated_files; }
 
 private:
@@ -68,7 +83,7 @@ private:
         std::size_t operator()(const TileCoord& k) const
         { return std::hash<int>()(k.x) ^ (std::hash<int>()(k.y) << 1); }
     };
-    struct PackedTile { uint32_t x, y; uint64_t h; std::vector<uint8_t> data; };
+    struct PackedTile { uint32_t x, y; std::vector<uint8_t> data; };
 
     struct ProcessedFeature
     {
@@ -90,7 +105,12 @@ private:
         std::vector<TileCoord> tiles;
     };
 
-    // --- Collision detection for text labels ---
+    /**
+     * @brief Resolve text label placement for a zoom level using bounding-box collision detection.
+     * @param all_text All text and place-name features in the dataset.
+     * @param zoom     Target zoom level.
+     * @return Placed labels with their assigned tile coordinates; overlapping candidates are discarded.
+     */
     std::vector<PlacedLabel> resolve_text_labels(const std::vector<Feature>& all_text, int zoom)
     {
         std::vector<PlacedLabel> result;
@@ -172,6 +192,12 @@ private:
         return result;
     }
 
+    /**
+     * @brief Count total coordinate points in a GEOS geometry (recursive over collections).
+     * @param handle GEOS thread-local context.
+     * @param g      Geometry to count. May be nullptr or empty.
+     * @return Total number of coordinate points.
+     */
     uint32_t count_geos_points(GEOSContextHandle_t handle, const GEOSGeometry* g)
     {
         if (!g || GEOSisEmpty_r(handle, g)) return 0;
@@ -204,6 +230,12 @@ private:
         return 0;
     }
 
+    /**
+     * @brief Convert a nav::Feature polygon or linestring to a GEOS geometry for clipping.
+     * @param f      Source feature with ring_ends and points populated.
+     * @param handle GEOS thread-local context.
+     * @return Caller-owned GEOSGeometry*, or nullptr if the feature is degenerate.
+     */
     GEOSGeometry* feature_to_geos(const Feature& f, GEOSContextHandle_t handle)
     {
         if (f.ring_ends.empty()) return nullptr;
@@ -251,7 +283,14 @@ private:
         }
     }
 
-    // Convert GEOM_POINT features to polygon symbols for a given zoom/tile
+    /**
+     * @brief Build square polygon symbols for GEOM_POINT features visible in a tile.
+     * @param point_features All POI features in the dataset.
+     * @param z              Current zoom level.
+     * @param tile_x         Tile X coordinate.
+     * @param tile_y         Tile Y coordinate.
+     * @return ProcessedFeature list with one polygon per visible point.
+     */
     std::vector<ProcessedFeature> make_point_symbols(const std::vector<Feature>& point_features,
                                                       int z, int tile_x, int tile_y)
     {
@@ -316,7 +355,15 @@ private:
         return result;
     }
 
-    // Generate bridge deck underlay polygons (z >= 16)
+    /**
+     * @brief Generate bridge deck underlay polygons from road linestrings (zoom >= 16 only).
+     * @param line_features Processed linestring features for the current tile.
+     * @param z             Current zoom level; returns empty if z < 16.
+     * @param tile_x        Tile X coordinate.
+     * @param tile_y        Tile Y coordinate.
+     * @param handle        GEOS thread-local context.
+     * @return Polygon features representing bridge deck surfaces.
+     */
     std::vector<ProcessedFeature> make_bridge_decks(const std::vector<ProcessedFeature>& line_features,
                                                      int z, int tile_x, int tile_y,
                                                      GEOSContextHandle_t handle)
@@ -413,6 +460,13 @@ private:
         return result;
     }
 
+    /**
+     * @brief Extract a bridge deck polygon from a GEOS geometry and append it to result.
+     * @param handle GEOS thread-local context.
+     * @param poly   Clipped bridge deck polygon geometry.
+     * @param result Output list to append the decoded ProcessedFeature to.
+     * @param z      Current zoom level (used for coordinate scaling).
+     */
     void extract_deck_polygon(GEOSContextHandle_t handle, const GEOSGeometry* poly,
                                std::vector<ProcessedFeature>& result, int z, int /*tile_x*/, int /*tile_y*/)
     {
@@ -441,6 +495,14 @@ private:
         result.push_back(std::move(pf));
     }
 
+    /**
+     * @brief Generate the NPK2 tile file for a single zoom level.
+     * @param features_by_zoom Feature offset arrays indexed by zoom bucket (0–17).
+     * @param store            Memory-mapped feature store.
+     * @param z                Zoom level to process.
+     * @param placed_labels    Pre-resolved text label placements for this zoom.
+     * @param point_features   POI features rendered as polygon symbols.
+     */
     void process_zoom_level(std::vector<size_t> (&features_by_zoom)[18], MappedStore& store, int z,
                             const std::vector<PlacedLabel>& placed_labels,
                             const std::vector<Feature>& point_features)
@@ -526,7 +588,6 @@ private:
 
                     packed_results[idx].x = (uint32_t)tw.coord.x;
                     packed_results[idx].y = (uint32_t)tw.coord.y;
-                    packed_results[idx].h = utils::xy_to_hilbert(packed_results[idx].x, packed_results[idx].y, z);
                     packed_results[idx].data = serialize_tile(z, tw.coord.x, tw.coord.y,
                                                               store, tw.offsets, handle, m,
                                                               tile_labels, pt_syms);
@@ -551,55 +612,138 @@ private:
         }
         for (auto& w : workers) w.join();
 
-        // 1. Sort by Hilbert index to define physical AND index order
-        std::sort(packed_results.begin(), packed_results.end(), [](const PackedTile& a, const PackedTile& b) {
-            return a.h < b.h;
-        });
+        // Build global color palette from serialized tiles and collapse 2B color -> 1B index.
+        // Tiles are serialized with a temporary 2-byte color in each feature header;
+        // here we gather the real color set, assign indices and rewrite every tile in place.
+        std::vector<uint16_t> palette;
+        std::unordered_map<uint16_t, uint16_t> color_to_index;
 
+        for (auto& pt : packed_results)
+        {
+            if (pt.data.size() < 6)
+                continue;
+            uint16_t fcount;
+            memcpy(&fcount, pt.data.data() + 4, 2);
+
+            std::vector<uint8_t> rewritten;
+            rewritten.reserve(pt.data.size());
+            rewritten.insert(rewritten.end(), pt.data.begin(), pt.data.begin() + 6);
+
+            size_t p = 6;
+            bool ok = true;
+            for (uint16_t fi = 0; fi < fcount; ++fi)
+            {
+                if (p + 9 > pt.data.size())
+                {
+                    ok = false;
+                    break;
+                }
+                uint8_t geom = pt.data[p];
+                uint16_t color;
+                memcpy(&color, pt.data.data() + p + 1, 2);
+
+                auto it = color_to_index.find(color);
+                uint16_t cidx;
+                if (it == color_to_index.end())
+                {
+                    cidx = (uint16_t)palette.size();
+                    color_to_index.emplace(color, cidx);
+                    palette.push_back(color);
+                }
+                else
+                    cidx = it->second;
+
+                size_t hp = p + 9;
+                while (hp < pt.data.size() && (pt.data[hp++] & 0x80))
+                {
+                }
+                uint64_t ps = 0;
+                int shift = 0;
+                while (hp < pt.data.size())
+                {
+                    uint8_t b = pt.data[hp++];
+                    ps |= (uint64_t)(b & 0x7F) << shift;
+                    if (!(b & 0x80))
+                        break;
+                    shift += 7;
+                }
+                if (hp + ps > pt.data.size())
+                {
+                    ok = false;
+                    break;
+                }
+
+                rewritten.push_back(geom);
+                rewritten.push_back((uint8_t)cidx);
+                rewritten.insert(rewritten.end(), pt.data.begin() + p + 3, pt.data.begin() + hp);
+                rewritten.insert(rewritten.end(), pt.data.begin() + hp, pt.data.begin() + hp + ps);
+                p = hp + ps;
+            }
+            if (ok)
+                pt.data = std::move(rewritten);
+        }
+
+        if (palette.size() > 255)
+            std::cerr << "\nWARNING: Z" << z << " palette has " << palette.size()
+                      << " colors (>255), 1-byte color index will overflow\n";
+
+        // Compute bounding box of tiles in this zoom level
+        uint32_t min_x = UINT32_MAX, min_y = UINT32_MAX;
+        uint32_t max_x = 0, max_y = 0;
+        for (const auto& pt : packed_results)
+        {
+            if (pt.x < min_x) min_x = pt.x;
+            if (pt.x > max_x) max_x = pt.x;
+            if (pt.y < min_y) min_y = pt.y;
+            if (pt.y > max_y) max_y = pt.y;
+        }
+        uint32_t tiles_wide = max_x - min_x + 1;
+        uint32_t tiles_high = max_y - min_y + 1;
+        uint32_t flat_count = tiles_wide * tiles_high;
+
+        uint64_t zoom_bytes = 0;
         std::string pack_path = output_dir + "/Z" + std::to_string(z) + ".nav";
         std::ofstream out(pack_path, std::ios::binary);
         if (out)
         {
-            uint32_t index_offset = sizeof(PackHeader);
-            uint32_t data_offset = index_offset + (uint32_t)(packed_results.size() * sizeof(IndexEntry));
+            uint32_t palette_bytes = (uint32_t)palette.size() * sizeof(uint16_t);
+            uint32_t data_offset = sizeof(MapHeader) + flat_count * sizeof(IndexEntry) + palette_bytes;
 
-            std::map<std::vector<uint8_t>, uint32_t> data_to_offset;
-            std::vector<size_t> unique_data_indices;
+            // Write header
+            MapHeader mh;
+            memcpy(mh.magic, "NPK2", 4);
+            mh.zoom = (uint8_t)z;
+            mh.tiles_wide = tiles_wide;
+            mh.tiles_high = tiles_high;
+            mh.bottom_left[0] = min_x;
+            mh.bottom_left[1] = min_y;
+            mh.color_count = (uint16_t)palette.size();
+            out.write((char*)&mh, sizeof(MapHeader));
+
+            // Reserve index table (all zeros = empty slot)
+            std::vector<IndexEntry> index(flat_count, {0, 0});
+
+            // Write tile data and fill index
             uint32_t current_data_offset = data_offset;
-
-            std::vector<IndexEntry> index;
-            for (size_t i = 0; i < packed_results.size(); ++i)
+            for (const auto& pt : packed_results)
             {
-                auto& pt = packed_results[i];
-                auto it = data_to_offset.find(pt.data);
-                uint32_t final_offset;
-                if (it != data_to_offset.end())
-                {
-                    final_offset = it->second;
-                }
-                else
-                {
-                    final_offset = current_data_offset;
-                    data_to_offset[pt.data] = current_data_offset;
-                    unique_data_indices.push_back(i);
-                    current_data_offset += (uint32_t)pt.data.size();
-                }
-                index.push_back({pt.h, final_offset, (uint32_t)pt.data.size()});
+                uint32_t x_off = pt.x - min_x;
+                uint32_t y_off = pt.y - min_y;
+                uint32_t flat_idx = y_off * tiles_wide + x_off;
+                index[flat_idx].offset = current_data_offset;
+                index[flat_idx].size   = (uint32_t)pt.data.size();
+                current_data_offset += (uint32_t)pt.data.size();
             }
 
-            PackHeader ph;
-            memcpy(ph.magic, "NPK2", 4);
-            ph.zoom = (uint8_t)z;
-            ph.tile_count = (uint32_t)index.size();
-            ph.index_offset = index_offset;
-            memset(ph.reserved, 0, sizeof(ph.reserved));
+            out.write((char*)index.data(), flat_count * sizeof(IndexEntry));
 
-            out.write((char*)&ph, sizeof(PackHeader));
-            out.write((char*)index.data(), index.size() * sizeof(IndexEntry));
-            
-            for (size_t idx : unique_data_indices)
-                out.write((char*)packed_results[idx].data.data(), packed_results[idx].data.size());
+            if (!palette.empty())
+                out.write((char*)palette.data(), palette_bytes);
 
+            for (const auto& pt : packed_results)
+                out.write((char*)pt.data.data(), pt.data.size());
+
+            zoom_bytes = current_data_offset;
             total_generated_bytes += current_data_offset;
             total_generated_files++;
         }
@@ -610,9 +754,23 @@ private:
                   << std::setw(8) << tiles.size() << " tiles ("
                   << std::fixed << std::setprecision(1) << avg_tps << " t/s), "
                   << std::setw(8) << (size_t)merged_count << " polygons merged | "
-                  << std::setw(6) << (total_generated_bytes / 1024 / 1024) << " MB done in " << elapsed.count() << "s" << std::endl;
+                  << std::setw(6) << std::setprecision(1) << (zoom_bytes / 1024.0 / 1024.0) << " MB done in " << elapsed.count() << "s" << std::endl;
     }
 
+    /**
+     * @brief Serialize one tile to NAV1 binary format (geometry clip, simplify, encode).
+     * @param z             Zoom level.
+     * @param x             Tile X coordinate.
+     * @param y             Tile Y coordinate.
+     * @param store         Memory-mapped feature store.
+     * @param offsets       Feature offsets within the store that intersect this tile.
+     * @param local_handle  GEOS thread-local context for geometry operations.
+     * @param merged_out    Incremented by the number of polygons merged in this tile.
+     * @param tile_labels   Pre-placed text label features for this tile.
+     * @param point_symbols Pre-built polygon symbols for POI features in this tile.
+     * @return Raw NAV1 tile bytes with a temporary 2-byte color per feature; the color is
+     *         later collapsed to a 1-byte palette index during the zoom-level palette pass.
+     */
     std::vector<uint8_t> serialize_tile(int z, int x, int y, const MappedStore& store,
                                          const std::vector<size_t>& offsets,
                                          GEOSContextHandle_t local_handle, size_t& merged_out,
@@ -1005,9 +1163,9 @@ private:
         double merc_range = t_max_merc - t_min_merc;
 
         uint16_t count = (uint16_t)std::min((size_t)0xFFFF, final_features.size() + tile_labels.size());
-        uint8_t th[22] = {'N', 'A', 'V', '1', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+        uint8_t th[6] = {'N', 'A', 'V', '1', 0, 0};
         memcpy(th + 4, &count, 2);
-        buffer.insert(buffer.end(), th, th + 22);
+        buffer.insert(buffer.end(), th, th + 6);
 
         uint16_t written = 0;
 
@@ -1085,12 +1243,14 @@ private:
                     ri.push_back(cur & 0xFF); ri.push_back(cur >> 8);
                 }
             }
-            uint8_t fh[13] = {pf.type, (uint8_t)(pf.color & 0xFF), (uint8_t)(pf.color >> 8), pf.prio, width_byte,
-                              (uint8_t)std::min(255, minx / 16), (uint8_t)std::min(255, miny / 16),
-                              (uint8_t)std::min(255, maxx / 16), (uint8_t)std::min(255, maxy / 16),
-                              (uint8_t)(pts & 0xFF), (uint8_t)(pts >> 8),
-                              (uint8_t)((payload.size() + ri.size()) & 0xFF), (uint8_t)((payload.size() + ri.size()) >> 8)};
-            buffer.insert(buffer.end(), fh, fh + 13);
+            uint8_t fh[9] = {pf.type, (uint8_t)(pf.color & 0xFF), (uint8_t)(pf.color >> 8), pf.prio, width_byte,
+                             (uint8_t)std::min(255, minx / 16), (uint8_t)std::min(255, miny / 16),
+                             (uint8_t)std::min(255, maxx / 16), (uint8_t)std::min(255, maxy / 16)};
+            buffer.insert(buffer.end(), fh, fh + 9);
+            auto vcc = utils::to_varint((uint64_t)pts);
+            buffer.insert(buffer.end(), vcc.begin(), vcc.end());
+            auto vps = utils::to_varint((uint64_t)(payload.size() + ri.size()));
+            buffer.insert(buffer.end(), vps.begin(), vps.end());
             buffer.insert(buffer.end(), payload.begin(), payload.end());
             if (!ri.empty()) buffer.insert(buffer.end(), ri.begin(), ri.end());
             written++;
@@ -1132,12 +1292,14 @@ private:
             uint8_t bx = (uint8_t)std::max(0, std::min(255, (int)px >> 4));
             uint8_t by = (uint8_t)std::max(0, std::min(255, (int)py >> 4));
 
-            uint8_t th2[13] = {GEOM_TEXT, (uint8_t)(label->color_rgb565 & 0xFF), (uint8_t)(label->color_rgb565 >> 8),
+            uint8_t th2[9] = {GEOM_TEXT, (uint8_t)(label->color_rgb565 & 0xFF), (uint8_t)(label->color_rgb565 >> 8),
                               label->zoom_priority, label->font_size,
-                              bx, by, bx, by,
-                              (uint8_t)(coord_count & 0xFF), (uint8_t)(coord_count >> 8),
-                              (uint8_t)(text_payload.size() & 0xFF), (uint8_t)(text_payload.size() >> 8)};
-            buffer.insert(buffer.end(), th2, th2 + 13);
+                              bx, by, bx, by};
+            buffer.insert(buffer.end(), th2, th2 + 9);
+            auto vcc = utils::to_varint((uint64_t)coord_count);
+            buffer.insert(buffer.end(), vcc.begin(), vcc.end());
+            auto vps = utils::to_varint((uint64_t)text_payload.size());
+            buffer.insert(buffer.end(), vps.begin(), vps.end());
             buffer.insert(buffer.end(), text_payload.begin(), text_payload.end());
             written++;
         }
