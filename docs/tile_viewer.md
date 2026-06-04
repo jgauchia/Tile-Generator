@@ -7,7 +7,8 @@
 - **NPK2 Flat Index Support**: Parses the `MapHeader` bounding box and resolves tiles by direct O(1) position calculation.
 - **Pack Statistics**: Real-time display of tile count, bounding box dimensions, origin coordinates, and file size per zoom level.
 - **Four-Pass Rendering Simulation**: Automatically draws layers in the correct order (Polygons → Road Casings → Road Cores → Text Labels).
-- **Reverse Tag Mapping**: When launched with `--config features.json`, identifies original OSM tags based on binary color.
+- **Global Color Palette**: Reads the per-pack RGB565 palette and resolves each feature's 1-byte color index back to its color.
+- **Reverse Tag Mapping**: When launched with `--config features.json`, identifies original OSM tags based on the resolved color.
 
 ---
 
@@ -55,6 +56,7 @@ entry = index.get((tile_x, tile_y))  # dict keyed by (x, y)
 Displays per-zoom information:
 - **Tiles**: Total tile count and bounding box dimensions (wide×high).
 - **Origin**: Bottom-left tile coordinate of the bounding box.
+- **Palette colors**: Number of RGB565 entries in the pack's global color palette.
 - **Pack size**: Actual size of the `.nav` file on disk.
 
 ### Query Statistics

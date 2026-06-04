@@ -158,7 +158,9 @@ For the full binary format and profile speed tables see [`docs/route_generator.m
 ## Internal Format Details
 
 - **Tile container**: NPK2 (Flat 2D Array Index, O(1) lookup) — `docs/bin_tile_format.md`
-- **Tile internal format**: NAV1 (Geometry + Text labels)
+- **Tile internal format**: NAV1 (Geometry + Text labels), 6-byte tile header
+- **Color palette**: per-pack global RGB565 table; features store a 1-byte color index
+- **Feature header**: 8 fixed bytes + varint `coord_count`/`payload_size`
 - **Coordinates**: Web Mercator, 12-bit tile-relative space (0-4096)
 - **Routing graph**: ROUTE.bin (header 32B + index 20B/cell + nodes 12B + edges 12B, interleaved per cell) — `docs/route_generator.md`
 

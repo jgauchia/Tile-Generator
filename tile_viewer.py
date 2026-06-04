@@ -18,7 +18,6 @@ Controls:
     B                Toggle background color
     F                Toggle polygon fill
     G                Toggle tile grid
-    H                Toggle Hilbert path
     S                Toggle feature stats panel
     L                Toggle color legend panel
     Q / Escape       Quit
@@ -316,76 +315,15 @@ def _read_varint(buffer: bytes, offset: int) -> Tuple[int, int]:
         shift += 7
 
 
-def read_nav_tile(path: str, tile_x: int, tile_y: int) -> List[NavFeature]:
-    """Read optimized NAV tile file and return list of features with rings."""
+def read_nav_tile_from_bytes(data: bytes, tile_x: int, tile_y: int, palette: List[int]) -> List[NavFeature]:
+    """Read NAV tile from raw bytes (NPK2 pack, global color palette)."""
     features = []
     try:
-        with open(path, 'rb') as f:
-            magic = f.read(4)
-            if magic != NAV_MAGIC:
-                return features
-
-            feature_count = struct.unpack('<H', f.read(2))[0]
-            f.read(16)  # Skip global tile BBox
-
-            for _ in range(feature_count):
-                feature = NavFeature()
-                feature.tile_x = tile_x
-                feature.tile_y = tile_y
-
-                feature.geom_type = struct.unpack('<B', f.read(1))[0]
-                feature.color_rgb565 = struct.unpack('<H', f.read(2))[0]
-                feature.zoom_priority = struct.unpack('<B', f.read(1))[0]
-
-                # Width byte encoding: bit 7 = casing flag, bits 0-6 = actual width
-                width_byte = struct.unpack('<B', f.read(1))[0]
-                feature.needs_casing = (width_byte & 0x80) != 0
-                feature.width = (width_byte & 0x7F) / 2.0  # half-pixels to pixels
-
-                feature.bbox = struct.unpack('<BBBB', f.read(4))
-                coord_count = struct.unpack('<H', f.read(2))[0]
-                payload_size = struct.unpack('<H', f.read(2))[0]
-                payload = f.read(payload_size)
-
-                if feature.geom_type == GEOM_TEXT:
-                    if len(payload) >= 5:
-                        px, py = struct.unpack('<hh', payload[0:4])
-                        feature.coords.append((px, py))
-                        text_len = payload[4]
-                        feature.text = payload[5:5 + text_len].decode('utf-8', errors='replace')
-                        feature.font_size = feature.width
-                else:
-                    offset = 0
-                    last_x, last_y = 0, 0
-                    for _ in range(coord_count):
-                        zx, offset = _read_varint(payload, offset)
-                        zy, offset = _read_varint(payload, offset)
-                        last_x += _zigzag_decode(zx)
-                        last_y += _zigzag_decode(zy)
-                        feature.coords.append((last_x, last_y))
-
-                    if feature.geom_type == GEOM_POLYGON:
-                        ring_count = struct.unpack('<H', payload[offset:offset + 2])[0]
-                        offset += 2
-                        for _ in range(ring_count):
-                            feature.ring_ends.append(struct.unpack('<H', payload[offset:offset + 2])[0])
-                            offset += 2
-
-                features.append(feature)
-    except Exception as e:
-        logger.debug(f"Error reading tile {path}: {e}")
-    return features
-
-
-def read_nav_tile_from_bytes(data: bytes, tile_x: int, tile_y: int) -> List[NavFeature]:
-    """Read NAV tile from raw bytes (for NPK1 pack support)."""
-    features = []
-    try:
-        if len(data) < 22 or data[:4] != NAV_MAGIC:
+        if len(data) < 6 or data[:4] != NAV_MAGIC:
             return features
 
         feature_count = struct.unpack('<H', data[4:6])[0]
-        pos = 22  # Skip header (4 magic + 2 count + 16 bbox)
+        pos = 6  # Skip tile header (4 magic + 2 count)
 
         for _ in range(feature_count):
             feature = NavFeature()
@@ -393,15 +331,16 @@ def read_nav_tile_from_bytes(data: bytes, tile_x: int, tile_y: int) -> List[NavF
             feature.tile_y = tile_y
 
             feature.geom_type = data[pos]; pos += 1
-            feature.color_rgb565 = struct.unpack('<H', data[pos:pos+2])[0]; pos += 2
+            color_index = data[pos]; pos += 1
+            feature.color_rgb565 = palette[color_index] if color_index < len(palette) else 0xFFFF
             feature.zoom_priority = data[pos]; pos += 1
             width_byte = data[pos]; pos += 1
             feature.needs_casing = (width_byte & 0x80) != 0
             feature.width = (width_byte & 0x7F) / 2.0
 
             feature.bbox = struct.unpack('<BBBB', data[pos:pos+4]); pos += 4
-            coord_count = struct.unpack('<H', data[pos:pos+2])[0]; pos += 2
-            payload_size = struct.unpack('<H', data[pos:pos+2])[0]; pos += 2
+            coord_count, pos = _read_varint(data, pos)
+            payload_size, pos = _read_varint(data, pos)
             payload = data[pos:pos+payload_size]; pos += payload_size
 
             if feature.geom_type == GEOM_TEXT:
@@ -440,6 +379,7 @@ class NAVViewer:
         self.nav_dir = nav_dir
         self.available_zooms: Set[int] = set()
         self.pack_index: Dict[int, Dict[Tuple[int, int], Tuple[str, int, int]]] = {}
+        self.pack_palette: Dict[int, List[int]] = {}
         self.dedup_stats: Dict[int, Dict[str, float]] = {}  # Stats per zoom
         self._index_tiles()
 
@@ -449,7 +389,6 @@ class NAVViewer:
         self.background_color = (255, 255, 255)
         self.fill_polygons = True
         self.show_tile_grid = False
-        self.show_hilbert_path = False  # kept for key binding compat, no-op
 
         self.last_query_stats = {}
         self.cached_features: Optional[List[NavFeature]] = None
@@ -475,14 +414,12 @@ class NAVViewer:
             self._load_config(config_file)
 
     def _index_tiles(self):
-        """Build an index of available zoom levels on disk (individual tiles + NPK1 packs)."""
+        """Build an index of available zoom levels from the NPK2 pack files on disk."""
         if not os.path.isdir(self.nav_dir):
             return
         for name in os.listdir(self.nav_dir):
             full = os.path.join(self.nav_dir, name)
-            if name.isdigit() and os.path.isdir(full):
-                self.available_zooms.add(int(name))
-            elif name.startswith('Z') and name.endswith('.nav') and os.path.isfile(full):
+            if name.startswith('Z') and name.endswith('.nav') and os.path.isfile(full):
                 self._index_pack_file(full)
 
     def _index_pack_file(self, pack_path: str):
@@ -495,6 +432,7 @@ class NAVViewer:
                 zoom = struct.unpack('<B', f.read(1))[0]
                 tiles_wide, tiles_high = struct.unpack('<II', f.read(8))
                 min_x, min_y = struct.unpack('<II', f.read(8))
+                color_count = struct.unpack('<H', f.read(2))[0]
 
                 flat_count = tiles_wide * tiles_high
                 index: Dict[Tuple[int, int], Tuple[str, int, int]] = {}
@@ -509,7 +447,10 @@ class NAVViewer:
                     index[(x, y)] = (pack_path, offset, size)
                     tile_count += 1
 
+                palette = list(struct.unpack(f'<{color_count}H', f.read(color_count * 2))) if color_count else []
+
                 self.pack_index[zoom] = index
+                self.pack_palette[zoom] = palette
                 self.available_zooms.add(zoom)
 
                 self.dedup_stats[zoom] = {
@@ -518,11 +459,13 @@ class NAVViewer:
                     'tiles_high': tiles_high,
                     'min_x': min_x,
                     'min_y': min_y,
+                    'palette_colors': color_count,
                     'file_size_mb': os.path.getsize(pack_path) / (1024 * 1024)
                 }
 
                 logger.info(f"Indexed NPK2 pack Z{zoom}: {tile_count} tiles, "
                             f"bbox {tiles_wide}x{tiles_high} @ ({min_x},{min_y}), "
+                            f"{color_count} palette colors, "
                             f"Size: {self.dedup_stats[zoom]['file_size_mb']:.2f} MB")
         except Exception as e:
             logger.warning(f"Could not index pack {pack_path}: {e}")
@@ -540,7 +483,7 @@ class NAVViewer:
             with open(pack_path, 'rb') as f:
                 f.seek(offset)
                 tile_data = f.read(size)
-            return read_nav_tile_from_bytes(tile_data, tx, ty)
+            return read_nav_tile_from_bytes(tile_data, tx, ty, self.pack_palette.get(zoom, []))
         except Exception as e:
             logger.debug(f"Error reading tile {tx}/{ty} from pack: {e}")
             return []
@@ -589,9 +532,6 @@ class NAVViewer:
                     tiles.append((tx, ty))
         return tiles
 
-    def _get_tile_path(self, x: int, y: int) -> str:
-        return os.path.join(self.nav_dir, str(self.zoom), str(x), f"{y}.nav")
-
     @property
     def bbox(self) -> Tuple[float, float, float, float]:
         """Return the (min_lon, min_lat, max_lon, max_lat) of the current viewport."""
@@ -619,17 +559,9 @@ class NAVViewer:
         tiles = self._get_tiles_for_viewport()
         all_features = []
         loaded = 0
-        use_pack = self.zoom in self.pack_index
 
         for tx, ty in tiles:
-            if use_pack:
-                features = self._read_tile_from_pack(self.zoom, tx, ty)
-            else:
-                path = self._get_tile_path(tx, ty)
-                if os.path.exists(path):
-                    features = read_nav_tile(path, tx, ty)
-                else:
-                    features = []
+            features = self._read_tile_from_pack(self.zoom, tx, ty)
             if features:
                 all_features.extend([f for f in features if f.min_zoom <= self.zoom])
                 loaded += 1
@@ -718,12 +650,6 @@ class NAVViewer:
 
         if self.show_tile_grid:
             self._draw_tile_grid(surface)
-
-        if self.show_hilbert_path:
-            self._draw_hilbert_path(surface)
-
-    def _draw_hilbert_path(self, surface: pygame.Surface):
-        pass
 
     def _tile_coord_to_screen(self, tx: int, ty: int, px: int, py: int) -> Tuple[int, int]:
         """Convert relative tile coordinate (0-4096) to viewport pixels."""
@@ -877,8 +803,7 @@ class NAVViewer:
                 sx, sy = int((tx - tl_x) * TILE_SIZE), int((ty - tl_y) * TILE_SIZE)
                 pygame.draw.rect(surface, grid_color, (sx, sy, TILE_SIZE, TILE_SIZE), 1)
                 
-                path = self._get_tile_path(tx, ty)
-                exists = os.path.exists(path) or (self.zoom in self.pack_index and (tx, ty) in self.pack_index[self.zoom])
+                exists = self.zoom in self.pack_index and (tx, ty) in self.pack_index[self.zoom]
                 color = (0, 0, 0) if exists else (150, 50, 50)
                 label = font.render(f"{tx}/{ty}", True, color, (255, 255, 255))
                 surface.blit(label, (sx + 5, sy + 5))
@@ -1068,9 +993,6 @@ def main():
                     need_redraw = True
                 elif event.key == pygame.K_g:
                     viewer.show_tile_grid = not viewer.show_tile_grid
-                    need_redraw = True
-                elif event.key == pygame.K_h:
-                    viewer.show_hilbert_path = not viewer.show_hilbert_path
                     need_redraw = True
                 elif event.key == pygame.K_r:
                     viewer.last_viewport_key = None

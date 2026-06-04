@@ -27,6 +27,7 @@ struct MapHeader
     uint32_t tiles_wide;
     uint32_t tiles_high;
     uint32_t bottom_left[2]; // [0]=min_x, [1]=min_y
+    uint16_t color_count;    // number of RGB565 entries in the global palette
 };
 
 struct IndexEntry

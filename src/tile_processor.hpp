@@ -612,6 +612,81 @@ private:
         }
         for (auto& w : workers) w.join();
 
+        // Build global color palette from serialized tiles and collapse 2B color -> 1B index.
+        // Tiles are serialized with a temporary 2-byte color in each feature header;
+        // here we gather the real color set, assign indices and rewrite every tile in place.
+        std::vector<uint16_t> palette;
+        std::unordered_map<uint16_t, uint16_t> color_to_index;
+
+        for (auto& pt : packed_results)
+        {
+            if (pt.data.size() < 6)
+                continue;
+            uint16_t fcount;
+            memcpy(&fcount, pt.data.data() + 4, 2);
+
+            std::vector<uint8_t> rewritten;
+            rewritten.reserve(pt.data.size());
+            rewritten.insert(rewritten.end(), pt.data.begin(), pt.data.begin() + 6);
+
+            size_t p = 6;
+            bool ok = true;
+            for (uint16_t fi = 0; fi < fcount; ++fi)
+            {
+                if (p + 9 > pt.data.size())
+                {
+                    ok = false;
+                    break;
+                }
+                uint8_t geom = pt.data[p];
+                uint16_t color;
+                memcpy(&color, pt.data.data() + p + 1, 2);
+
+                auto it = color_to_index.find(color);
+                uint16_t cidx;
+                if (it == color_to_index.end())
+                {
+                    cidx = (uint16_t)palette.size();
+                    color_to_index.emplace(color, cidx);
+                    palette.push_back(color);
+                }
+                else
+                    cidx = it->second;
+
+                size_t hp = p + 9;
+                while (hp < pt.data.size() && (pt.data[hp++] & 0x80))
+                {
+                }
+                uint64_t ps = 0;
+                int shift = 0;
+                while (hp < pt.data.size())
+                {
+                    uint8_t b = pt.data[hp++];
+                    ps |= (uint64_t)(b & 0x7F) << shift;
+                    if (!(b & 0x80))
+                        break;
+                    shift += 7;
+                }
+                if (hp + ps > pt.data.size())
+                {
+                    ok = false;
+                    break;
+                }
+
+                rewritten.push_back(geom);
+                rewritten.push_back((uint8_t)cidx);
+                rewritten.insert(rewritten.end(), pt.data.begin() + p + 3, pt.data.begin() + hp);
+                rewritten.insert(rewritten.end(), pt.data.begin() + hp, pt.data.begin() + hp + ps);
+                p = hp + ps;
+            }
+            if (ok)
+                pt.data = std::move(rewritten);
+        }
+
+        if (palette.size() > 255)
+            std::cerr << "\nWARNING: Z" << z << " palette has " << palette.size()
+                      << " colors (>255), 1-byte color index will overflow\n";
+
         // Compute bounding box of tiles in this zoom level
         uint32_t min_x = UINT32_MAX, min_y = UINT32_MAX;
         uint32_t max_x = 0, max_y = 0;
@@ -631,7 +706,8 @@ private:
         std::ofstream out(pack_path, std::ios::binary);
         if (out)
         {
-            uint32_t data_offset = sizeof(MapHeader) + flat_count * sizeof(IndexEntry);
+            uint32_t palette_bytes = (uint32_t)palette.size() * sizeof(uint16_t);
+            uint32_t data_offset = sizeof(MapHeader) + flat_count * sizeof(IndexEntry) + palette_bytes;
 
             // Write header
             MapHeader mh;
@@ -641,6 +717,7 @@ private:
             mh.tiles_high = tiles_high;
             mh.bottom_left[0] = min_x;
             mh.bottom_left[1] = min_y;
+            mh.color_count = (uint16_t)palette.size();
             out.write((char*)&mh, sizeof(MapHeader));
 
             // Reserve index table (all zeros = empty slot)
@@ -659,6 +736,9 @@ private:
             }
 
             out.write((char*)index.data(), flat_count * sizeof(IndexEntry));
+
+            if (!palette.empty())
+                out.write((char*)palette.data(), palette_bytes);
 
             for (const auto& pt : packed_results)
                 out.write((char*)pt.data.data(), pt.data.size());
@@ -688,7 +768,8 @@ private:
      * @param merged_out    Incremented by the number of polygons merged in this tile.
      * @param tile_labels   Pre-placed text label features for this tile.
      * @param point_symbols Pre-built polygon symbols for POI features in this tile.
-     * @return Raw bytes of the complete NAV1 tile block ready to write to disk.
+     * @return Raw NAV1 tile bytes with a temporary 2-byte color per feature; the color is
+     *         later collapsed to a 1-byte palette index during the zoom-level palette pass.
      */
     std::vector<uint8_t> serialize_tile(int z, int x, int y, const MappedStore& store,
                                          const std::vector<size_t>& offsets,
@@ -1082,9 +1163,9 @@ private:
         double merc_range = t_max_merc - t_min_merc;
 
         uint16_t count = (uint16_t)std::min((size_t)0xFFFF, final_features.size() + tile_labels.size());
-        uint8_t th[22] = {'N', 'A', 'V', '1', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+        uint8_t th[6] = {'N', 'A', 'V', '1', 0, 0};
         memcpy(th + 4, &count, 2);
-        buffer.insert(buffer.end(), th, th + 22);
+        buffer.insert(buffer.end(), th, th + 6);
 
         uint16_t written = 0;
 
@@ -1162,12 +1243,14 @@ private:
                     ri.push_back(cur & 0xFF); ri.push_back(cur >> 8);
                 }
             }
-            uint8_t fh[13] = {pf.type, (uint8_t)(pf.color & 0xFF), (uint8_t)(pf.color >> 8), pf.prio, width_byte,
-                              (uint8_t)std::min(255, minx / 16), (uint8_t)std::min(255, miny / 16),
-                              (uint8_t)std::min(255, maxx / 16), (uint8_t)std::min(255, maxy / 16),
-                              (uint8_t)(pts & 0xFF), (uint8_t)(pts >> 8),
-                              (uint8_t)((payload.size() + ri.size()) & 0xFF), (uint8_t)((payload.size() + ri.size()) >> 8)};
-            buffer.insert(buffer.end(), fh, fh + 13);
+            uint8_t fh[9] = {pf.type, (uint8_t)(pf.color & 0xFF), (uint8_t)(pf.color >> 8), pf.prio, width_byte,
+                             (uint8_t)std::min(255, minx / 16), (uint8_t)std::min(255, miny / 16),
+                             (uint8_t)std::min(255, maxx / 16), (uint8_t)std::min(255, maxy / 16)};
+            buffer.insert(buffer.end(), fh, fh + 9);
+            auto vcc = utils::to_varint((uint64_t)pts);
+            buffer.insert(buffer.end(), vcc.begin(), vcc.end());
+            auto vps = utils::to_varint((uint64_t)(payload.size() + ri.size()));
+            buffer.insert(buffer.end(), vps.begin(), vps.end());
             buffer.insert(buffer.end(), payload.begin(), payload.end());
             if (!ri.empty()) buffer.insert(buffer.end(), ri.begin(), ri.end());
             written++;
@@ -1209,12 +1292,14 @@ private:
             uint8_t bx = (uint8_t)std::max(0, std::min(255, (int)px >> 4));
             uint8_t by = (uint8_t)std::max(0, std::min(255, (int)py >> 4));
 
-            uint8_t th2[13] = {GEOM_TEXT, (uint8_t)(label->color_rgb565 & 0xFF), (uint8_t)(label->color_rgb565 >> 8),
+            uint8_t th2[9] = {GEOM_TEXT, (uint8_t)(label->color_rgb565 & 0xFF), (uint8_t)(label->color_rgb565 >> 8),
                               label->zoom_priority, label->font_size,
-                              bx, by, bx, by,
-                              (uint8_t)(coord_count & 0xFF), (uint8_t)(coord_count >> 8),
-                              (uint8_t)(text_payload.size() & 0xFF), (uint8_t)(text_payload.size() >> 8)};
-            buffer.insert(buffer.end(), th2, th2 + 13);
+                              bx, by, bx, by};
+            buffer.insert(buffer.end(), th2, th2 + 9);
+            auto vcc = utils::to_varint((uint64_t)coord_count);
+            buffer.insert(buffer.end(), vcc.begin(), vcc.end());
+            auto vps = utils::to_varint((uint64_t)text_payload.size());
+            buffer.insert(buffer.end(), vps.begin(), vps.end());
             buffer.insert(buffer.end(), text_payload.begin(), text_payload.end());
             written++;
         }
