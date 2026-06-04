@@ -20,11 +20,15 @@ Controls:
     G                Toggle tile grid
     S                Toggle feature stats panel
     L                Toggle color legend panel
+    P                Cycle routing profile (WALK -> BIKE -> CAR)
     Q / Escape       Quit
 
 Routing:
-    Reads ROUTE/R{lat}_{lon}.bin from the nav_dir.
-    The routing log (bottom-right panel) shows origin, destination,
+    Reads ROUTE/{CAR,BIKE,WALK}/ROUTE.bin alongside the nav_dir.
+    Active profile defaults to WALK; switch it with the Route button or the P key.
+    On each right-click (or profile change) it loads every cell in the origin→destination
+    bounding box (+1 cell margin) and runs A* over that subgraph.
+    The routing log (bottom-right panel) shows origin, destination, profile,
     graph stats, route length, nodes visited and A* computation time.
 """
 
@@ -98,53 +102,71 @@ def darken_color(rgb: Tuple[int, int, int], amount: float = 0.15) -> Tuple[int, 
 
 # ── Routing ───────────────────────────────────────────────────────────────────
 
-# ROUTE.bin v2 format constants
-ROUTE_FILE_HDR_FMT  = '<4sBBBBIIIII'   # magic(4) version reserved[3] cell_count reserved2[4]
+# ROUTE.bin format constants (NPK route graph, interleaved per cell).
+# Must match graph_builder.hpp / route_types.hpp.
+ROUTE_FILE_HDR_FMT  = '<4sII5I'        # magic(4) sub_step_e4 cell_count reserved[5]  = 32B
 ROUTE_FILE_HDR_SIZE = struct.calcsize(ROUTE_FILE_HDR_FMT)
-CELL_IDX_FMT        = '<hhIIIII'       # lat_floor lon_floor node_offset node_count edge_offset edge_count reserved
+CELL_IDX_FMT        = '<iiIHIH'        # lat_e4 lon_e4 node_offset node_count data_offset edge_count = 20B
 CELL_IDX_SIZE       = struct.calcsize(CELL_IDX_FMT)
-ROUTE_NODE_FMT      = '<ffI'
+ROUTE_NODE_FMT      = '<ffI'           # lat lon edge_offset(u32)  = 12B
 ROUTE_NODE_SIZE     = struct.calcsize(ROUTE_NODE_FMT)
-ROUTE_EDGE_FMT      = '<IIHBHx'
+ROUTE_EDGE_FMT      = '<IIHBB'         # dst_node cost dist_m flags reserved = 12B
 ROUTE_EDGE_SIZE     = struct.calcsize(ROUTE_EDGE_FMT)
 
 
 def load_cells_for_route(route_base_dir: str,
                          src_lat: float, src_lon: float,
                          dst_lat: float, dst_lon: float):
-    """Load one or two cells from ROUTE.bin covering src and dst, merge into a single graph."""
+    """Load every cell in the origin→destination bounding box (±1 cell margin) from
+    ROUTE.bin and merge them into a single graph for A*.
+
+    The firmware pages cells on demand as A* expands, so it never needs a precomputed
+    box. The viewer loads statically, so it must include the cells between origin and
+    destination — loading only the two endpoint cells would leave the graph disconnected.
+    """
     route_path = os.path.join(route_base_dir, 'ROUTE.bin')
     if not os.path.exists(route_path):
         return None, None, [f'Missing: {route_path}']
 
     data = open(route_path, 'rb').read()
-    off = 0
 
-    hdr = struct.unpack_from(ROUTE_FILE_HDR_FMT, data, off)
-    off += ROUTE_FILE_HDR_SIZE
+    hdr = struct.unpack_from(ROUTE_FILE_HDR_FMT, data, 0)
     if hdr[0] != b'ROUT':
         return None, None, ['Bad magic in ROUTE.bin']
-    version    = hdr[1]
-    cell_count = hdr[5]
-    if version != 2:
-        return None, None, [f'Unsupported ROUTE.bin version {version} (expected 2)']
+    sub_step_e4 = hdr[1] if hdr[1] > 0 else 500
+    cell_count  = hdr[2]
 
-    # Read cell index
+    # Read cell index: lat_e4 lon_e4 node_offset node_count data_offset edge_count
+    off = ROUTE_FILE_HDR_SIZE
     cell_index = []
     for _ in range(cell_count):
-        lat_f, lon_f, n_off, n_cnt, e_off, e_cnt, _reserved = struct.unpack_from(CELL_IDX_FMT, data, off)
+        lat_e4, lon_e4, n_off, n_cnt, d_off, e_cnt = struct.unpack_from(CELL_IDX_FMT, data, off)
         off += CELL_IDX_SIZE
-        cell_index.append((lat_f, lon_f, n_off, n_cnt, e_off, e_cnt))
+        cell_index.append((lat_e4, lon_e4, n_off, n_cnt, d_off, e_cnt))
 
-    nodes_base = ROUTE_FILE_HDR_SIZE + cell_count * CELL_IDX_SIZE
-    edges_base = nodes_base + sum(c[3] for c in cell_index) * ROUTE_NODE_SIZE
-
-    # Determine which cells to load
-    def cell_key(lat, lon):
-        return (int(math.floor(lat)), int(math.floor(lon)))
-
-    needed = list(dict.fromkeys([cell_key(src_lat, src_lon), cell_key(dst_lat, dst_lon)]))
+    # Data block starts right after header + index. Each cell stores its nodes
+    # immediately followed by its edges at data_base + data_offset (interleaved).
+    data_base = ROUTE_FILE_HDR_SIZE + cell_count * CELL_IDX_SIZE
     cell_map = {(c[0], c[1]): c for c in cell_index}
+
+    def snap_e4(v):
+        return int(math.floor(v * 10000.0 / sub_step_e4) * sub_step_e4)
+
+    # Bounding box of origin and destination, expanded by one cell on each side.
+    lat_lo = min(snap_e4(src_lat), snap_e4(dst_lat)) - sub_step_e4
+    lat_hi = max(snap_e4(src_lat), snap_e4(dst_lat)) + sub_step_e4
+    lon_lo = min(snap_e4(src_lon), snap_e4(dst_lon)) - sub_step_e4
+    lon_hi = max(snap_e4(src_lon), snap_e4(dst_lon)) + sub_step_e4
+
+    needed = []
+    lat = lat_lo
+    while lat <= lat_hi:
+        lon = lon_lo
+        while lon <= lon_hi:
+            if (lat, lon) in cell_map:
+                needed.append((lat, lon))
+            lon += sub_step_e4
+        lat += sub_step_e4
 
     # dst_node in edges are global indices.
     # Nodes are stored as (lat, lon, edge_start, edge_end) — explicit range avoids
@@ -158,15 +180,14 @@ def load_cells_for_route(route_base_dir: str,
     for lat_k, lon_k in needed:
         entry = cell_map.get((lat_k, lon_k))
         if entry is None:
-            log.append(f'Cell R{lat_k}_{lon_k}: not found in index')
             continue
 
-        _, _, n_off, n_cnt, e_off, e_cnt = entry
+        _, _, n_off, n_cnt, d_off, e_cnt = entry
         edge_base = len(all_edges)
 
         # Read all nodes of cell into a temp list to compute edge_end per node
         cell_nodes_raw = []
-        pos = nodes_base + n_off * ROUTE_NODE_SIZE
+        pos = data_base + d_off
         for _ in range(n_cnt):
             lat_, lon_, local_edge_off = struct.unpack_from(ROUTE_NODE_FMT, data, pos)
             pos += ROUTE_NODE_SIZE
@@ -181,18 +202,18 @@ def load_cells_for_route(route_base_dir: str,
             gi = n_off + li
             all_nodes[gi] = (lat_, lon_, eo + edge_base, e_end)
 
-        # Read edges (dst_node already global)
-        pos = edges_base + e_off * ROUTE_EDGE_SIZE
+        # Edges follow the cell's nodes within the same data block (dst_node global).
+        pos = data_base + d_off + n_cnt * ROUTE_NODE_SIZE
         for _ in range(e_cnt):
-            dst_n, cost, dist_m, flags, name_idx = struct.unpack_from(ROUTE_EDGE_FMT, data, pos)
+            dst_n, cost, dist_m, flags, _reserved = struct.unpack_from(ROUTE_EDGE_FMT, data, pos)
             pos += ROUTE_EDGE_SIZE
-            all_edges.append((dst_n, cost, dist_m, flags, name_idx))
+            all_edges.append((dst_n, cost, dist_m, flags))
 
-        log.append(f'R{lat_k}_{lon_k}: {n_cnt} nodes, {e_cnt} edges')
+        log.append(f'E4:{lat_k}_{lon_k}: {n_cnt} nodes, {e_cnt} edges')
         loaded_any = True
 
     if not loaded_any:
-        return None, None, log
+        return None, None, log + ['No cells in route bbox']
 
     return all_nodes, all_edges, log
 
@@ -239,7 +260,9 @@ def astar_route(nodes, edges, src, dst):
             break
         e_end = nodes[u][3]
         for ei in range(nodes[u][2], e_end):
-            dst_n, cost, dist_m, _, _ = edges[ei]
+            dst_n, cost, dist_m, _flags = edges[ei]
+            if dst_n >= N:
+                continue  # edge points to a node outside the loaded bbox subgraph
             ng = gcost[u] + cost
             if ng < gcost[dst_n]:
                 gcost[dst_n] = ng
@@ -407,11 +430,17 @@ class NAVViewer:
         self.route_graph = None
         self.route_log:   List[str] = []
         self.route_base_dir: str = os.path.join(os.path.dirname(os.path.abspath(nav_dir)), 'ROUTE')
+        self.route_profiles = ['WALK', 'BIKE', 'CAR']
+        self.route_profile: str = 'WALK'   # default profile when none specified
 
         # New: Color to OSM tag mapping
         self.color_to_tags: Dict[str, List[str]] = {}
         if config_file:
             self._load_config(config_file)
+
+    def route_profile_dir(self) -> str:
+        """Directory holding the active profile's ROUTE.bin (route_base_dir/<PROFILE>)."""
+        return os.path.join(self.route_base_dir, self.route_profile)
 
     def _index_tiles(self):
         """Build an index of available zoom levels from the NPK2 pack files on disk."""
@@ -900,8 +929,12 @@ def main():
     parser.add_argument('--zoom', type=int, default=14, help='Zoom level')
     parser.add_argument('--config', type=str, help='Features JSON config file (optional, for OSM tag mapping)')
     parser.add_argument('--route-dir', type=str, default=None,
-                        help='Directory containing ROUTE/R{lat}_{lon}.bin files. '
-                             'Defaults to ../ROUTE relative to nav_dir.')
+                        help='ROUTE base dir holding CAR/BIKE/WALK subfolders, OR a single '
+                             'profile dir containing ROUTE.bin. Defaults to ../ROUTE relative to nav_dir.')
+    parser.add_argument('--route-profile', type=str, default='WALK',
+                        choices=['CAR', 'BIKE', 'WALK'],
+                        help='Initial routing profile (default: WALK). Switchable in-app with the '
+                             'Route button or the P key.')
 
     args = parser.parse_args()
 
@@ -911,12 +944,22 @@ def main():
 
     viewer = NAVViewer(args.nav_dir, args.config)
 
-    # Resolve route directory
+    # Resolve route directory and initial profile.
     if args.route_dir:
-        viewer.route_base_dir = args.route_dir
+        base = args.route_dir
     else:
         # Default: sibling ROUTE/ next to nav_dir
-        viewer.route_base_dir = os.path.join(os.path.dirname(os.path.abspath(args.nav_dir)), 'ROUTE')
+        base = os.path.join(os.path.dirname(os.path.abspath(args.nav_dir)), 'ROUTE')
+
+    viewer.route_profile = args.route_profile
+    if os.path.exists(os.path.join(base, 'ROUTE.bin')):
+        # route_dir points straight at a profile folder: pin it, disable the selector.
+        viewer.route_base_dir = os.path.dirname(os.path.abspath(base))
+        pinned = os.path.basename(os.path.abspath(base)).upper()
+        viewer.route_profiles = [pinned]
+        viewer.route_profile = pinned
+    else:
+        viewer.route_base_dir = base
     viewer.set_center(args.lat, args.lon, args.zoom)
 
     pygame.init()
@@ -938,9 +981,10 @@ def main():
     grid_button_rect = pygame.Rect(VIEWPORT_SIZE + 10, button_margin * 3 + button_height * 2, button_width, button_height)
     stats_button_rect = pygame.Rect(VIEWPORT_SIZE + 10, button_margin * 4 + button_height * 3, button_width, button_height)
     legend_button_rect = pygame.Rect(VIEWPORT_SIZE + 10, button_margin * 5 + button_height * 4, button_width, button_height)
+    profile_button_rect = pygame.Rect(VIEWPORT_SIZE + 10, button_margin * 6 + button_height * 5, button_width, button_height)
 
     # Priority filter sliders
-    slider_y_base = button_margin * 6 + button_height * 5 + 40
+    slider_y_base = button_margin * 7 + button_height * 6 + 40
     slider_height = 20
     min_priority_slider_rect = pygame.Rect(VIEWPORT_SIZE + 10, slider_y_base, button_width, slider_height)
     max_priority_slider_rect = pygame.Rect(VIEWPORT_SIZE + 10, slider_y_base + 40, button_width, slider_height)
@@ -954,6 +998,42 @@ def main():
     need_redraw = True
     running = True
     pan_speed_base = 0.01
+
+    def compute_route():
+        """(Re)load the bbox subgraph for the active profile and run A* origin→dest."""
+        if not (viewer.route_origin and viewer.route_dest):
+            return
+        olat, olon = viewer.route_origin
+        dlat, dlon = viewer.route_dest
+        viewer.route_log = [f'Origin: {olat:.5f}, {olon:.5f}',
+                            f'Dest: {dlat:.5f}, {dlon:.5f}',
+                            f'Profile: {viewer.route_profile}']
+
+        nodes, edges, graph_log = load_cells_for_route(
+            viewer.route_profile_dir(), olat, olon, dlat, dlon)
+        viewer.route_graph = (nodes, edges) if nodes else None
+        for line in graph_log:
+            viewer.route_log.append(line)
+        if not nodes:
+            viewer.route_log.append('No ROUTE.bin found')
+            viewer.route_path_coords = []
+            return
+
+        viewer.route_log.append(f'Graph total: {len(nodes)} nodes, {len(edges)} edges')
+        src = nearest_node_route(nodes, olat, olon)
+        dst = nearest_node_route(nodes, dlat, dlon)
+        viewer.route_log.append(f'Src: node {src}  Dst: node {dst}')
+        t0 = time.perf_counter()
+        path, vis, dist = astar_route(nodes, edges, src, dst)
+        elapsed = (time.perf_counter() - t0) * 1000
+        if path:
+            viewer.route_path_coords = [(nodes[i][0], nodes[i][1]) for i in path]
+            viewer.route_log.append(f'Route: {len(path)} nodes  {dist/1000:.1f} km')
+            viewer.route_log.append(f'Visited: {vis}/{len(nodes)} ({100*vis/len(nodes):.1f}%)')
+            viewer.route_log.append(f'A* time: {elapsed:.2f} ms')
+        else:
+            viewer.route_path_coords = []
+            viewer.route_log.append('No path found')
 
     while running:
         for event in pygame.event.get():
@@ -1010,6 +1090,11 @@ def main():
                     show_legend_window = not show_legend_window
                     show_stats_window = False  # Close stats if legend opened
                     need_redraw = True
+                elif event.key == pygame.K_p:
+                    idx = viewer.route_profiles.index(viewer.route_profile)
+                    viewer.route_profile = viewer.route_profiles[(idx + 1) % len(viewer.route_profiles)]
+                    compute_route()
+                    need_redraw = True
                 elif event.key in (pygame.K_q, pygame.K_ESCAPE):
                     running = False
 
@@ -1032,6 +1117,11 @@ def main():
                     elif legend_button_rect.collidepoint(mx, my):
                         show_legend_window = not show_legend_window
                         need_redraw = True
+                    elif profile_button_rect.collidepoint(mx, my):
+                        idx = viewer.route_profiles.index(viewer.route_profile)
+                        viewer.route_profile = viewer.route_profiles[(idx + 1) % len(viewer.route_profiles)]
+                        compute_route()  # recompute on the new profile if origin+dest are set
+                        need_redraw = True
                     elif min_priority_slider_rect.collidepoint(mx, my):
                         # Set min priority from slider position
                         ratio = (mx - min_priority_slider_rect.x) / min_priority_slider_rect.width
@@ -1053,39 +1143,7 @@ def main():
                         tl_x, tl_y = center_x - 1.5, center_y - 1.5
                         dlat, dlon = num2deg(tl_x + mx / TILE_SIZE, tl_y + my / TILE_SIZE, viewer.zoom)
                         viewer.route_dest = (dlat, dlon)
-                        viewer.route_log = viewer.route_log[:1]
-                        viewer.route_log.append(f'Dest: {dlat:.5f}, {dlon:.5f}')
-
-                        if viewer.route_origin:
-                            nodes, edges, graph_log = load_cells_for_route(
-                                viewer.route_base_dir,
-                                viewer.route_origin[0], viewer.route_origin[1],
-                                dlat, dlon)
-                            viewer.route_graph = (nodes, edges) if nodes else None
-                            for line in graph_log:
-                                viewer.route_log.append(line)
-                            if nodes:
-                                viewer.route_log.append(
-                                    f'Graph total: {len(nodes)} nodes, {len(edges)} edges')
-                            else:
-                                viewer.route_log.append('No ROUTE.bin found')
-
-                        if viewer.route_origin and viewer.route_graph:
-                            nodes, edges = viewer.route_graph
-                            src = nearest_node_route(nodes, viewer.route_origin[0], viewer.route_origin[1])
-                            dst = nearest_node_route(nodes, dlat, dlon)
-                            viewer.route_log.append(f'Src: node {src}  Dst: node {dst}')
-                            t0 = time.perf_counter()
-                            path, vis, dist = astar_route(nodes, edges, src, dst)
-                            elapsed = (time.perf_counter() - t0) * 1000
-                            if path:
-                                viewer.route_path_coords = [(nodes[i][0], nodes[i][1]) for i in path]
-                                viewer.route_log.append(f'Route: {len(path)} nodes  {dist/1000:.1f} km')
-                                viewer.route_log.append(f'Visited: {vis}/{len(nodes)} ({100*vis/len(nodes):.1f}%)')
-                                viewer.route_log.append(f'A* time: {elapsed:.2f} ms')
-                            else:
-                                viewer.route_path_coords = []
-                                viewer.route_log.append('No path found')
+                        compute_route()
                         need_redraw = True
 
                 elif event.button == 4:
@@ -1158,6 +1216,9 @@ def main():
 
             legend_text = "Legend" + (" ✓" if show_legend_window else "")
             draw_button(screen, legend_text, legend_button_rect, button_bg, button_fg, button_border, font_small)
+
+            draw_button(screen, f"Route: {viewer.route_profile}", profile_button_rect,
+                        button_bg, button_fg, button_border, font_small)
 
             info_color = (200, 200, 200)
 
