@@ -508,70 +508,30 @@ private:
                             const std::vector<Feature>& point_features)
     {
         auto start = std::chrono::steady_clock::now();
-
-        std::vector<size_t> flat_offsets;
-        for (int b = 0; b <= z; ++b)
-            flat_offsets.insert(flat_offsets.end(), features_by_zoom[b].begin(), features_by_zoom[b].end());
-
-        unsigned int map_threads = std::thread::hardware_concurrency();
-        if (map_threads == 0) map_threads = 4;
-
-        struct TileEntry { TileCoord coord; size_t seq; size_t offset; };
-        std::vector<std::vector<TileEntry>> partial_entries(map_threads);
-
-        {
-            std::atomic<size_t> next_idx(0);
-            size_t chunk = 4096;
-            std::vector<std::thread> map_workers;
-            for (unsigned int t = 0; t < map_threads; ++t)
-            {
-                map_workers.emplace_back([&, t]() {
-                    auto& local = partial_entries[t];
-                    while (true)
-                    {
-                        size_t begin = next_idx.fetch_add(chunk);
-                        if (begin >= flat_offsets.size()) break;
-                        size_t end = std::min(begin + chunk, flat_offsets.size());
-                        for (size_t i = begin; i < end; ++i)
-                        {
-                            size_t offset = flat_offsets[i];
-                            Feature f = store.get(offset);
-                            if (z == 9 && f.highway_type == "secondary" && f.ref.empty())
-                                continue;
-
-                            int min_tx = 1e9, max_tx = -1, min_ty = 1e9, max_ty = -1;
-                            for (const auto& p : f.points)
-                            {
-                                int tx = static_cast<int>(utils::lon_to_x(p.lon, z));
-                                int ty = static_cast<int>(utils::lat_to_y(p.lat, z));
-                                if (tx < min_tx) min_tx = tx;
-                                if (tx > max_tx) max_tx = tx;
-                                if (ty < min_ty) min_ty = ty;
-                                if (ty > max_ty) max_ty = ty;
-                            }
-                            for (int x = min_tx; x <= max_tx; ++x)
-                                for (int y = min_ty; y <= max_ty; ++y)
-                                    local.push_back({{x, y}, i, offset});
-                        }
-                    }
-                });
-            }
-            for (auto& w : map_workers) w.join();
-        }
-
-        std::unordered_map<TileCoord, std::vector<TileEntry>, TileCoordHash> tile_entries;
-        for (auto& part : partial_entries)
-            for (auto& e : part)
-                tile_entries[e.coord].push_back(e);
-
         std::unordered_map<TileCoord, std::vector<size_t>, TileCoordHash> tile_map;
-        for (auto& [tc, entries] : tile_entries)
+        for (int b = 0; b <= z; ++b)
         {
-            std::sort(entries.begin(), entries.end(),
-                      [](const TileEntry& a, const TileEntry& b) { return a.seq < b.seq; });
-            std::vector<size_t>& vec = tile_map[tc];
-            vec.reserve(entries.size());
-            for (auto& e : entries) vec.push_back(e.offset);
+            const auto& bucket = features_by_zoom[b];
+            for (size_t offset : bucket)
+            {
+                Feature f = store.get(offset);
+                if (z == 9 && f.highway_type == "secondary" && f.ref.empty())
+                    continue;
+
+                int min_tx = 1e9, max_tx = -1, min_ty = 1e9, max_ty = -1;
+                for (const auto& p : f.points)
+                {
+                    int tx = static_cast<int>(utils::lon_to_x(p.lon, z));
+                    int ty = static_cast<int>(utils::lat_to_y(p.lat, z));
+                    if (tx < min_tx) min_tx = tx;
+                    if (tx > max_tx) max_tx = tx;
+                    if (ty < min_ty) min_ty = ty;
+                    if (ty > max_ty) max_ty = ty;
+                }
+                for (int x = min_tx; x <= max_tx; ++x)
+                    for (int y = min_ty; y <= max_ty; ++y)
+                        tile_map[{x, y}].push_back(offset);
+            }
         }
 
         std::unordered_map<TileCoord, std::vector<size_t>, TileCoordHash> tile_label_indices;
