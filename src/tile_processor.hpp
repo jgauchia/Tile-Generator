@@ -563,6 +563,8 @@ private:
             tiles.push_back(std::move(tw));
         }
 
+        auto t_prep1 = std::chrono::steady_clock::now();
+
         std::vector<PackedTile> packed_results(tiles.size());
         unsigned int num_threads = std::thread::hardware_concurrency();
         if (num_threads == 0) num_threads = 4;
@@ -612,6 +614,7 @@ private:
         }
         for (auto& w : workers) w.join();
 
+        auto t_palette0 = std::chrono::steady_clock::now();
         // Build global color palette from serialized tiles and collapse 2B color -> 1B index.
         // Tiles are serialized with a temporary 2-byte color in each feature header;
         // here we gather the real color set, assign indices and rewrite every tile in place.
@@ -682,6 +685,7 @@ private:
             if (ok)
                 pt.data = std::move(rewritten);
         }
+        auto t_palette1 = std::chrono::steady_clock::now();
 
         if (palette.size() > 255)
             std::cerr << "\nWARNING: Z" << z << " palette has " << palette.size()
@@ -701,6 +705,7 @@ private:
         uint32_t tiles_high = max_y - min_y + 1;
         uint32_t flat_count = tiles_wide * tiles_high;
 
+        auto t_write0 = std::chrono::steady_clock::now();
         uint64_t zoom_bytes = 0;
         std::string pack_path = output_dir + "/Z" + std::to_string(z) + ".nav";
         std::ofstream out(pack_path, std::ios::binary);
@@ -755,6 +760,12 @@ private:
                   << std::fixed << std::setprecision(1) << avg_tps << " t/s), "
                   << std::setw(8) << (size_t)merged_count << " polygons merged | "
                   << std::setw(6) << std::setprecision(1) << (zoom_bytes / 1024.0 / 1024.0) << " MB done in " << elapsed.count() << "s" << std::endl;
+        {
+            auto secs = [](auto a, auto b) { return std::chrono::duration<double>(b - a).count(); };
+            std::cout << "    [CLOSE z" << z << "] prep_tilemap=" << std::fixed << std::setprecision(1)
+                      << secs(start, t_prep1) << "s  palette_pass=" << secs(t_palette0, t_palette1)
+                      << "s  write_nav=" << secs(t_write0, end) << "s" << std::endl;
+        }
     }
 
     /**
