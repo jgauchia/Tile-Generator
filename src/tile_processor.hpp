@@ -876,6 +876,28 @@ private:
         };
         GEOSGeometry* clip_poly = make_clip_box(constants::CLIP_MARGIN_POLYGON);
         GEOSGeometry* clip_line = make_clip_box(constants::CLIP_MARGIN_LINE);
+
+        double poly_lm = (lmax - lmin) * constants::CLIP_MARGIN_POLYGON;
+        double poly_tm = (tmax - tmin) * constants::CLIP_MARGIN_POLYGON;
+        double clip_poly_xmin = lmin - poly_lm, clip_poly_xmax = lmax + poly_lm;
+        double clip_poly_ymin = tmin - poly_tm, clip_poly_ymax = tmax + poly_tm;
+        double line_lm = (lmax - lmin) * constants::CLIP_MARGIN_LINE;
+        double line_tm = (tmax - tmin) * constants::CLIP_MARGIN_LINE;
+        double clip_line_xmin = lmin - line_lm, clip_line_xmax = lmax + line_lm;
+        double clip_line_ymin = tmin - line_tm, clip_line_ymax = tmax + line_tm;
+
+        auto clip_with_bbox = [&](const GEOSGeometry* geom, const GEOSGeometry* clip_box,
+                                  double cxmin, double cxmax, double cymin, double cymax) -> GEOSGeometry* {
+            double gxmin, gymin, gxmax, gymax;
+            if (GEOSGeom_getExtent_r(local_handle, geom, &gxmin, &gymin, &gxmax, &gymax))
+            {
+                if (gxmax < cxmin || gxmin > cxmax || gymax < cymin || gymin > cymax)
+                    return nullptr;
+                if (gxmin >= cxmin && gxmax <= cxmax && gymin >= cymin && gymax <= cymax)
+                    return GEOSGeom_clone_r(local_handle, geom);
+            }
+            return GEOSIntersection_r(local_handle, geom, clip_box);
+        };
         double tolerance = (lmax - lmin) / 1024.0;
         double pixel_deg = (lmax - lmin) / 256.0;
         double min_pixel_area = constants::post_projection_min_area(z);
@@ -971,7 +993,7 @@ private:
             {
                 GEOSGeometry* simplified = GEOSTopologyPreserveSimplify_r(local_handle, merged, tolerance * 0.5);
                 GEOSGeometry* to_clip = (simplified && !GEOSisEmpty_r(local_handle, simplified)) ? simplified : merged;
-                GEOSGeometry* clipped = GEOSIntersection_r(local_handle, to_clip, clip_poly);
+                GEOSGeometry* clipped = clip_with_bbox(to_clip, clip_poly, clip_poly_xmin, clip_poly_xmax, clip_poly_ymin, clip_poly_ymax);
                 if (to_clip != merged) GEOSGeom_destroy_r(local_handle, to_clip);
                 if (clipped)
                 {
@@ -1014,7 +1036,7 @@ private:
             {
                 GEOSGeometry* g = feature_to_geos(f, local_handle);
                 if (!g) continue;
-                GEOSGeometry* clipped = GEOSIntersection_r(local_handle, g, clip_poly);
+                GEOSGeometry* clipped = clip_with_bbox(g, clip_poly, clip_poly_xmin, clip_poly_xmax, clip_poly_ymin, clip_poly_ymax);
                 GEOSGeom_destroy_r(local_handle, g);
                 if (!clipped || GEOSisEmpty_r(local_handle, clipped)) { if (clipped) GEOSGeom_destroy_r(local_handle, clipped); continue; }
                 if (!GEOSisValid_r(local_handle, clipped)) { GEOSGeometry* v = GEOSMakeValid_r(local_handle, clipped); GEOSGeom_destroy_r(local_handle, clipped); clipped = v; }
@@ -1078,7 +1100,7 @@ private:
         {
             GEOSGeometry* g = feature_to_geos(f, local_handle);
             if (!g) continue;
-            GEOSGeometry* clipped = GEOSIntersection_r(local_handle, g, clip_line);
+            GEOSGeometry* clipped = clip_with_bbox(g, clip_line, clip_line_xmin, clip_line_xmax, clip_line_ymin, clip_line_ymax);
             if (!clipped || GEOSisEmpty_r(local_handle, clipped))
             {
                 GEOSGeom_destroy_r(local_handle, g);
