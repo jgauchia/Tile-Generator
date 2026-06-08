@@ -508,15 +508,21 @@ private:
                             const std::vector<Feature>& point_features)
     {
         auto start = std::chrono::steady_clock::now();
+        double prep_loop_s = 0.0, prep_insert_s = 0.0;
+        uint64_t prep_inserts = 0;
         std::unordered_map<TileCoord, std::vector<size_t>, TileCoordHash> tile_map;
         for (int b = 0; b <= z; ++b)
         {
             const auto& bucket = features_by_zoom[b];
             for (size_t offset : bucket)
             {
+                auto tl0 = std::chrono::steady_clock::now();
                 Feature f = store.get(offset);
                 if (z == 9 && f.highway_type == "secondary" && f.ref.empty())
+                {
+                    prep_loop_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - tl0).count();
                     continue;
+                }
 
                 int min_tx = 1e9, max_tx = -1, min_ty = 1e9, max_ty = -1;
                 for (const auto& p : f.points)
@@ -528,9 +534,16 @@ private:
                     if (ty < min_ty) min_ty = ty;
                     if (ty > max_ty) max_ty = ty;
                 }
+                prep_loop_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - tl0).count();
+
+                auto ti0 = std::chrono::steady_clock::now();
                 for (int x = min_tx; x <= max_tx; ++x)
                     for (int y = min_ty; y <= max_ty; ++y)
+                    {
                         tile_map[{x, y}].push_back(offset);
+                        prep_inserts++;
+                    }
+                prep_insert_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - ti0).count();
             }
         }
 
@@ -765,6 +778,9 @@ private:
             std::cout << "    [CLOSE z" << z << "] prep_tilemap=" << std::fixed << std::setprecision(1)
                       << secs(start, t_prep1) << "s  palette_pass=" << secs(t_palette0, t_palette1)
                       << "s  write_nav=" << secs(t_write0, end) << "s" << std::endl;
+            std::cout << "    [PREP z" << z << "] feat_loop=" << std::fixed << std::setprecision(1)
+                      << prep_loop_s << "s  map_insert=" << prep_insert_s << "s  inserts="
+                      << prep_inserts << std::endl;
         }
     }
 
