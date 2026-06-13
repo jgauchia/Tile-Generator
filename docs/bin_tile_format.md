@@ -1,104 +1,137 @@
-# NAV-PACK Format Specification (v0.5.0)
+# NAV-PACK Format Specification (NPK2)
 
-This document describes the **NPK2** container format evolved with **Pure Hilbert Indexing**, a high-performance binary storage system for vector map tiles designed for ESP32-based GPS navigators.
-
-NPK2-Hilbert optimizes SD card access by ordering tiles and indices along a space-filling curve, ensuring that geographically adjacent tiles are physically close in the binary file.
+This document describes the **NPK2** container format used by the NAV tile generator.
+NPK2 uses a flat 2D array index over a rectangular bounding box, providing **O(1)**
+tile lookup: one seek to the index entry, one read of 8 bytes, no search required.
 
 ---
 
 ## 1. Storage Architecture
 
-Map data is organized into consolidated binary files per zoom level: `Z{zoom}.nav`.
+Map data is organized into one binary file per zoom level: `Z{zoom}.nav`.
 
-Each Pack file consists of: **Global Header** → **Hilbert Index Table** → **Tile Data Blocks**.
+Each file consists of: **Map Header** → **Flat Index Table** → **Color Palette** → **Tile Data Blocks**.
 
-### 1.1. Key Features
-- **Spatial Locality**: Data is ordered by Hilbert distance.
-- **Binary Deduplication**: Multiple index entries can point to the same physical data block (e.g., empty ocean/land tiles).
-- **Extensible Header**: Reserved fields for future metadata or checksums.
+The index is a contiguous array of `tiles_wide × tiles_high` entries stored row-major
+(Y outer, X inner). The position of a tile `(x, y)` in the index is:
+
+```
+flat_index = (y - bottom_left[1]) * tiles_wide + (x - bottom_left[0])
+```
+
+Empty slots (gaps inside the bounding box) have `offset = 0` and `size = 0`.
 
 ---
 
 ## 2. File Structure
 
-### 2.1. Global Pack Header (37 bytes)
+### 2.1. Map Header (23 bytes, `#pragma pack(push,1)`)
 
-| Offset | Field          | Type      | Size  | Description                               |
-|--------|----------------|-----------|--------|-------------------------------------------|
-| 0      | magic          | bytes[4]  | 4      | "NPK2"                                    |
-| 4      | zoom           | uint8     | 1      | Zoom level                                |
-| 5      | tile_count     | uint32    | 4      | Total number of tiles (LE)                |
-| 9      | index_offset   | uint32    | 4      | File offset to the Hilbert Index Table    |
-| 13     | reserved[4]    | uint32[4] | 16     | Reserved for future use (alignment)       |
+| Offset | Field          | Type     | Size | Description                           |
+|--------|----------------|----------|------|---------------------------------------|
+| 0      | magic          | bytes[4] | 4    | `"NPK2"`                              |
+| 4      | zoom           | uint8    | 1    | Zoom level                            |
+| 5      | tiles_wide     | uint32   | 4    | Width of the bounding box in tiles    |
+| 9      | tiles_high     | uint32   | 4    | Height of the bounding box in tiles   |
+| 13     | bottom_left[0] | uint32   | 4    | Absolute tile X of origin (min_x)     |
+| 17     | bottom_left[1] | uint32   | 4    | Absolute tile Y of origin (min_y)     |
+| 21     | color_count    | uint16   | 2    | Number of RGB565 entries in palette   |
 
-### 2.2. Hilbert Index Table (tile_count * 16 bytes)
+### 2.2. Flat Index Table (`tiles_wide × tiles_high × 8` bytes)
 
-The index table is sorted by the `h` (Hilbert Index) field to allow $O(\log N)$ binary search.
+| Offset | Field  | Type   | Size | Description                         |
+|--------|--------|--------|------|-------------------------------------|
+| 0      | offset | uint32 | 4    | Absolute byte offset of tile data   |
+| 4      | size   | uint32 | 4    | Size of tile data in bytes (0=empty)|
 
-| Offset | Field      | Type   | Size | Description                              |
-|--------|------------|--------|------|------------------------------------------|
-| 0      | h          | uint64 | 8    | Hilbert distance index (calculated from x, y) |
-| 8      | offset     | uint32 | 4    | Absolute byte offset of tile data        |
-| 12     | size       | uint32 | 4    | Size of tile data in bytes               |
+### 2.3. Color Palette (`color_count × 2` bytes)
+
+Placed immediately after the index table and before the first tile block. A contiguous
+array of `color_count` RGB565 values (LE). Feature headers reference colors by 1-byte
+index into this table instead of storing the full 16-bit color. Tile data offsets in the
+index already account for the palette size, so reading is still a single seek.
+
+| Offset      | Field   | Type   | Size | Description           |
+|-------------|---------|--------|------|-----------------------|
+| `i × 2`     | color   | uint16 | 2    | RGB565 color (LE)     |
 
 ---
 
 ## 3. Internal Tile Format (NAV1)
 
-Each tile block is byte-for-byte identical for deduplication if geometry matches.
+### 3.1. Tile Header (6 bytes)
 
-### 3.1. Tile Header (22 bytes)
-
-| Offset | Field         | Type     | Size | Description                          |
-|--------|---------------|----------|------|--------------------------------------|
-| 0      | magic         | bytes[4] | 4    | "NAV1"                               |
-| 4      | feature_count | uint16   | 2    | Number of features                   |
-| 6      | reserved      | uint8[16]| 16   | Set to 0 to enable binary deduplication |
+| Offset | Field         | Type      | Size | Description        |
+|--------|---------------|-----------|------|--------------------|
+| 0      | magic         | bytes[4]  | 4    | `"NAV1"`           |
+| 4      | feature_count | uint16    | 2    | Number of features |
 
 ---
 
 ## 4. Feature Records
 
-Each feature has a **13-byte header** followed by compressed coordinates or text payload.
+Each feature has a **variable-length header** followed by compressed coordinates or text
+payload. The fixed part is 8 bytes; `coord_count` and `payload_size` are LEB128 varints.
 
-| Offset | Field         | Type   | Size | Description                                        |
-|--------|---------------|--------|------|----------------------------------------------------|
-| 0      | geom_type     | uint8  | 1    | 1=Point, 2=Line, 3=Polygon, 4=Text                |
-| 1      | color         | uint16 | 2    | Color in RGB565 (LE)                               |
-| 3      | zoom_priority | uint8  | 1    | `(min_zoom << 4) \| (priority & 0x0F)`            |
-| 4      | width_flags   | uint8  | 1    | Bit 7=Casing, Bits 0-6=Width (0.5px units)        |
-| 5      | min_x         | uint8  | 1    | BBox min X (coords/16)                             |
-| 6      | min_y         | uint8  | 1    | BBox min Y (coords/16)                             |
-| 7      | max_x         | uint8  | 1    | BBox max X (coords/16)                             |
-| 8      | max_y         | uint8  | 1    | BBox max Y (coords/16)                             |
-| 9      | coord_count   | uint16 | 2    | Number of vertices (or words for text)             |
-| 11     | payload_size  | uint16 | 2    | Total bytes of data following the header           |
+| Field         | Type    | Size   | Description                                        |
+|---------------|---------|--------|----------------------------------------------------|
+| geom_type     | uint8   | 1      | 1=Point, 2=Line, 3=Polygon, 4=Text                 |
+| color_index   | uint8   | 1      | Index into the pack color palette                  |
+| zoom_priority | uint8   | 1      | `(min_zoom << 4) \| (priority & 0x0F)`             |
+| width_flags   | uint8   | 1      | Bit 7=Casing, Bits 0-6=Width (0.5px units)         |
+| min_x         | uint8   | 1      | BBox min X (coords/16)                             |
+| min_y         | uint8   | 1      | BBox min Y (coords/16)                             |
+| max_x         | uint8   | 1      | BBox max X (coords/16)                             |
+| max_y         | uint8   | 1      | BBox max Y (coords/16)                             |
+| coord_count   | varint  | 1–3    | Number of vertices (or words for text)             |
+| payload_size  | varint  | 1–3    | Total bytes of data following the header           |
+
+> **Note:** the previous format used a fixed 13-byte header with a 2-byte inline color
+> and 2-byte `coord_count`/`payload_size`. The current format moves color to a global
+> palette (1-byte index) and varint-encodes the two counts, shrinking the typical feature
+> header from 13 to ~10 bytes and the tile header from 22 to 6 bytes. The `"NPK2"` /
+> `"NAV1"` magics are unchanged.
 
 ---
 
-## 5. Tile Lookup (ESP32 Algorithm)
-
-1. **Calculate Hilbert Index**:
-   Convert target `(x, y)` to Hilbert index `h` using the `xy_to_hilbert(x, y, zoom)` function.
-2. **Binary Search**:
-   Perform a binary search on the Index Table (starting at `index_offset`) to find the entry where `entry.h == h`.
-3. **Fetch Data**:
-   Read `entry.size` bytes starting at `entry.offset`.
+## 5. Tile Lookup Algorithm (O(1))
 
 ```cpp
-// Example C++ lookup logic
-uint64_t h = xy_to_hilbert(targetX, targetY, zoom);
-int low = 0, high = hdr.tile_count - 1;
-while (low <= high) {
-    int mid = low + (high - low) / 2;
-    IndexEntry entry;
-    f.seek(hdr.index_offset + mid * sizeof(IndexEntry));
-    f.read((uint8_t*)&entry, sizeof(IndexEntry));
-    if (entry.h == h) return entry; // Found!
-    if (entry.h < h) low = mid + 1;
-    else high = mid - 1;
-}
+// 1. Read MapHeader at file offset 0
+MapHeader hdr;
+file.read(&hdr, sizeof(MapHeader));
+
+// 2. Compute relative offsets
+int32_t x_off = target_x - (int32_t)hdr.bottom_left[0];
+int32_t y_off = target_y - (int32_t)hdr.bottom_left[1];
+
+// 3. Bounds check — outside bounding box means tile does not exist
+if (x_off < 0 || y_off < 0 ||
+    (uint32_t)x_off >= hdr.tiles_wide ||
+    (uint32_t)y_off >= hdr.tiles_high)
+    return false;
+
+// 4. Seek directly to the index entry
+uint32_t flat_idx = (uint32_t)y_off * hdr.tiles_wide + (uint32_t)x_off;
+uint32_t entry_pos = sizeof(MapHeader) + flat_idx * sizeof(IndexEntry);
+file.seek(entry_pos);
+
+// 5. Read 8-byte entry — size == 0 means empty slot
+IndexEntry entry;
+file.read(&entry, sizeof(IndexEntry));
+if (entry.size == 0)
+    return false;
+
+offset = entry.offset;
+size   = entry.size;
+return true;
 ```
+
+The lookup is unaffected by the palette: `entry.offset` is an absolute file offset that
+already includes `sizeof(MapHeader) + index_table + palette`. The palette
+(`color_count × 2` bytes, located right after the index table) is read once when the pack
+is opened and kept in memory; each feature's `color_index` is then resolved to RGB565 via
+`palette[color_index]`.
 
 ---
 

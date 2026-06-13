@@ -2,8 +2,8 @@
  * @file mapped_store.hpp
  * @author Jordi Gauchía (jgauchia @jgauchia.com)
  * @brief High-performance POSIX memory-mapped storage for map features.
- * @version 0.8.0
- * @date 2026-05
+ * @version 0.9.0
+ * @date 2026-06
  */
 
 #pragma once
