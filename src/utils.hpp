@@ -2,8 +2,8 @@
  * @file utils.hpp
  * @author Jordi Gauchía (jgauchia @jgauchia.com)
  * @brief Geographic projection, color conversion, and coordinate encoding utilities.
- * @version 0.8.0
- * @date 2026-05
+ * @version 0.9.0
+ * @date 2026-06
  */
 
 #pragma once
