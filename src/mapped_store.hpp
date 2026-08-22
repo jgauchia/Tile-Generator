@@ -56,7 +56,7 @@ public:
         size_t ends_size = f.ring_ends.size() * sizeof(uint32_t);
         size_t widths_size = f.zoom_widths.size() * (sizeof(int) + sizeof(uint8_t));
 
-        size_t total_size = sizeof(int64_t) + 4 + 4 + 4 + pts_size + ends_size + sizeof(size_t) + widths_size;
+        size_t total_size = sizeof(int64_t) + 4 + 4 + 4 + 4 + pts_size + ends_size + sizeof(size_t) + widths_size;
         // Extra fields: highway_type, layer, is_bridge, is_building, ref, name
         total_size += sizeof(uint16_t) + f.highway_type.size();
         total_size += sizeof(uint16_t) + f.layer.size();
