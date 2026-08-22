@@ -701,8 +701,8 @@ private:
         auto t_palette1 = std::chrono::steady_clock::now();
 
         if (palette.size() > 255)
-            std::cerr << "\nWARNING: Z" << z << " palette has " << palette.size()
-                      << " colors (>255), 1-byte color index will overflow\n";
+            throw std::runtime_error("Z" + std::to_string(z) + " palette has " + std::to_string(palette.size()) +
+                                     " colors (>255), 1-byte color index would overflow");
 
         // Compute bounding box of tiles in this zoom level
         uint32_t min_x = UINT32_MAX, min_y = UINT32_MAX;
@@ -1320,8 +1320,7 @@ private:
             uint8_t text_len = (uint8_t)text_bytes.size();
             bool has_shield = (label->bg_color_rgb565 != 0);
             int data_size = 4 + 1 + text_len + (has_shield ? 4 : 0);
-            uint16_t coord_count = (data_size + 3) / 4;
-            int padded_size = coord_count * 4;
+            uint16_t coord_count = (uint16_t)data_size;
 
             std::vector<uint8_t> text_payload;
             text_payload.push_back(px & 0xFF); text_payload.push_back(px >> 8);
@@ -1335,8 +1334,6 @@ private:
                 text_payload.push_back(label->border_color_rgb565 & 0xFF);
                 text_payload.push_back(label->border_color_rgb565 >> 8);
             }
-            int padding = padded_size - data_size;
-            for (int p = 0; p < padding; ++p) text_payload.push_back(0);
 
             uint8_t bx = (uint8_t)std::max(0, std::min(255, (int)px >> 4));
             uint8_t by = (uint8_t)std::max(0, std::min(255, (int)py >> 4));

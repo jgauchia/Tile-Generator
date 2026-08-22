@@ -72,6 +72,7 @@ index already account for the palette size, so reading is still a single seek.
 
 Each feature has a **variable-length header** followed by compressed coordinates or text
 payload. The fixed part is 8 bytes; `coord_count` and `payload_size` are LEB128 varints.
+Text payloads are **not 4-byte aligned**: `coord_count` equals the payload size in bytes.
 
 | Field         | Type    | Size   | Description                                        |
 |---------------|---------|--------|----------------------------------------------------|
@@ -83,7 +84,7 @@ payload. The fixed part is 8 bytes; `coord_count` and `payload_size` are LEB128 
 | min_y         | uint8   | 1      | BBox min Y (coords/16)                             |
 | max_x         | uint8   | 1      | BBox max X (coords/16)                             |
 | max_y         | uint8   | 1      | BBox max Y (coords/16)                             |
-| coord_count   | varint  | 1–3    | Number of vertices (or words for text)             |
+| coord_count   | varint  | 1–3    | Number of vertices (or payload bytes for text)     |
 | payload_size  | varint  | 1–3    | Total bytes of data following the header           |
 
 > **Note:** the previous format used a fixed 13-byte header with a 2-byte inline color
