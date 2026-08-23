@@ -4,7 +4,7 @@ C++ toolset for generating optimized vector map tiles from OpenStreetMap PBF fil
 
 ## Features
 
-- **Flat 2D Array Index**: O(1) tile lookup using a rectangular bounding box. No search required — one seek to the index entry, one read of 8 bytes.
+- **Sparse Index (bitmap + rank)**: O(1) tile lookup over the bounding box. A 1-bit-per-cell coverage bitmap plus a popcount rank table locates each compact 8-byte entry — empty cells (sea, gaps) resolve with a single small read instead of wasting an index slot.
 - **High-Performance C++ Engine**: OSM PBF parsing and tile generation using GEOS, GDAL, and Libosmium.
 - **Efficient Binary Format**: Packed NPK2 containers with Delta+ZigZag+VarInt coordinate encoding.
 - **Memory-Mapped Storage**: Uses `mmap` for feature storage, allowing processing of large PBF files with minimal RAM.
@@ -161,7 +161,7 @@ For the full binary format and profile speed tables see [`docs/route_generator.m
 
 ## Internal Format Details
 
-- **Tile container**: NPK2 (Flat 2D Array Index, O(1) lookup) — `docs/bin_tile_format.md`
+- **Tile container**: NPK2 (Sparse index: coverage bitmap + rank table + compact 8B entries, O(1) lookup) — `docs/bin_tile_format.md`
 - **Tile internal format**: NAV1 (Geometry + Text labels), 6-byte tile header
 - **Color palette**: per-pack global RGB565 table; features store a 1-byte color index
 - **Feature header**: 8 fixed bytes + varint `coord_count`/`payload_size`

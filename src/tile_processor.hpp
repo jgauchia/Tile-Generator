@@ -718,6 +718,45 @@ private:
         uint32_t tiles_high = max_y - min_y + 1;
         uint32_t flat_count = tiles_wide * tiles_high;
 
+        // Sparse index: only tiles with data get entries, sorted by flat index. Coverage
+        // is a 1-bit-per-cell bitmap; a rank table (u32 per 64 bitmap bytes = 512 cells)
+        // locates each entry in the compact array in O(1) with 2-3 small SD reads.
+        std::vector<const PackedTile*> real_tiles;
+        for (const auto& pt : packed_results)
+        {
+            if (pt.data.size() < 6)
+                continue;
+            real_tiles.push_back(&pt);
+        }
+        std::sort(real_tiles.begin(), real_tiles.end(), [&](const PackedTile* a, const PackedTile* b)
+        {
+            uint32_t fa = (a->y - min_y) * tiles_wide + (a->x - min_x);
+            uint32_t fb = (b->y - min_y) * tiles_wide + (b->x - min_x);
+            return fa < fb;
+        });
+
+        uint32_t bitmap_bytes = (flat_count + 7) / 8;
+        std::vector<uint8_t> bitmap(bitmap_bytes, 0);
+        for (const PackedTile* pt : real_tiles)
+        {
+            uint32_t flat = (pt->y - min_y) * tiles_wide + (pt->x - min_x);
+            bitmap[flat >> 3] |= (uint8_t)(1u << (flat & 7));
+        }
+
+        constexpr uint32_t RANK_STRIDE_BYTES = 64;
+        uint32_t rank_count = (bitmap_bytes + RANK_STRIDE_BYTES - 1) / RANK_STRIDE_BYTES;
+        std::vector<uint32_t> rank(rank_count, 0);
+        {
+            uint32_t acc = 0;
+            for (uint32_t i = 0; i < rank_count; ++i)
+            {
+                rank[i] = acc;
+                uint32_t end = std::min(bitmap_bytes, (i + 1) * RANK_STRIDE_BYTES);
+                for (uint32_t b = i * RANK_STRIDE_BYTES; b < end; ++b)
+                    acc += (uint32_t)__builtin_popcount(bitmap[b]);
+            }
+        }
+
         auto t_write0 = std::chrono::steady_clock::now();
         uint64_t zoom_bytes = 0;
         std::string pack_path = output_dir + "/Z" + std::to_string(z) + ".nav";
@@ -725,7 +764,10 @@ private:
         if (out)
         {
             uint32_t palette_bytes = (uint32_t)palette.size() * sizeof(uint16_t);
-            uint32_t data_offset = sizeof(MapHeader) + flat_count * sizeof(IndexEntry) + palette_bytes;
+            uint32_t index_count = (uint32_t)real_tiles.size();
+            uint64_t data_offset = sizeof(MapHeader) + sizeof(index_count) + bitmap_bytes +
+                                   (uint64_t)rank_count * sizeof(uint32_t) +
+                                   (uint64_t)index_count * sizeof(IndexEntry) + palette_bytes;
 
             // Write header
             MapHeader mh;
@@ -738,28 +780,26 @@ private:
             mh.color_count = (uint16_t)palette.size();
             out.write((char*)&mh, sizeof(MapHeader));
 
-            // Reserve index table (all zeros = empty slot)
-            std::vector<IndexEntry> index(flat_count, {0, 0});
+            // Sparse index: count, coverage bitmap, rank table, compact entries (flat order)
+            out.write((char*)&index_count, sizeof(index_count));
+            out.write((char*)bitmap.data(), bitmap.size());
+            out.write((char*)rank.data(), rank.size() * sizeof(uint32_t));
 
-            // Write tile data and fill index
-            uint32_t current_data_offset = data_offset;
-            for (const auto& pt : packed_results)
+            uint64_t current_data_offset = data_offset;
+            for (const PackedTile* pt : real_tiles)
             {
-                uint32_t x_off = pt.x - min_x;
-                uint32_t y_off = pt.y - min_y;
-                uint32_t flat_idx = y_off * tiles_wide + x_off;
-                index[flat_idx].offset = current_data_offset;
-                index[flat_idx].size   = (uint32_t)pt.data.size();
-                current_data_offset += (uint32_t)pt.data.size();
+                IndexEntry entry;
+                entry.offset = (uint32_t)current_data_offset;
+                entry.size   = (uint32_t)pt->data.size();
+                current_data_offset += pt->data.size();
+                out.write((char*)&entry, sizeof(entry));
             }
-
-            out.write((char*)index.data(), flat_count * sizeof(IndexEntry));
 
             if (!palette.empty())
                 out.write((char*)palette.data(), palette_bytes);
 
-            for (const auto& pt : packed_results)
-                out.write((char*)pt.data.data(), pt.data.size());
+            for (const PackedTile* pt : real_tiles)
+                out.write((char*)pt->data.data(), pt->data.size());
 
             zoom_bytes = current_data_offset;
             total_generated_bytes += current_data_offset;

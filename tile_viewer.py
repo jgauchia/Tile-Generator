@@ -452,7 +452,7 @@ class NAVViewer:
                 self._index_pack_file(full)
 
     def _index_pack_file(self, pack_path: str):
-        """Parse NPK2 pack header and build (x,y) -> (pack_path, offset, size) index."""
+        """Parse NPK2 pack header and sparse index, building (x,y) -> (pack_path, offset, size)."""
         try:
             with open(pack_path, 'rb') as f:
                 magic = f.read(4)
@@ -463,14 +463,26 @@ class NAVViewer:
                 min_x, min_y = struct.unpack('<II', f.read(8))
                 color_count = struct.unpack('<H', f.read(2))[0]
 
+                index_count = struct.unpack('<I', f.read(4))[0]
                 flat_count = tiles_wide * tiles_high
+                bitmap_bytes = (flat_count + 7) // 8
+                bitmap = f.read(bitmap_bytes)
+                rank_bytes = ((bitmap_bytes + 63) // 64) * 4
+                f.seek(f.tell() + rank_bytes)   # skip popcount rank table; entries follow
+
+                # Enumerate set bits of the coverage bitmap in ascending flat order;
+                # the compact 8-byte entries follow exactly that order.
+                set_bits = []
+                for byte_idx, byte in enumerate(bitmap):
+                    if byte:
+                        for b in range(8):
+                            if byte & (1 << b):
+                                set_bits.append(byte_idx * 8 + b)
+
                 index: Dict[Tuple[int, int], Tuple[str, int, int]] = {}
                 tile_count = 0
-
-                for flat_idx in range(flat_count):
+                for flat_idx in set_bits:
                     offset, size = struct.unpack('<II', f.read(8))
-                    if size == 0:
-                        continue
                     x = min_x + (flat_idx % tiles_wide)
                     y = min_y + (flat_idx // tiles_wide)
                     index[(x, y)] = (pack_path, offset, size)

@@ -1,10 +1,10 @@
 # NAV Tile Viewer - ESP32 Map Simulator (v0.5.0)
 
-`tile_viewer.py` is a specialized simulator for the **NPK2 flat 2D index binary format**. It mirrors the exact rendering logic of the IceNav ESP32 firmware while providing advanced diagnostic tools for map validation.
+`tile_viewer.py` is a specialized simulator for the **NPK2 sparse index binary format**. It mirrors the exact rendering logic of the IceNav ESP32 firmware while providing advanced diagnostic tools for map validation.
 
 ## Features
 
-- **NPK2 Flat Index Support**: Parses the `MapHeader` bounding box and resolves tiles by direct O(1) position calculation.
+- **NPK2 Sparse Index Support**: Parses the `MapHeader` bounding box, the coverage bitmap and the compact entries, resolving tiles by O(1) bitmap + rank lookup (empty cells resolve instantly).
 - **Pack Statistics**: Real-time display of tile count, bounding box dimensions, origin coordinates, and file size per zoom level.
 - **Four-Pass Rendering Simulation**: Automatically draws layers in the correct order (Polygons → Road Casings → Road Cores → Text Labels).
 - **Global Color Palette**: Reads the per-pack RGB565 palette and resolves each feature's 1-byte color index back to its color.
