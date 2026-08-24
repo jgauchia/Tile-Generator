@@ -57,6 +57,66 @@ static bool is_accessible(const std::string& hw, nav::RoutingProfile profile)
         && hw != "pedestrian" && hw != "steps" && hw != "path";
 }
 
+class RestrictionHandler : public osmium::handler::Handler
+{
+public:
+    // type=restriction relations with a single `via` node. via-way restrictions
+    // are skipped (0.6% on real maps) and documented in route_generator.md.
+
+    void relation(const osmium::Relation& r)
+    {
+        const char* type = r.tags().get_value_by_key("type");
+        if (!type || std::string(type) != "restriction")
+            return;
+        const char* rtype = r.tags().get_value_by_key("restriction");
+        if (!rtype)
+            return;
+        std::string rt(rtype);
+
+        // Only the directional restrictions we can honour in A*.
+        static const std::unordered_set<std::string> SUPPORTED = {
+            "no_left_turn", "no_right_turn", "only_straight_on",
+            "only_right_turn", "only_left_turn", "no_straight_on",
+            "no_u_turn",
+        };
+        if (!SUPPORTED.count(rt))
+            return;
+
+        // Via must be a single node.
+        const osmium::RelationMember* via = nullptr;
+        for (const auto& m : r.members())
+            if (std::string(m.role()) == "via")
+            {
+                if (via) return;         // multiple via members — skip
+                via = &m;
+            }
+        if (!via || via->type() != osmium::item_type::node)
+            return;
+
+        // from/to must be ways (via-node restrictions always reference ways).
+        const osmium::RelationMember* from = nullptr;
+        const osmium::RelationMember* to   = nullptr;
+        for (const auto& m : r.members())
+        {
+            const char* role = m.role();
+            if (std::string(role) == "from")  from = &m;
+            else if (std::string(role) == "to") to = &m;
+        }
+        if (!from || !to)
+            return;
+        if (from->type() != osmium::item_type::way || to->type() != osmium::item_type::way)
+            return;
+
+        // from/to way ids are resolved to global edges in GraphBuilder via the
+        // way_id carried on each segment; stored as OSM way ids here.
+        from_way[via->ref()].insert(from->ref());
+        to_way[via->ref()].insert(to->ref());
+    }
+
+    std::unordered_map<int64_t, std::unordered_set<int64_t>> from_way;
+    std::unordered_map<int64_t, std::unordered_set<int64_t>> to_way;
+};
+
 class RouteHandler : public osmium::handler::Handler
 {
 public:
@@ -112,6 +172,32 @@ public:
         {
             try { f.maxspeed = (uint8_t)std::min(std::stoi(ms), 255); }
             catch (...) {}
+        }
+
+        // Surface quality → 3 bits in RouteEdge.flags (0=unknown, 1=paved, 2=unpaved,
+        // 3=gravel, 4=dirt, 5=trail, 6=sand). Only used by BIKE/PED profiles.
+        const char* surf = w.tags().get_value_by_key("surface");
+        if (surf)
+        {
+            std::string s(surf);
+            if      (s == "asphalt" || s == "paved" || s == "concrete" || s == "concrete:plates" || s == "paving_stones" || s == "sett") f.surface = 1;
+            else if (s == "unpaved" || s == "compacted" || s == "fine_gravel" || s == "ground")                                      f.surface = 2;
+            else if (s == "gravel" || s == "pebblestone")                                                                               f.surface = 3;
+            else if (s == "dirt" || s == "earth" || s == "mud" || s == "clay")                                                       f.surface = 4;
+            else if (s == "grass" || s == "grass_paver" || s == "wood" || s == "sand" || s == "gravel" )                            f.surface = (s == "sand") ? 6 : 5;
+        }
+        else
+        {
+            // smoothness fallback — rough implies unpaved/dirt for bike/ped
+            const char* sm = w.tags().get_value_by_key("smoothness");
+            if (sm)
+            {
+                std::string smv(sm);
+                if (smv == "bad" || smv == "very_bad" || smv == "horrible" || smv == "very_horrible" || smv == "impassable")
+                    f.surface = 4; // dirt — worst paved-equivalent
+                else if (smv == "intermediate")
+                    f.surface = 3; // gravel
+            }
         }
 
         const char* nm = w.tags().get_value_by_key("name");
@@ -173,6 +259,41 @@ int main(int argc, char* argv[])
 
     auto total_start = std::chrono::steady_clock::now();
 
+    // Extract turn restrictions once (shared by all profiles).
+    std::cout << "Scanning turn restrictions..." << std::endl;
+    RestrictionHandler restr_handler;
+    {
+        osmium::io::Reader reader{input_pbf, osmium::osm_entity_bits::relation};
+        osmium::apply(reader, restr_handler);
+        reader.close();
+    }
+    std::cout << "Turn restrictions found: " << restr_handler.from_way.size() << " via-nodes" << std::endl;
+
+    // Build resolution input (OSM ids) shared by all profiles.
+    std::vector<nav::TurnRestrictionRef> turn_refs;
+    {
+        std::unordered_map<int64_t, std::pair<std::vector<int64_t>, std::vector<int64_t>>> merged;
+        for (const auto& [via, froms] : restr_handler.from_way)
+        {
+            auto& [f, t] = merged[via];
+            f.assign(froms.begin(), froms.end());
+        }
+        for (const auto& [via, tos] : restr_handler.to_way)
+        {
+            auto& [f, t] = merged[via];
+            t.assign(tos.begin(), tos.end());
+        }
+        turn_refs.reserve(merged.size());
+        for (auto& [via, ft] : merged)
+        {
+            nav::TurnRestrictionRef r;
+            r.via_osm    = via;
+            r.from_ways  = std::move(ft.first);
+            r.to_ways    = std::move(ft.second);
+            turn_refs.push_back(std::move(r));
+        }
+    }
+
     static const nav::RoutingProfile ALL_PROFILES[] = {
         nav::RoutingProfile::Car,
         nav::RoutingProfile::Bike,
@@ -220,7 +341,7 @@ int main(int argc, char* argv[])
             nav::GraphBuilder graph_builder(output_dir, profile);
             for (const auto& f : route_handler.road_ways)
                 graph_builder.add_way(f);
-            graph_builder.build_and_write();
+            graph_builder.build_and_write(turn_refs);
 
             auto end_time = std::chrono::steady_clock::now();
             std::chrono::duration<double> elapsed = end_time - start_time;

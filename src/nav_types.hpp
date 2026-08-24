@@ -35,6 +35,24 @@ struct IndexEntry
     uint32_t offset;
     uint32_t size;
 };
+
+// Resolution input (OSM ids): a via node with the from/to ways that form the turn.
+struct TurnRestrictionRef
+{
+    int64_t via_osm;
+    std::vector<int64_t> from_ways;
+    std::vector<int64_t> to_ways;
+};
+
+// Turn restriction: prohibits travelling in_edge -> out_edge through via_node.
+// Edges are identified by their global index (see route_generator.md).
+struct TurnRestriction
+{
+    uint32_t via_node;   // global node index
+    uint32_t in_edge;    // global edge index (entry)
+    uint32_t out_edge;   // global edge index (forbidden exit)
+};
+static_assert(sizeof(TurnRestriction) == 12, "TurnRestriction size mismatch");
 #pragma pack(pop)
 
 struct Point
@@ -57,6 +75,7 @@ struct Feature
     std::string highway_type;
     uint8_t oneway = 0;
     uint8_t maxspeed = 0;
+    uint8_t surface = 0;   // 0=unknown, 1=paved, 2=unpaved, 3=gravel, 4=dirt, 5=trail, 6=sand
     std::string ref;
     std::string old_ref;
     std::string name;

@@ -104,8 +104,10 @@ def darken_color(rgb: Tuple[int, int, int], amount: float = 0.15) -> Tuple[int, 
 
 # ROUTE.bin format constants (NPK route graph, interleaved per cell).
 # Must match graph_builder.hpp / route_types.hpp.
-ROUTE_FILE_HDR_FMT  = '<4sII5I'        # magic(4) sub_step_e4 cell_count reserved[5]  = 32B
+ROUTE_FILE_HDR_FMT  = '<4sIII4I'       # magic(4) sub_step_e4 cell_count turn_count reserved[4] = 32B
 ROUTE_FILE_HDR_SIZE = struct.calcsize(ROUTE_FILE_HDR_FMT)
+TURN_RESTR_FMT      = '<III'           # via_node in_edge out_edge = 12B
+TURN_RESTR_SIZE     = struct.calcsize(TURN_RESTR_FMT)
 CELL_IDX_FMT        = '<iiIHIH'        # lat_e4 lon_e4 node_offset node_count data_offset edge_count = 20B
 CELL_IDX_SIZE       = struct.calcsize(CELL_IDX_FMT)
 ROUTE_NODE_FMT      = '<hhI'           # lat_off lon_off (int16, cell-relative) edge_offset(u32) = 8B
@@ -133,15 +135,16 @@ def load_cells_for_route(route_base_dir: str,
     """
     route_path = os.path.join(route_base_dir, 'ROUTE.bin')
     if not os.path.exists(route_path):
-        return None, None, [f'Missing: {route_path}']
+        return None, None, [], [f'Missing: {route_path}']
 
     data = open(route_path, 'rb').read()
 
     hdr = struct.unpack_from(ROUTE_FILE_HDR_FMT, data, 0)
     if hdr[0] != b'ROUT':
-        return None, None, ['Bad magic in ROUTE.bin']
+        return None, None, [], ['Bad magic in ROUTE.bin']
     sub_step_e4 = hdr[1] if hdr[1] > 0 else 500
     cell_count  = hdr[2]
+    turn_count  = hdr[3]
 
     # Read cell index: lat_e4 lon_e4 node_offset node_count data_offset edge_count
     off = ROUTE_FILE_HDR_SIZE
@@ -222,9 +225,18 @@ def load_cells_for_route(route_base_dir: str,
         loaded_any = True
 
     if not loaded_any:
-        return None, None, log + ['No cells in route bbox']
+        return None, None, [], log + ['No cells in route bbox']
 
-    return all_nodes, all_edges, log
+    # Turn-restriction table appended after the data block.
+    restrictions = []
+    if turn_count > 0:
+        pos = data_base + max(c[4] + c[3]*ROUTE_NODE_SIZE + c[5]*ROUTE_EDGE_SIZE for c in cell_index)
+        for _ in range(turn_count):
+            via, ine, oute = struct.unpack_from('<III', data, pos)
+            pos += TURN_RESTR_SIZE
+            restrictions.append((via, ine, oute))
+
+    return all_nodes, all_edges, restrictions, log
 
 
 def nearest_node_route(nodes, lat, lon):
@@ -249,42 +261,89 @@ def heuristic_route(nodes, a, b):
     return (dist_m / 36.1) * 10.0
 
 
-def astar_route(nodes, edges, src, dst):
+def turn_angle_deg(nodes, a, b, c):
+    """Turn angle in degrees at node b when coming from a and going to c."""
+    (alat, alon) = nodes[a][0], nodes[a][1]
+    (blat, blon) = nodes[b][0], nodes[b][1]
+    (clat, clon) = nodes[c][0], nodes[c][1]
+    cos_lat = math.cos(blat * math.pi / 180.0)
+    # Direction of travel: incoming (b <- a) and outgoing (b -> c) —
+    # a straight continuation yields 0°, a U-turn 180°.
+    ax = (blon - alon) * cos_lat
+    ay = blat - alat
+    bx = (clon - blon) * cos_lat
+    by = clat - blat
+    na = math.hypot(ax, ay)
+    nb = math.hypot(bx, by)
+    if na < 1e-9 or nb < 1e-9:
+        return 0.0
+    dot = max(-1.0, min(1.0, (ax * bx + ay * by) / (na * nb)))
+    return math.degrees(math.acos(dot))
+
+
+def astar_route(nodes, edges, restrictions, src, dst):
+    """A* over state (node, incoming edge) honouring turn restrictions and
+    penalising sharp turns (matches the firmware behaviour)."""
     import heapq
     N = len(nodes)
     INF = float('inf')
-    gcost = [INF] * N
-    prev = [-1] * N
-    visited = [False] * N
-    gcost[src] = 0
-    pq = [(heuristic_route(nodes, src, dst), 0.0, src)]
+    EDGE_NONE = -1
+    TURN_MIN_ANGLE = 45.0
+    TURN_PENALTY_TENTHS = 30   # 3 s extra per sharp turn (>45 deg), in tenths of second
+
+    # Restriction lookup: (via, in_edge) -> set of forbidden out_edges.
+    restr = {}
+    for via, ine, oute in restrictions:
+        restr.setdefault((via, ine), set()).add(oute)
+
+    gcost = {}
+    prev = {}
+    visited = set()
+    src_key = (src, EDGE_NONE)
+    gcost[src_key] = 0.0
+    pq = [(heuristic_route(nodes, src, dst), 0.0, src_key)]
     visited_count = 0
+    dst_key = None
     while pq:
-        f, g, u = heapq.heappop(pq)
-        if visited[u]:
+        f, g, (u, edge_in) = heapq.heappop(pq)
+        if (u, edge_in) in visited:
             continue
-        visited[u] = True
+        visited.add((u, edge_in))
         visited_count += 1
         if u == dst:
+            dst_key = (u, edge_in)
             break
-        e_end = nodes[u][3]
-        for ei in range(nodes[u][2], e_end):
+        if (u, edge_in) not in gcost:
+            continue
+        for ei in range(nodes[u][2], nodes[u][3]):
             dst_n, cost, dist_m, _flags = edges[ei]
             if dst_n >= N:
-                continue  # edge points to a node outside the loaded bbox subgraph
-            ng = gcost[u] + cost
-            if ng < gcost[dst_n]:
-                gcost[dst_n] = ng
-                prev[dst_n] = u
+                continue
+            # Turn restriction: (edge_in -> ei) through u forbidden. The edge ids
+            # are the global indices of the edges in the ROUTE.bin edge stream.
+            if edge_in != EDGE_NONE and ei in restr.get((u, edge_in), set()):
+                continue
+            add = 0.0
+            if edge_in != EDGE_NONE:
+                prev_node = prev.get((u, edge_in))
+                if prev_node is not None:
+                    ang = turn_angle_deg(nodes, prev_node[0], u, dst_n)
+                    if ang > TURN_MIN_ANGLE:
+                        add = TURN_PENALTY_TENTHS
+            ng = gcost[(u, edge_in)] + cost + add
+            nkey = (dst_n, ei)
+            if ng < gcost.get(nkey, INF):
+                gcost[nkey] = ng
+                prev[nkey] = (u, edge_in)
                 h = heuristic_route(nodes, dst_n, dst)
-                heapq.heappush(pq, (ng + h, ng, dst_n))
-    if gcost[dst] == INF:
+                heapq.heappush(pq, (ng + h, ng, nkey))
+    if dst_key is None:
         return [], visited_count, 0.0
     path = []
-    cur = dst
-    while cur != -1:
-        path.append(cur)
-        cur = prev[cur]
+    cur = dst_key
+    while cur is not None:
+        path.append(cur[0])
+        cur = prev.get(cur)
     path.reverse()
     dist = 0.0
     for i in range(1, len(path)):
@@ -424,7 +483,6 @@ class NAVViewer:
 
         self.last_query_stats = {}
         self.cached_features: Optional[List[NavFeature]] = None
-        self.selected_feature = None
         self.last_viewport_key = None
         self.cached_query_features: List[NavFeature] = []
 
@@ -633,7 +691,7 @@ class NAVViewer:
             self.cached_features = []
             return
 
-        self.cached_features = features # Update for identify_feature_at
+        self.cached_features = features
 
         # New: Apply priority filter
         features = [f for f in features if self.priority_filter_min <= f.priority <= self.priority_filter_max]
@@ -858,33 +916,6 @@ class NAVViewer:
                 label = font.render(f"{tx}/{ty}", True, color, (255, 255, 255))
                 surface.blit(label, (sx + 5, sy + 5))
 
-    def identify_feature_at(self, pixel_x: int, pixel_y: int) -> Optional[dict]:
-        if not self.cached_features: return None
-        center_x, center_y = deg2num(self.center_lat, self.center_lon, self.zoom)
-        tl_x, tl_y = center_x - 1.5, center_y - 1.5
-        fx, fy = tl_x + (pixel_x / TILE_SIZE), tl_y + (pixel_y / TILE_SIZE)
-
-        # Test features in priority order (highest first) for correct hit-testing
-        sorted_features = sorted(self.cached_features, key=lambda f: f.priority, reverse=True)
-        for feature in sorted_features:
-            if self._point_in_feature(fx, fy, feature):
-                bx1, by1, bx2, by2 = feature.bbox
-                color_hex = f"#{rgb565_to_rgb888(feature.color_rgb565)[0]:02x}{rgb565_to_rgb888(feature.color_rgb565)[1]:02x}{rgb565_to_rgb888(feature.color_rgb565)[2]:02x}"
-
-                # Find OSM tags from color
-                osm_tags = self.color_to_tags.get(color_hex, ['unknown'])
-
-                return {
-                    'type': ['?', 'Point', 'Line', 'Polygon', 'Text'][feature.geom_type if feature.geom_type < 5 else 0],
-                    'color': color_hex,
-                    'tags': ', '.join(osm_tags[:3]),  # Show up to 3 tags
-                    'zoom': feature.min_zoom,
-                    'priority': feature.priority,
-                    'pts': len(feature.coords),
-                    'bbox': f"({bx1},{by1})-({bx2},{by2})"
-                }
-        return None
-
     def get_feature_stats(self) -> Dict:
         """Calculate detailed statistics about loaded features."""
         if not self.cached_features:
@@ -909,28 +940,6 @@ class NAVViewer:
             stats['by_color'][color_hex] = stats['by_color'].get(color_hex, 0) + 1
 
         return stats
-
-    def _point_in_feature(self, fx: float, fy: float, feature: NavFeature) -> bool:
-        # Convert feature to global tile units for intersection test
-        f_pts = [(feature.tile_x + px/4096.0, feature.tile_y + py/4096.0) for px, py in feature.coords]
-        if feature.geom_type == GEOM_POLYGON:
-            inside = False
-            for i in range(len(f_pts)):
-                p1, p2 = f_pts[i], f_pts[i - 1]
-                if ((p1[1] > fy) != (p2[1] > fy)) and (fx < (p2[0] - p1[0]) * (fy - p1[1]) / (p2[1] - p1[1]) + p1[0]):
-                    inside = not inside
-            return inside
-        elif feature.geom_type == GEOM_LINESTRING:
-            tol = 5.0 / TILE_SIZE
-            for i in range(len(f_pts) - 1):
-                p1, p2 = f_pts[i], f_pts[i + 1]
-                dx, dy = p2[0] - p1[0], p2[1] - p1[1]
-                if dx == 0 and dy == 0: d = math.sqrt((fx-p1[0])**2 + (fy-p1[1])**2)
-                else:
-                    t = max(0, min(1, ((fx - p1[0]) * dx + (fy - p1[1]) * dy) / (dx*dx + dy*dy)))
-                    d = math.sqrt((fx - (p1[0] + t*dx))**2 + (fy - (p1[1] + t*dy))**2)
-                if d < tol: return True
-        return False
 
 
 def draw_button(surface, text, rect, bg_color, fg_color, border_color, font):
@@ -1026,32 +1035,27 @@ def main():
             return
         olat, olon = viewer.route_origin
         dlat, dlon = viewer.route_dest
-        viewer.route_log = [f'Origin: {olat:.5f}, {olon:.5f}',
-                            f'Dest: {dlat:.5f}, {dlon:.5f}',
-                            f'Profile: {viewer.route_profile}']
+        viewer.route_log = [f'Profile: {viewer.route_profile}',
+                            f'O: {olat:.5f}, {olon:.5f}',
+                            f'D: {dlat:.5f}, {dlon:.5f}']
 
-        nodes, edges, graph_log = load_cells_for_route(
+        nodes, edges, restrictions, graph_log = load_cells_for_route(
             viewer.route_profile_dir(), olat, olon, dlat, dlon)
         viewer.route_graph = (nodes, edges) if nodes else None
-        for line in graph_log:
-            viewer.route_log.append(line)
         if not nodes:
-            viewer.route_log.append('No ROUTE.bin found')
+            viewer.route_log.append(graph_log[0] if graph_log else 'No ROUTE.bin found')
             viewer.route_path_coords = []
             return
 
-        viewer.route_log.append(f'Graph total: {len(nodes)} nodes, {len(edges)} edges')
         src = nearest_node_route(nodes, olat, olon)
         dst = nearest_node_route(nodes, dlat, dlon)
-        viewer.route_log.append(f'Src: node {src}  Dst: node {dst}')
         t0 = time.perf_counter()
-        path, vis, dist = astar_route(nodes, edges, src, dst)
+        path, vis, dist = astar_route(nodes, edges, restrictions, src, dst)
         elapsed = (time.perf_counter() - t0) * 1000
         if path:
             viewer.route_path_coords = [(nodes[i][0], nodes[i][1]) for i in path]
-            viewer.route_log.append(f'Route: {len(path)} nodes  {dist/1000:.1f} km')
-            viewer.route_log.append(f'Visited: {vis}/{len(nodes)} ({100*vis/len(nodes):.1f}%)')
-            viewer.route_log.append(f'A* time: {elapsed:.2f} ms')
+            viewer.route_log.append(f'Nodes: {len(path)}  {dist/1000:.1f} km')
+            viewer.route_log.append(f'A*: {elapsed:.2f} ms')
         else:
             viewer.route_path_coords = []
             viewer.route_log.append('No path found')
@@ -1191,7 +1195,7 @@ def main():
                             viewer.route_origin = (olat, olon)
                             viewer.route_path_coords = []
                             viewer.route_dest = None
-                            viewer.route_log = [f'Origin: {olat:.5f}, {olon:.5f}']
+                            viewer.route_log = [f'O: {olat:.5f}, {olon:.5f}']
                             need_redraw = True
                     dragging = False
 
@@ -1282,21 +1286,10 @@ def main():
                 screen.blit(font_small.render(f"  Origin: ({ds['min_x']},{ds['min_y']})", True, (150, 150, 150)), (VIEWPORT_SIZE + 10, dedup_y + 32))
                 screen.blit(font_small.render(f"  Pack size: {ds['file_size_mb']:.2f} MB", True, (150, 150, 150)), (VIEWPORT_SIZE + 10, dedup_y + 46))
 
-            # Feature Identification (Right-click)
             feature_y = dedup_y + 70
-            if not show_stats_window and not show_legend_window:
-                screen.blit(font_small.render("Selected Feature:", True, info_color), (VIEWPORT_SIZE + 10, feature_y))
-                if viewer.selected_feature:
-                    line_y = feature_y + 18
-                    for key, value in viewer.selected_feature.items():
-                        text = f"  {key}: {value}"
-                        screen.blit(font_small.render(text, True, (100, 200, 100)), (VIEWPORT_SIZE + 10, line_y))
-                        line_y += 14
-                else:
-                    screen.blit(font_small.render("  (Right-click to select)", True, (100, 100, 100)), (VIEWPORT_SIZE + 10, feature_y + 18))
 
             # Stats window
-            elif show_stats_window:
+            if show_stats_window:
                 feature_stats = viewer.get_feature_stats()
                 screen.blit(font_small.render("Feature Statistics:", True, (255, 255, 100)), (VIEWPORT_SIZE + 10, feature_y))
                 line_y = feature_y + 20
@@ -1345,15 +1338,15 @@ def main():
                 zooms_str = f"Available Zooms: {min(viewer.available_zooms)}-{max(viewer.available_zooms)}"
                 screen.blit(font_small.render(zooms_str, True, (150, 150, 150)), (10, VIEWPORT_SIZE + 30))
 
-            # Routing log (bottom of toolbar)
+            # Route info (right column, next to map info)
+            route_x = VIEWPORT_SIZE + TOOLBAR_WIDTH // 2 + 5
+            screen.blit(font_small.render("Route", True, (100, 180, 255)), (route_x, info_y))
             if viewer.route_log:
-                route_log_y = VIEWPORT_SIZE - 14 - len(viewer.route_log) * 16
-                screen.blit(font_small.render('── Route ──', True, (100, 180, 255)),
-                            (VIEWPORT_SIZE + 10, route_log_y - 18))
-                for line in viewer.route_log:
-                    screen.blit(font_small.render(line, True, (180, 230, 180)),
-                                (VIEWPORT_SIZE + 10, route_log_y))
-                    route_log_y += 16
+                line_y = info_y + 20
+                for i, line in enumerate(viewer.route_log):
+                    color = (255, 220, 100) if i == 0 else (180, 230, 180)
+                    screen.blit(font_small.render(line, True, color), (route_x, line_y))
+                    line_y += 16
 
             pygame.display.flip()
             need_redraw = False

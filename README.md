@@ -111,12 +111,7 @@ If a `ROUTE/` directory with profile subfolders (`CAR/`, `BIKE/`, `WALK/`) exist
 | **Route** button / `P` | Cycle profile WALK → BIKE → CAR and recompute |
 | `R` | Clear route and reload tiles |
 
-On each right-click (or profile change) the viewer loads every cell in the origin→destination bounding box (+1 cell margin) and runs A\* over that subgraph. The routing log panel (bottom-right) shows:
-- Origin and destination coordinates, active profile
-- Graph size (nodes / edges)
-- Nearest graph nodes for src and dst
-- Route length (km) and node count
-- Nodes visited by A\* and computation time
+On each right-click (or profile change) the viewer loads every cell in the bounding box covering origin and destination (+1 cell margin) and runs A\* over that subgraph, honouring turn restrictions and the turn penalty. The sidebar shows the map info on the left column and the route summary (active profile, origin/destination coordinates, nodes + distance in km, A\* time) on the right column.
 
 See [`docs/tile_viewer.md`](docs/tile_viewer.md) for the full routing usage and CLI flags (`--route-dir`, `--route-profile`).
 
@@ -166,7 +161,7 @@ For the full binary format and profile speed tables see [`docs/route_generator.m
 - **Color palette**: per-pack global RGB565 table; features store a 1-byte color index
 - **Feature header**: 8 fixed bytes + varint `coord_count`/`payload_size`
 - **Coordinates**: Web Mercator, 12-bit tile-relative space (0-4096)
-- **Routing graph**: ROUTE.bin (header 32B + index 20B/cell + nodes 8B + edges 12B, interleaved per cell; node coords as int16 cell-relative offsets) — `docs/route_generator.md`
+- **Routing graph**: ROUTE.bin (header 32B + index 20B/cell + nodes 8B + edges 12B interleaved per cell; node coords as int16 cell-relative offsets; appended turn-restriction table via_node/in_edge/out_edge; surface bits in edge flags) — `docs/route_generator.md`
 
 ---
 

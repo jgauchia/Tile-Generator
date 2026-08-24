@@ -96,16 +96,17 @@ By default the viewer looks for `ROUTE/` as a sibling of the nav directory and u
 | **Route** button / `P` | Cycle profile WALK → BIKE → CAR and recompute |
 | `R` | Clear route and reload tiles |
 
-### Routing log panel (bottom-right)
+### Route info panel (right column)
 
-The panel displays:
-- `Origin` / `Dest` — geographic coordinates of the clicked points
+The sidebar shows the map info on the left column and the route info on the right column (next to it):
+
 - `Profile` — active routing profile (WALK / BIKE / CAR)
-- `Graph` — number of nodes and edges loaded for the route bbox
-- `Src node` / `Dst node` — nearest graph nodes to origin and destination
-- `Route` — number of waypoints and total distance in km
-- `Visited` — nodes expanded by A\* (efficiency indicator)
-- `A* time` — computation time in milliseconds
+- `O` — origin coordinates (latitude, longitude)
+- `D` — destination coordinates (latitude, longitude)
+- `Nodes` — number of waypoints in the route and total distance in km
+- `A*` — computation time in milliseconds
+
+Route details (cells loaded, graph size, restrictions applied) are intentionally kept out of the UI; use the stats/logs when diagnosing.
 
 ### Route file format
 
