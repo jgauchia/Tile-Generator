@@ -154,13 +154,18 @@ Each cell's nodes and edges are stored **contiguously** in the data block. The `
 | 14 | uint32 | data_offset | byte offset from start of data block to this cell's `Node[0]` |
 | 18 | uint16 | edge_count | number of edges in this cell |
 
-### Node (12 bytes)
+### Node (8 bytes)
 
 | Offset | Type | Field | Description |
 |---|---|---|---|
-| 0 | float | lat | latitude in degrees |
-| 4 | float | lon | longitude in degrees |
-| 8 | uint32 | edge_offset | index of first outgoing edge within this cell's edge block |
+| 0 | int16 | lat_off | latitude offset from cell **centre** × 65536/(0.05°) — i.e. `(lat − cell_center_lat) / 0.05° × 65536` |
+| 2 | int16 | lon_off | longitude offset from cell **centre**, same scaling |
+| 4 | uint32 | edge_offset | index of first outgoing edge within this cell's edge block |
+
+Absolute coordinates are rebuilt as:  
+`lat = (cell.lat_e4 + 250) / 10000 + lat_off × (0.05 / 65536)`  
+`lon = (cell.lon_e4 + 250) / 10000 + lon_off × (0.05 / 65536)`  
+(`+250` shifts from the SW corner to the cell centre; `0.05/65536` ≈ 0.085 m/step). Offsets are clamped to ±32767.
 
 Edges for node `i` span `edge[node[i].edge_offset .. node[i+1].edge_offset - 1]` within the cell's edge block. For the last node, the range ends at `edge_count`.
 

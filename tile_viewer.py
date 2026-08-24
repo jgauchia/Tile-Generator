@@ -108,8 +108,15 @@ ROUTE_FILE_HDR_FMT  = '<4sII5I'        # magic(4) sub_step_e4 cell_count reserve
 ROUTE_FILE_HDR_SIZE = struct.calcsize(ROUTE_FILE_HDR_FMT)
 CELL_IDX_FMT        = '<iiIHIH'        # lat_e4 lon_e4 node_offset node_count data_offset edge_count = 20B
 CELL_IDX_SIZE       = struct.calcsize(CELL_IDX_FMT)
-ROUTE_NODE_FMT      = '<ffI'           # lat lon edge_offset(u32)  = 12B
+ROUTE_NODE_FMT      = '<hhI'           # lat_off lon_off (int16, cell-relative) edge_offset(u32) = 8B
 ROUTE_NODE_SIZE     = struct.calcsize(ROUTE_NODE_FMT)
+
+# Rebuild absolute degrees from cell SW corner (lat_e4/lon_e4) + int16 offset.
+# Matches graph_builder.hpp / route_types.hpp: offset 0 = cell centre, 1 step ≈ 0.085 m.
+_ROUTE_STEP_DEG = 0.05 / 65536.0
+def route_node_latlon(lat_e4, lon_e4, lat_off, lon_off):
+    return ((lat_e4 + 250) / 10000.0 + lat_off * _ROUTE_STEP_DEG,
+            (lon_e4 + 250) / 10000.0 + lon_off * _ROUTE_STEP_DEG)
 ROUTE_EDGE_FMT      = '<IIHBB'         # dst_node cost dist_m flags reserved = 12B
 ROUTE_EDGE_SIZE     = struct.calcsize(ROUTE_EDGE_FMT)
 
@@ -185,20 +192,22 @@ def load_cells_for_route(route_base_dir: str,
         _, _, n_off, n_cnt, d_off, e_cnt = entry
         edge_base = len(all_edges)
 
-        # Read all nodes of cell into a temp list to compute edge_end per node
+        # Read all nodes of the cell into a temp list to compute edge_end per node
         cell_nodes_raw = []
         pos = data_base + d_off
         for _ in range(n_cnt):
-            lat_, lon_, local_edge_off = struct.unpack_from(ROUTE_NODE_FMT, data, pos)
+            lat_off, lon_off, local_edge_off = struct.unpack_from(ROUTE_NODE_FMT, data, pos)
             pos += ROUTE_NODE_SIZE
-            cell_nodes_raw.append((lat_, lon_, local_edge_off))
+            cell_nodes_raw.append((lat_off, lon_off, local_edge_off))
 
-        # Build (lat, lon, edge_start, edge_end) with explicit range
-        for li, (lat_, lon_, eo) in enumerate(cell_nodes_raw):
+        # Build (lat, lon, edge_start, edge_end) with explicit range.
+        # Absolute lat/lon are rebuilt from the cell centre + int16 offsets.
+        for li, (lat_off, lon_off, eo) in enumerate(cell_nodes_raw):
             if li + 1 < n_cnt:
                 e_end = cell_nodes_raw[li + 1][2] + edge_base
             else:
                 e_end = edge_base + e_cnt
+            lat_, lon_ = route_node_latlon(lat_k, lon_k, lat_off, lon_off)
             gi = n_off + li
             all_nodes[gi] = (lat_, lon_, eo + edge_base, e_end)
 

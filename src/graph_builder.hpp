@@ -59,11 +59,11 @@ static_assert(sizeof(CellIndexEntry) == 20, "CellIndexEntry size mismatch");
 
 struct RouteNode
 {
-    float    lat;
-    float    lon;
-    uint32_t edge_offset;    // index into this cell's edge block (relative to cell edge_offset)
+    int16_t  lat_off;       // (lat − cell_center_lat) / 0.05° × 65536, clamp ±32767
+    int16_t  lon_off;       // (lon − cell_center_lon) / 0.05° × 65536, clamp ±32767
+    uint32_t edge_offset;   // index into this cell's edge block (relative to cell edge_offset)
 };
-static_assert(sizeof(RouteNode) == 12, "RouteNode size mismatch");
+static_assert(sizeof(RouteNode) == 8, "RouteNode size mismatch");
 
 struct RouteEdge
 {
@@ -323,11 +323,21 @@ public:
             cd.lat_e4 = lat_e4;
             cd.lon_e4 = lon_e4;
             cd.nodes.resize(range.count);
+            // Node coords are stored as int16 offsets from the cell centre in units of
+            // 0.05°/65536 (~0.085 m/step). Rebuilt in firmware as:
+            //   lat = (cell_lat_e4 + 250) / 10000 + lat_off * (0.05 / 65536)
+            const double lat_center = (lat_e4 + 250) / 10000.0;
+            const double lon_center = (lon_e4 + 250) / 10000.0;
+            auto quant16 = [](double v) -> int16_t {
+                if (v >  32767.0) v =  32767.0;
+                if (v < -32768.0) v = -32768.0;
+                return (int16_t)std::lround(v);
+            };
             for (uint32_t li = 0; li < range.count; ++li)
             {
                 uint32_t gi = range.base + li;
-                cd.nodes[li].lat         = global_coords[gi].first;
-                cd.nodes[li].lon         = global_coords[gi].second;
+                cd.nodes[li].lat_off     = quant16((global_coords[gi].first  - lat_center) * (65536.0 / 0.05));
+                cd.nodes[li].lon_off     = quant16((global_coords[gi].second - lon_center) * (65536.0 / 0.05));
                 cd.nodes[li].edge_offset = 0;
             }
 
