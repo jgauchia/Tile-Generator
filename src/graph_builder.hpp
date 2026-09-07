@@ -2,8 +2,8 @@
  * @file graph_builder.hpp
  * @author Jordi Gauchía (jgauchia @jgauchia.com)
  * @brief Builds ROUTE.bin routing graph files from road features extracted by OSMHandler.
- * @version 0.9.0
- * @date 2026-06
+ * @version 1.0.0
+ * @date 2026-09
  */
 
 #pragma once
