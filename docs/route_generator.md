@@ -127,12 +127,14 @@ CellIndex[]     (20 bytes × cell_count)
   Cell 1: Node[node_count_1] + Edge[edge_count_1]
   ...
   Cell N: Node[node_count_N] + Edge[edge_count_N]
+TurnRestriction[turn_count]   (12 bytes × turn_count)
 ```
 
-Each cell's nodes and edges are stored **contiguously** in the data block. The `data_offset` field in the cell index gives the byte offset from the start of the data block to the beginning of that cell's node array. This layout allows the firmware loader to read each cell with a **single seek + read** instead of two separate operations.
+Each cell's nodes and edges are stored **contiguously** in the data block. The `data_offset` field in the cell index gives the byte offset from the start of the data block to the beginning of that cell's node array. This layout allows the firmware loader to read each cell with a **single seek + read** instead of two separate operations. The turn-restriction table is appended after the last cell's data and its size is given by `turn_count` in the header.
 
 `dst_node` in each Edge is a **global node index** — absolute across all cells, no remapping needed.  
-`edge_offset` in each Node is relative to that cell's own edge block (i.e., index 0 = first edge of this cell).
+`edge_offset` in each Node is relative to that cell's own edge block (i.e., index 0 = first edge of this cell).  
+Edge ids used by turn restrictions are **global** edge indices: the cumulative edge stream (cell 0 first, then nodes in order, edges in emission order).
 
 ### FileHeader (32 bytes)
 
@@ -141,7 +143,8 @@ Each cell's nodes and edges are stored **contiguously** in the data block. The `
 | 0 | char[4] | magic | `"ROUT"` |
 | 4 | uint32 | sub_step_e4 | grid step × 10000; `500` = 0.05° cells |
 | 8 | uint32 | cell_count | number of cells in the index |
-| 12 | uint32[5] | reserved | padding to 32 bytes |
+| 12 | uint32 | turn_count | number of TurnRestriction entries at the end of the file |
+| 16 | uint32[4] | reserved | padding to 32 bytes |
 
 ### CellIndex entry (20 bytes)
 
@@ -154,13 +157,18 @@ Each cell's nodes and edges are stored **contiguously** in the data block. The `
 | 14 | uint32 | data_offset | byte offset from start of data block to this cell's `Node[0]` |
 | 18 | uint16 | edge_count | number of edges in this cell |
 
-### Node (12 bytes)
+### Node (8 bytes)
 
 | Offset | Type | Field | Description |
 |---|---|---|---|
-| 0 | float | lat | latitude in degrees |
-| 4 | float | lon | longitude in degrees |
-| 8 | uint32 | edge_offset | index of first outgoing edge within this cell's edge block |
+| 0 | int16 | lat_off | latitude offset from cell **centre** × 65536/(0.05°) — i.e. `(lat − cell_center_lat) / 0.05° × 65536` |
+| 2 | int16 | lon_off | longitude offset from cell **centre**, same scaling |
+| 4 | uint32 | edge_offset | index of first outgoing edge within this cell's edge block |
+
+Absolute coordinates are rebuilt as:  
+`lat = (cell.lat_e4 + 250) / 10000 + lat_off × (0.05 / 65536)`  
+`lon = (cell.lon_e4 + 250) / 10000 + lon_off × (0.05 / 65536)`  
+(`+250` shifts from the SW corner to the cell centre; `0.05/65536` ≈ 0.085 m/step). Offsets are clamped to ±32767.
 
 Edges for node `i` span `edge[node[i].edge_offset .. node[i+1].edge_offset - 1]` within the cell's edge block. For the last node, the range ends at `edge_count`.
 
@@ -171,7 +179,7 @@ Edges for node `i` span `edge[node[i].edge_offset .. node[i+1].edge_offset - 1]`
 | 0 | uint32 | dst_node | destination global node index |
 | 4 | uint32 | cost | travel time in tenths of second |
 | 8 | uint16 | dist_m | segment length in metres (capped at 65535) |
-| 10 | uint8 | flags | `bit0` = oneway, `bits1-3` = highway class (0–6) |
+| 10 | uint8 | flags | `bit0` = oneway, `bits1-3` = highway class (0–6), `bits4-6` = surface (0–6) |
 | 11 | uint8 | reserved | always 0 |
 
 ### Highway classes (bits 1–3 of flags)
@@ -185,6 +193,30 @@ Edges for node `i` span `edge[node[i].edge_offset .. node[i+1].edge_offset - 1]`
 | 4 | primary / primary_link |
 | 5 | trunk / trunk_link |
 | 6 | motorway / motorway_link |
+
+### TurnRestriction (12 bytes)
+
+| Offset | Type | Field | Description |
+|---|---|---|---|
+| 0 | uint32 | via_node | global node index of the intersection |
+| 4 | uint32 | in_edge | global edge index arriving at `via_node` |
+| 8 | uint32 | out_edge | global edge index forbidden as the exit |
+
+Semantics: the transition `in_edge → out_edge` through `via_node` is **not allowed**. The A* uses state (node, incoming edge) to honour this. Only `via=node` restrictions are exported (`via=way` relations are skipped — ~0.6% on real maps; they model complex intersections). `no_u_turn` restrictions are also skipped since a U-turn is never part of an optimal path with positive costs.
+
+### Surface quality (bits 4–6 of Edge.flags)
+
+| Value | surface | Generator source (`surface=` / `smoothness=` fallback) |
+|---|---|---|
+| 0 | unknown | no tag |
+| 1 | paved | asphalt, paved, concrete, paving_stones, sett |
+| 2 | unpaved | unpaved, compacted, fine_gravel, ground |
+| 3 | gravel | gravel, pebblestone |
+| 4 | dirt | dirt, earth, mud, clay; smoothness bad/very_bad/horrible/impassable |
+| 5 | trail | grass, grass_paver, wood |
+| 6 | sand | sand |
+
+Surface affects the **bike and pedestrian** profiles only: the generator multiplies the edge speed by 0.60 (gravel), 0.40 (dirt), 0.25 (trail) or 0.20 (sand). Car profile is unaffected.
 
 ---
 

@@ -1,8 +1,11 @@
 # NAV-PACK Format Specification (NPK2)
 
 This document describes the **NPK2** container format used by the NAV tile generator.
-NPK2 uses a flat 2D array index over a rectangular bounding box, providing **O(1)**
-tile lookup: one seek to the index entry, one read of 8 bytes, no search required.
+NPK2 uses a **sparse index** (coverage bitmap + popcount rank table + compact 8-byte
+entries) over a rectangular bounding box, providing **O(1)** tile lookup with 2-3 small
+random reads: a 64-byte bitmap block, a 4-byte rank value and an 8-byte entry. Empty
+cells (sea, gaps) resolve with a single small read instead of wasting a full 8-byte
+slot per cell.
 
 ---
 
@@ -10,16 +13,18 @@ tile lookup: one seek to the index entry, one read of 8 bytes, no search require
 
 Map data is organized into one binary file per zoom level: `Z{zoom}.nav`.
 
-Each file consists of: **Map Header** → **Flat Index Table** → **Color Palette** → **Tile Data Blocks**.
+Each file consists of: **Map Header** → **Sparse Index** → **Color Palette** → **Tile Data Blocks**.
 
-The index is a contiguous array of `tiles_wide × tiles_high` entries stored row-major
-(Y outer, X inner). The position of a tile `(x, y)` in the index is:
+The grid is defined by `tiles_wide × tiles_high` cells (row-major, Y outer, X inner).
+The position of a tile `(x, y)` in the grid is:
 
 ```
 flat_index = (y - bottom_left[1]) * tiles_wide + (x - bottom_left[0])
 ```
 
-Empty slots (gaps inside the bounding box) have `offset = 0` and `size = 0`.
+The sparse index stores **only the cells that contain data** (compact entries in ascending
+`flat_index` order) plus a 1-bit-per-cell coverage bitmap. A popcount rank table (one
+`uint32` per 64 bitmap bytes = 512 cells) maps a cell to its entry position in O(1).
 
 ---
 
@@ -37,19 +42,35 @@ Empty slots (gaps inside the bounding box) have `offset = 0` and `size = 0`.
 | 17     | bottom_left[1] | uint32   | 4    | Absolute tile Y of origin (min_y)     |
 | 21     | color_count    | uint16   | 2    | Number of RGB565 entries in palette   |
 
-### 2.2. Flat Index Table (`tiles_wide × tiles_high × 8` bytes)
+### 2.2. Sparse Index
 
-| Offset | Field  | Type   | Size | Description                         |
-|--------|--------|--------|------|-------------------------------------|
-| 0      | offset | uint32 | 4    | Absolute byte offset of tile data   |
-| 4      | size   | uint32 | 4    | Size of tile data in bytes (0=empty)|
+Immediately after the header:
+
+| Offset        | Field         | Type     | Size                    | Description                              |
+|---------------|---------------|----------|-------------------------|------------------------------------------|
+| 0             | index_count   | uint32   | 4                       | Number of cells with data (compact entries) |
+| 4             | coverage      | bytes    | `ceil(tiles_wide × tiles_high / 8)` | 1 bit per cell; bit `f` set = cell `f` has data (LSB-first, byte `f >> 3`) |
+| after bitmap  | rank          | uint32[] | `ceil(bitmap_bytes / 64) × 4` | `rank[i]` = number of set bits in `bitmap[0 .. i*64)` (cumulative popcount) |
+| after rank    | entries       | —        | `index_count × 8`       | `IndexEntry { offset u32, size u32 }` in ascending `flat_index` order |
+
+#### Compact entry lookup
+
+```
+f        = flat_index of the target cell
+block    = bitmap[f >> 13] .. bitmap[(f >> 13) + 63]   // 512 cells, clamped at the end of the bitmap
+bit f&7  of byte f>>3 is 0  →  cell is empty, no data
+rank     = rank[f >> 9]                                // set bits before this 512-cell block
+within   = popcount(bitmap bytes of the block before byte f>>3)
+e        = rank + within                               // position in the compact entries
+offset,size = entries[e]
+```
 
 ### 2.3. Color Palette (`color_count × 2` bytes)
 
-Placed immediately after the index table and before the first tile block. A contiguous
+Placed immediately after the compact entries and before the first tile block. A contiguous
 array of `color_count` RGB565 values (LE). Feature headers reference colors by 1-byte
 index into this table instead of storing the full 16-bit color. Tile data offsets in the
-index already account for the palette size, so reading is still a single seek.
+entries already account for the palette size, so reading is still a single seek.
 
 | Offset      | Field   | Type   | Size | Description           |
 |-------------|---------|--------|------|-----------------------|
@@ -72,6 +93,7 @@ index already account for the palette size, so reading is still a single seek.
 
 Each feature has a **variable-length header** followed by compressed coordinates or text
 payload. The fixed part is 8 bytes; `coord_count` and `payload_size` are LEB128 varints.
+Text payloads are **not 4-byte aligned**: `coord_count` equals the payload size in bytes.
 
 | Field         | Type    | Size   | Description                                        |
 |---------------|---------|--------|----------------------------------------------------|
@@ -83,7 +105,7 @@ payload. The fixed part is 8 bytes; `coord_count` and `payload_size` are LEB128 
 | min_y         | uint8   | 1      | BBox min Y (coords/16)                             |
 | max_x         | uint8   | 1      | BBox max X (coords/16)                             |
 | max_y         | uint8   | 1      | BBox max Y (coords/16)                             |
-| coord_count   | varint  | 1–3    | Number of vertices (or words for text)             |
+| coord_count   | varint  | 1–3    | Number of vertices (or payload bytes for text)     |
 | payload_size  | varint  | 1–3    | Total bytes of data following the header           |
 
 > **Note:** the previous format used a fixed 13-byte header with a 2-byte inline color
@@ -101,26 +123,41 @@ payload. The fixed part is 8 bytes; `coord_count` and `payload_size` are LEB128 
 MapHeader hdr;
 file.read(&hdr, sizeof(MapHeader));
 
-// 2. Compute relative offsets
+// 2. Read the sparse index layout
+uint32_t index_count = read_u32();
+uint32_t bitmap_bytes = (hdr.tiles_wide * hdr.tiles_high + 7) / 8;
+uint32_t rank_count = (bitmap_bytes + 63) / 64;
+uint32_t bitmap_base  = sizeof(MapHeader) + 4;
+uint32_t rank_base    = bitmap_base + bitmap_bytes;
+uint32_t entries_base = rank_base + rank_count * 4;
+
+// 3. Compute relative offsets and bounds check
 int32_t x_off = target_x - (int32_t)hdr.bottom_left[0];
 int32_t y_off = target_y - (int32_t)hdr.bottom_left[1];
-
-// 3. Bounds check — outside bounding box means tile does not exist
 if (x_off < 0 || y_off < 0 ||
     (uint32_t)x_off >= hdr.tiles_wide ||
     (uint32_t)y_off >= hdr.tiles_high)
     return false;
 
-// 4. Seek directly to the index entry
-uint32_t flat_idx = (uint32_t)y_off * hdr.tiles_wide + (uint32_t)x_off;
-uint32_t entry_pos = sizeof(MapHeader) + flat_idx * sizeof(IndexEntry);
-file.seek(entry_pos);
+uint32_t flat = (uint32_t)y_off * hdr.tiles_wide + (uint32_t)x_off;
 
-// 5. Read 8-byte entry — size == 0 means empty slot
+// 4. Read the 64-byte coverage block and test the cell bit
+uint32_t block_start = (flat >> 9) * 64;
+uint8_t block[64];
+file.seek(bitmap_base + block_start);
+file.read(block, min(64, bitmap_bytes - block_start));
+if (!(block[(flat >> 3) - block_start] & (1u << (flat & 7))))
+    return false;   // empty cell
+
+// 5. Rank: cumulative popcount up to this cell (block rank + in-block popcount)
+uint32_t rank = read_u32_at(rank_base + (flat >> 9) * 4);
+for (uint32_t i = 0; i < (flat >> 3) - block_start; ++i)
+    rank += popcount(block[i]);
+
+// 6. Read the compact 8-byte entry
 IndexEntry entry;
+file.seek(entries_base + (uint64_t)rank * sizeof(IndexEntry));
 file.read(&entry, sizeof(IndexEntry));
-if (entry.size == 0)
-    return false;
 
 offset = entry.offset;
 size   = entry.size;
@@ -128,10 +165,10 @@ return true;
 ```
 
 The lookup is unaffected by the palette: `entry.offset` is an absolute file offset that
-already includes `sizeof(MapHeader) + index_table + palette`. The palette
-(`color_count × 2` bytes, located right after the index table) is read once when the pack
-is opened and kept in memory; each feature's `color_index` is then resolved to RGB565 via
-`palette[color_index]`.
+already includes `sizeof(MapHeader) + sparse_index + palette`. The palette
+(`color_count × 2` bytes, located right after the compact entries) is read once when the
+pack is opened and kept in memory; each feature's `color_index` is then resolved to RGB565
+via `palette[color_index]`.
 
 ---
 
