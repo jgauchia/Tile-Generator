@@ -297,6 +297,42 @@ public:
 
         feat.zoom_priority = utils::pack_zoom_priority(min_zoom, nibble);
 
+        // Surface quality from OSM tags (0-6 scale)
+        // 0=unknown, 1=paved, 2=unpaved, 3=gravel, 4=dirt, 5=trail, 6=sand
+        uint8_t surface = 0;
+        if (tags.count("surface"))
+        {
+            std::string sup = tags.at("surface");
+            if (sup == "paved" || sup == "asphalt" || sup == "concrete" || sup == "paving_stones" || sup == "sett")
+                surface = 1;
+            else if (sup == "unpaved" || sup == "compacted" || sup == "fine_ground")
+                surface = 2;
+            else if (sup == "gravel")
+                surface = 3;
+            else if (sup == "dirt" || sup == "earth" || sup == "mud" || sup == "clay")
+                surface = 4;
+            else if (sup == "grass" || sup == "grass_paver" || sup == "wood")
+                surface = 5;
+            else if (sup == "sand")
+                surface = 6;
+        }
+        // Also check smoothness as fallback
+        if (surface == 0 && tags.count("smoothness"))
+        {
+            std::string smooth = tags.at("smoothness");
+            if (smooth == "pavement" || smooth == "excellent")
+                surface = 1;
+            else if (smooth == "fair")
+                surface = 2;
+            else if (smooth == "bad" || smooth == "very_bad" || smooth == "horrible" || smooth == "impassable")
+                surface = 4;
+            else if (smooth == "grass" || smooth == "packed")
+                surface = 5;
+            else if (smooth == "sand")
+                surface = 6;
+        }
+        feat.surface = surface;
+
         feat.points = std::move(way_points);
         feat.ring_ends.push_back(static_cast<uint32_t>(feat.points.size()));
 
