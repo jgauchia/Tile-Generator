@@ -249,7 +249,7 @@ public:
         feat.width_meters = get_width(tags);
         feat.highway_type = get_highway_type(tags);
         feat.ref = tags.count("ref") ? tags.at("ref") : "";
-        feat.old_ref = tags.count("old_ref") ? tags.at("old_ref") : "";
+        
 
         if (layer == "roads")
         {
@@ -306,7 +306,7 @@ public:
         features_by_zoom[min_zoom].push_back(store.append(feat));
 
         // Road labels
-        create_road_label(feat.points, feat.ref, feat.old_ref, feat.highway_type, feat.color_rgb565);
+        create_road_label(feat.points, feat.ref, feat.highway_type, feat.color_rgb565);
     }
 
     void area(const osmium::Area& a)
@@ -552,9 +552,8 @@ private:
         return 0.0f;
     }
 
-    void create_road_label(const std::vector<Point>& coords, const std::string& ref,
-                           const std::string& old_ref, const std::string& highway_type,
-                           uint16_t color_rgb565)
+void create_road_label(const std::vector<Point>& coords, const std::string& ref,
+                       const std::string& highway_type, uint16_t color_rgb565)
     {
         if (ref.empty()) return;
         if (highway_type != "motorway" && highway_type != "trunk" &&
@@ -569,7 +568,7 @@ private:
             try
             {
                 int d_number = std::stoi(ref.substr(1));
-                if (d_number >= 1000 && d_number <= 1999 && !old_ref.empty() && old_ref[0] == 'N')
+                if (d_number >= 1000 && d_number <= 1999)
                     should_create = true;
             }
             catch (...) {}

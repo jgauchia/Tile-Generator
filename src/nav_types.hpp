@@ -77,7 +77,6 @@ struct Feature
     uint8_t maxspeed = 0;
     uint8_t surface = 0;   // 0=unknown, 1=paved, 2=unpaved, 3=gravel, 4=dirt, 5=trail, 6=sand
     std::string ref;
-    std::string old_ref;
     std::string name;
     std::string layer;
     std::string shape;
