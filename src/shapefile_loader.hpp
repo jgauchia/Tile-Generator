@@ -3,7 +3,7 @@
  * @author Jordi Gauchía (jgauchia @jgauchia.com)
  * @brief Loads pre-computed ocean water polygons from shapefiles (osmdata.openstreetmap.de).
  * @version 1.0.0
- * @date 2026-09
+ * @date 2026-10
  */
 
 #pragma once

@@ -3,7 +3,7 @@
  * @author Jordi Gauchía (jgauchia @jgauchia.com)
  * @brief Tile generation engine with flat 2D array index (NPK2). O(1) lookup via rectangular bounding box.
  * @version 1.0.0
- * @date 2026-09
+ * @date 2026-10
  */
 
 #pragma once

@@ -3,7 +3,7 @@
  * @author Jordi Gauchía (jgauchia @jgauchia.com)
  * @brief Data structures shared between generator and firmware: MapHeader (NPK2 flat index) and IndexEntry.
  * @version 1.0.0
- * @date 2026-09
+ * @date 2026-10
  */
 
 #pragma once

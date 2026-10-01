@@ -3,7 +3,7 @@
  * @author Jordi Gauchía (jgauchia @jgauchia.com)
  * @brief Standalone routing graph generator. Reads an OSM PBF and writes ROUTE/R{lat}_{lon}.bin.
  * @version 1.0.0
- * @date 2026-09
+ * @date 2026-10
  */
 
 #include <iostream>

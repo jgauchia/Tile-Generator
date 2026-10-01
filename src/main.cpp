@@ -3,7 +3,7 @@
  * @author Jordi Gauchía (jgauchia @jgauchia.com)
  * @brief Entry point for the NAV Tile Generator C++ implementation with packed container support.
  * @version 1.0.0
- * @date 2026-09
+ * @date 2026-10
  */
 
 #include <iostream>

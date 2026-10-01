@@ -3,7 +3,7 @@
  * @author Jordi Gauchía (jgauchia @jgauchia.com)
  * @brief High-performance POSIX memory-mapped storage for map features.
  * @version 1.0.0
- * @date 2026-09
+ * @date 2026-10
  */
 
 #pragma once
