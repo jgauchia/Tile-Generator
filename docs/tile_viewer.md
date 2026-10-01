@@ -1,4 +1,4 @@
-# NAV Tile Viewer - ESP32 Map Simulator (v0.5.0)
+# NAV Tile Viewer - ESP32 Map Simulator
 
 `tile_viewer.py` is a specialized simulator for the **NPK2 sparse index binary format**. It mirrors the exact rendering logic of the IceNav ESP32 firmware while providing advanced diagnostic tools for map validation.
 
