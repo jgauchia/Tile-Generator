@@ -1,8 +1,9 @@
 /**
  * @file constants.hpp
+ * @author Jordi Gauchía (jgauchia @jgauchia.com)
  * @brief Rendering constants and per-zoom lookup tables (ported from Python constants.py).
- * @version 0.9.0
- * @date 2026-06
+ * @version 1.0.0
+ * @date 2026-10
  */
 
 #pragma once

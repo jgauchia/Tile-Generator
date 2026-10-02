@@ -1,10 +1,10 @@
-# NAV Tile Viewer - ESP32 Map Simulator (v0.5.0)
+# NAV Tile Viewer - ESP32 Map Simulator
 
-`tile_viewer.py` is a specialized simulator for the **NPK2 flat 2D index binary format**. It mirrors the exact rendering logic of the IceNav ESP32 firmware while providing advanced diagnostic tools for map validation.
+`tile_viewer.py` is a specialized simulator for the **NPK2 sparse index binary format**. It mirrors the exact rendering logic of the IceNav ESP32 firmware while providing advanced diagnostic tools for map validation.
 
 ## Features
 
-- **NPK2 Flat Index Support**: Parses the `MapHeader` bounding box and resolves tiles by direct O(1) position calculation.
+- **NPK2 Sparse Index Support**: Parses the `MapHeader` bounding box, the coverage bitmap and the compact entries, resolving tiles by O(1) bitmap + rank lookup (empty cells resolve instantly).
 - **Pack Statistics**: Real-time display of tile count, bounding box dimensions, origin coordinates, and file size per zoom level.
 - **Four-Pass Rendering Simulation**: Automatically draws layers in the correct order (Polygons → Road Casings → Road Cores → Text Labels).
 - **Global Color Palette**: Reads the per-pack RGB565 palette and resolves each feature's 1-byte color index back to its color.
@@ -96,16 +96,17 @@ By default the viewer looks for `ROUTE/` as a sibling of the nav directory and u
 | **Route** button / `P` | Cycle profile WALK → BIKE → CAR and recompute |
 | `R` | Clear route and reload tiles |
 
-### Routing log panel (bottom-right)
+### Route info panel (right column)
 
-The panel displays:
-- `Origin` / `Dest` — geographic coordinates of the clicked points
+The sidebar shows the map info on the left column and the route info on the right column (next to it):
+
 - `Profile` — active routing profile (WALK / BIKE / CAR)
-- `Graph` — number of nodes and edges loaded for the route bbox
-- `Src node` / `Dst node` — nearest graph nodes to origin and destination
-- `Route` — number of waypoints and total distance in km
-- `Visited` — nodes expanded by A\* (efficiency indicator)
-- `A* time` — computation time in milliseconds
+- `O` — origin coordinates (latitude, longitude)
+- `D` — destination coordinates (latitude, longitude)
+- `Nodes` — number of waypoints in the route and total distance in km
+- `A*` — computation time in milliseconds
+
+Route details (cells loaded, graph size, restrictions applied) are intentionally kept out of the UI; use the stats/logs when diagnosing.
 
 ### Route file format
 

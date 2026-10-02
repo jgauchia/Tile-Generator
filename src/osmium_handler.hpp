@@ -2,8 +2,8 @@
  * @file osmium_handler.hpp
  * @author Jordi Gauchía (jgauchia @jgauchia.com)
  * @brief OSM PBF extractor using Osmium library with mapped storage support.
- * @version 0.9.0
- * @date 2026-06
+ * @version 1.0.0
+ * @date 2026-10
  */
 
 #pragma once
@@ -249,7 +249,7 @@ public:
         feat.width_meters = get_width(tags);
         feat.highway_type = get_highway_type(tags);
         feat.ref = tags.count("ref") ? tags.at("ref") : "";
-        feat.old_ref = tags.count("old_ref") ? tags.at("old_ref") : "";
+        
 
         if (layer == "roads")
         {
@@ -297,6 +297,42 @@ public:
 
         feat.zoom_priority = utils::pack_zoom_priority(min_zoom, nibble);
 
+        // Surface quality from OSM tags (0-6 scale)
+        // 0=unknown, 1=paved, 2=unpaved, 3=gravel, 4=dirt, 5=trail, 6=sand
+        uint8_t surface = 0;
+        if (tags.count("surface"))
+        {
+            std::string sup = tags.at("surface");
+            if (sup == "paved" || sup == "asphalt" || sup == "concrete" || sup == "paving_stones" || sup == "sett")
+                surface = 1;
+            else if (sup == "unpaved" || sup == "compacted" || sup == "fine_ground")
+                surface = 2;
+            else if (sup == "gravel")
+                surface = 3;
+            else if (sup == "dirt" || sup == "earth" || sup == "mud" || sup == "clay")
+                surface = 4;
+            else if (sup == "grass" || sup == "grass_paver" || sup == "wood")
+                surface = 5;
+            else if (sup == "sand")
+                surface = 6;
+        }
+        // Also check smoothness as fallback
+        if (surface == 0 && tags.count("smoothness"))
+        {
+            std::string smooth = tags.at("smoothness");
+            if (smooth == "pavement" || smooth == "excellent")
+                surface = 1;
+            else if (smooth == "fair")
+                surface = 2;
+            else if (smooth == "bad" || smooth == "very_bad" || smooth == "horrible" || smooth == "impassable")
+                surface = 4;
+            else if (smooth == "grass" || smooth == "packed")
+                surface = 5;
+            else if (smooth == "sand")
+                surface = 6;
+        }
+        feat.surface = surface;
+
         feat.points = std::move(way_points);
         feat.ring_ends.push_back(static_cast<uint32_t>(feat.points.size()));
 
@@ -306,7 +342,7 @@ public:
         features_by_zoom[min_zoom].push_back(store.append(feat));
 
         // Road labels
-        create_road_label(feat.points, feat.ref, feat.old_ref, feat.highway_type, feat.color_rgb565);
+        create_road_label(feat.points, feat.ref, feat.highway_type, feat.color_rgb565);
     }
 
     void area(const osmium::Area& a)
@@ -552,9 +588,8 @@ private:
         return 0.0f;
     }
 
-    void create_road_label(const std::vector<Point>& coords, const std::string& ref,
-                           const std::string& old_ref, const std::string& highway_type,
-                           uint16_t color_rgb565)
+void create_road_label(const std::vector<Point>& coords, const std::string& ref,
+                       const std::string& highway_type, uint16_t color_rgb565)
     {
         if (ref.empty()) return;
         if (highway_type != "motorway" && highway_type != "trunk" &&
@@ -569,7 +604,7 @@ private:
             try
             {
                 int d_number = std::stoi(ref.substr(1));
-                if (d_number >= 1000 && d_number <= 1999 && !old_ref.empty() && old_ref[0] == 'N')
+                if (d_number >= 1000 && d_number <= 1999)
                     should_create = true;
             }
             catch (...) {}

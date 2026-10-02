@@ -2,8 +2,8 @@
  * @file mapped_store.hpp
  * @author Jordi Gauchía (jgauchia @jgauchia.com)
  * @brief High-performance POSIX memory-mapped storage for map features.
- * @version 0.9.0
- * @date 2026-06
+ * @version 1.0.0
+ * @date 2026-10
  */
 
 #pragma once
@@ -56,7 +56,7 @@ public:
         size_t ends_size = f.ring_ends.size() * sizeof(uint32_t);
         size_t widths_size = f.zoom_widths.size() * (sizeof(int) + sizeof(uint8_t));
 
-        size_t total_size = sizeof(int64_t) + 4 + 4 + 4 + pts_size + ends_size + sizeof(size_t) + widths_size;
+        size_t total_size = sizeof(int64_t) + 4 + 4 + 4 + 4 + pts_size + ends_size + sizeof(size_t) + widths_size;
         // Extra fields: highway_type, layer, is_bridge, is_building, ref, name
         total_size += sizeof(uint16_t) + f.highway_type.size();
         total_size += sizeof(uint16_t) + f.layer.size();

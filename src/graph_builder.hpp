@@ -2,8 +2,8 @@
  * @file graph_builder.hpp
  * @author Jordi Gauchía (jgauchia @jgauchia.com)
  * @brief Builds ROUTE.bin routing graph files from road features extracted by OSMHandler.
- * @version 0.9.0
- * @date 2026-06
+ * @version 1.0.0
+ * @date 2026-10
  */
 
 #pragma once
@@ -42,7 +42,8 @@ struct RouteFileHeader
     char     magic[4];       // "ROUT"
     uint32_t sub_step_e4;    // 500 for 0.05 deg
     uint32_t cell_count;
-    uint32_t reserved[5];    // padding to 32B
+    uint32_t turn_count;     // number of TurnRestriction entries appended after the data block
+    uint32_t reserved[4];    // padding to 32B
 };
 
 // Per-cell index entry — 20 bytes
@@ -59,18 +60,18 @@ static_assert(sizeof(CellIndexEntry) == 20, "CellIndexEntry size mismatch");
 
 struct RouteNode
 {
-    float    lat;
-    float    lon;
-    uint32_t edge_offset;    // index into this cell's edge block (relative to cell edge_offset)
+    int16_t  lat_off;       // (lat − cell_center_lat) / 0.05° × 65536, clamp ±32767
+    int16_t  lon_off;       // (lon − cell_center_lon) / 0.05° × 65536, clamp ±32767
+    uint32_t edge_offset;   // index into this cell's edge block (relative to cell edge_offset)
 };
-static_assert(sizeof(RouteNode) == 12, "RouteNode size mismatch");
+static_assert(sizeof(RouteNode) == 8, "RouteNode size mismatch");
 
 struct RouteEdge
 {
     uint32_t dst_node;       // global index
     uint32_t cost;
     uint16_t dist_m;
-    uint8_t  flags;
+    uint8_t  flags;          // bit0=oneway bits1-3=hw_class bits4-6=surface bit7=reserved
     uint8_t  reserved;
 };
 static_assert(sizeof(RouteEdge) == 12, "RouteEdge size mismatch");
@@ -92,13 +93,15 @@ public:
         wd.hw_class  = classify(f.highway_type);
         wd.oneway    = f.oneway;
         wd.maxspeed  = f.maxspeed;
+        wd.surface   = f.surface;
+        wd.way_id    = f.id;
         ways_.push_back(std::move(wd));
 
         for (int64_t id : ways_.back().node_ids)
             node_ref_count_[id]++;
     }
 
-    void build_and_write()
+    void build_and_write(const std::vector<nav::TurnRestrictionRef>& turn_refs)
     {
         if (ways_.empty()) return;
 
@@ -205,15 +208,17 @@ public:
 
                 if (is_vertex)
                 {
-                    SegmentData seg;
-                    seg.src_osm_id = wd.node_ids[seg_start];
-                    seg.dst_osm_id = wd.node_ids[i];
-                    seg.src_pt     = wd.coords[seg_start];
-                    seg.dst_pt     = wd.coords[i];
-                    seg.dist_m     = seg_dist;
-                    seg.hw_class   = wd.hw_class;
-                    seg.oneway     = wd.oneway;
-                    seg.maxspeed   = wd.maxspeed;
+                SegmentData seg;
+                seg.src_osm_id = wd.node_ids[seg_start];
+                seg.dst_osm_id = wd.node_ids[i];
+                seg.src_pt     = wd.coords[seg_start];
+                seg.dst_pt     = wd.coords[i];
+                seg.dist_m     = seg_dist;
+                seg.hw_class   = wd.hw_class;
+                seg.oneway     = wd.oneway;
+                seg.maxspeed   = wd.maxspeed;
+                seg.way_id     = wd.way_id;
+                seg.surface    = wd.surface;
 
                     emit_segment(seg);
 
@@ -245,8 +250,8 @@ public:
             cell_keys.push_back(key);
         std::sort(cell_keys.begin(), cell_keys.end());
 
-        std::unordered_map<int64_t, uint32_t> global_node_index;
         struct CellNodeRange { uint32_t base; uint32_t count; };
+        global_node_index_.clear();
         std::unordered_map<uint64_t, CellNodeRange> cell_node_ranges;
         std::vector<std::pair<float,float>> global_coords;
 
@@ -258,9 +263,9 @@ public:
             uint32_t base = (uint32_t)global_coords.size();
             for (const auto& seg : segs)
             {
-                if (!global_node_index.count(seg.src_osm_id))
+                if (!global_node_index_.count(seg.src_osm_id))
                 {
-                    global_node_index[seg.src_osm_id] = (uint32_t)global_coords.size();
+                    global_node_index_[seg.src_osm_id] = (uint32_t)global_coords.size();
                     global_coords.push_back({(float)seg.src_pt.lat, (float)seg.src_pt.lon});
                 }
             }
@@ -275,9 +280,9 @@ public:
             const auto& segs = cell_segments.at(key);
             for (const auto& seg : segs)
             {
-                if (!global_node_index.count(seg.dst_osm_id))
+                if (!global_node_index_.count(seg.dst_osm_id))
                 {
-                    global_node_index[seg.dst_osm_id] = (uint32_t)global_coords.size();
+                    global_node_index_[seg.dst_osm_id] = (uint32_t)global_coords.size();
                     global_coords.push_back({(float)seg.dst_pt.lat, (float)seg.dst_pt.lon});
                 }
             }
@@ -295,20 +300,34 @@ public:
             const auto& segs = cell_segments.at(key);
             const CellNodeRange& range = cell_node_ranges.at(key);
 
-            std::unordered_map<uint32_t, std::vector<RouteEdge>> node_edges;
+            struct EdgeDraft { RouteEdge e; int64_t way_id; int64_t src_osm; int64_t dst_osm; };
+            std::unordered_map<uint32_t, std::vector<EdgeDraft>> node_edges;
 
             for (const SegmentData& seg : segs)
             {
-                uint32_t src_global = global_node_index.at(seg.src_osm_id);
-                uint32_t dst_global = global_node_index.at(seg.dst_osm_id);
+                uint32_t src_global = global_node_index_.at(seg.src_osm_id);
+                uint32_t dst_global = global_node_index_.at(seg.dst_osm_id);
                 if (src_global == dst_global) continue;
 
                 float    spd   = speed_ms(seg.hw_class, seg.maxspeed);
                 if (spd <= 0.0f) continue;   // inaccessible for this profile
+                // Surface penalty for bike/pedestrian: unpaved and rougher surfaces
+                // slow these profiles down; car is unaffected.
+                if (profile_ != RoutingProfile::Car && seg.surface >= 3)
+                {
+                    // surface 3=gravel→0.60x speed, 4=dirt→0.40x, 5=trail→0.25x, 6=sand→0.20x
+                    float factor = 1.0f;
+                    if      (seg.surface == 3) factor = 0.60f;
+                    else if (seg.surface == 4) factor = 0.40f;
+                    else if (seg.surface == 5) factor = 0.25f;
+                    else if (seg.surface == 6) factor = 0.20f;
+                    spd *= factor;
+                }
                 uint32_t cost  = (uint32_t)((seg.dist_m / spd) * 10.0f);
                 uint16_t dm    = (uint16_t)std::min((float)UINT16_MAX, seg.dist_m);
                 uint8_t  flags = (uint8_t)((seg.oneway == 1 ? 1 : 0)
-                                          | ((seg.hw_class & 0x07) << 1));
+                                          | ((seg.hw_class & 0x07) << 1)
+                                          | ((seg.surface & 0x07) << 4));
 
                 RouteEdge e{};
                 e.dst_node = dst_global;
@@ -316,18 +335,28 @@ public:
                 e.dist_m   = dm;
                 e.flags    = flags;
                 e.reserved = 0;
-                node_edges[src_global].push_back(e);
+                node_edges[src_global].push_back({e, seg.way_id, seg.src_osm_id, seg.dst_osm_id});
             }
 
             CellData cd;
             cd.lat_e4 = lat_e4;
             cd.lon_e4 = lon_e4;
             cd.nodes.resize(range.count);
+            // Node coords are stored as int16 offsets from the cell centre in units of
+            // 0.05°/65536 (~0.085 m/step). Rebuilt in firmware as:
+            //   lat = (cell_lat_e4 + 250) / 10000 + lat_off * (0.05 / 65536)
+            const double lat_center = (lat_e4 + 250) / 10000.0;
+            const double lon_center = (lon_e4 + 250) / 10000.0;
+            auto quant16 = [](double v) -> int16_t {
+                if (v >  32767.0) v =  32767.0;
+                if (v < -32768.0) v = -32768.0;
+                return (int16_t)std::lround(v);
+            };
             for (uint32_t li = 0; li < range.count; ++li)
             {
                 uint32_t gi = range.base + li;
-                cd.nodes[li].lat         = global_coords[gi].first;
-                cd.nodes[li].lon         = global_coords[gi].second;
+                cd.nodes[li].lat_off     = quant16((global_coords[gi].first  - lat_center) * (65536.0 / 0.05));
+                cd.nodes[li].lon_off     = quant16((global_coords[gi].second - lon_center) * (65536.0 / 0.05));
                 cd.nodes[li].edge_offset = 0;
             }
 
@@ -339,8 +368,20 @@ public:
                 auto it = node_edges.find(gi);
                 if (it != node_edges.end())
                 {
-                    for (const auto& e : it->second)
-                        cd.edges.push_back(e);
+                    for (const auto& ed : it->second)
+                    {
+                        cd.edges.push_back(ed.e);
+                        // Record global edge index by (way_id, osm node) so turn
+                        // restrictions can be resolved from from_way/via/to_way.
+                        uint32_t cur = edge_count_global_++;
+                        if (ed.way_id != 0)
+                        {
+                            edge_of_way_dst[((uint64_t)(uint32_t)ed.way_id << 32)
+                                            | (uint32_t)(ed.dst_osm & 0xFFFFFFFF)] = cur;
+                            edge_of_way_src[((uint64_t)(uint32_t)ed.way_id << 32)
+                                            | (uint32_t)(ed.src_osm & 0xFFFFFFFF)] = cur;
+                        }
+                    }
                     offset += (uint32_t)it->second.size();
                 }
             }
@@ -351,10 +392,56 @@ public:
         }
 
         if (cells.empty()) return;
+
+        // Resolve OSM from_way/via/to_way to concrete global edge indices.
+        resolve_turn_restrictions(turn_refs);
+
         write_route_bin(cells);
     }
 
-private:
+    /**
+     * @brief Resolve the collected from-ways/via/to-ways into edge triples.
+     *
+     * A restriction (from_way → via node → to_way) becomes: the edge that
+     * enters `via` from `from_way`, the `via` node, and the edge that leaves
+     * `via` into `to_way` (the forbidden exit). Unresolvable pairs are skipped.
+     */
+    void resolve_turn_restrictions(const std::vector<nav::TurnRestrictionRef>& turn_refs)
+    {
+        turn_restrictions_.clear();
+
+        for (const auto& ref : turn_refs)
+        {
+            auto it = global_node_index_.find(ref.via_osm);
+            if (it == global_node_index_.end())
+                continue;
+            uint32_t via_global = it->second;
+
+            for (int64_t from_way : ref.from_ways)
+            {
+                auto in_it = edge_of_way_dst.find(((uint64_t)(uint32_t)from_way << 32)
+                                                  | (uint32_t)(ref.via_osm & 0xFFFFFFFF));
+                if (in_it == edge_of_way_dst.end())
+                    continue;
+
+                for (int64_t to_way : ref.to_ways)
+                {
+                    auto out_it = edge_of_way_src.find(((uint64_t)(uint32_t)to_way << 32)
+                                                       | (uint32_t)(ref.via_osm & 0xFFFFFFFF));
+                    if (out_it == edge_of_way_src.end())
+                        continue;
+
+                    nav::TurnRestriction tr;
+                    tr.via_node = via_global;
+                    tr.in_edge  = in_it->second;
+                    tr.out_edge = out_it->second;
+                    turn_restrictions_.push_back(tr);
+                }
+            }
+        }
+
+        printf("[GRAPH] Turn restrictions: %zu resolved\n", turn_restrictions_.size());
+    }private:
     struct CellData
     {
         int32_t                lat_e4;
@@ -370,6 +457,8 @@ private:
         uint8_t              hw_class;
         uint8_t              oneway;
         uint8_t              maxspeed;
+        uint8_t              surface;
+        int64_t              way_id;
     };
 
     struct SegmentData
@@ -382,12 +471,21 @@ private:
         uint8_t hw_class;
         uint8_t oneway;
         uint8_t maxspeed;
+        int64_t way_id;      // OSM way this segment belongs to (for turn restrictions)
+        uint8_t surface;     // 0=unknown 1=paved 2=unpaved 3=gravel 4=dirt 5=trail 6=sand
     };
 
     std::unordered_map<int64_t, int> node_ref_count_;
     std::vector<WayData>             ways_;
     std::string                      output_dir_;
     RoutingProfile                   profile_;
+
+    // Turn-restriction resolution state (filled during Pass 3 edge dump).
+    uint32_t                     edge_count_global_ = 0;
+    std::unordered_map<int64_t, uint32_t> global_node_index_;  // osm node id → global index
+    std::unordered_map<uint64_t, uint32_t> edge_of_way_dst;    // (way<<32)|dst_osm → global edge idx
+    std::unordered_map<uint64_t, uint32_t> edge_of_way_src;    // (way<<32)|src_osm → global edge idx
+    std::vector<nav::TurnRestriction> turn_restrictions_;
 
     static uint64_t cell_key_of(float lat, float lon)
     {
@@ -536,6 +634,7 @@ private:
         memcpy(hdr.magic, "ROUT", 4);
         hdr.sub_step_e4 = 500;
         hdr.cell_count  = (uint32_t)cells.size();
+        hdr.turn_count  = (uint32_t)turn_restrictions_.size();
         fwrite(&hdr, sizeof(hdr), 1, f);
 
         fwrite(index.data(), sizeof(CellIndexEntry), index.size(), f);
@@ -549,9 +648,13 @@ private:
                 fwrite(cd.edges.data(), sizeof(RouteEdge), cd.edges.size(), f);
         }
 
+        // Append the turn-restriction table (via_node, in_edge, out_edge).
+        if (hdr.turn_count > 0)
+            fwrite(turn_restrictions_.data(), sizeof(nav::TurnRestriction), hdr.turn_count, f);
+
         fclose(f);
-        printf("[GRAPH] Written: %s  (%zu cells, %u nodes, %u edges)\n",
-               path_buf, cells.size(), node_off, total_edges);
+        printf("[GRAPH] Written: %s  (%zu cells, %u nodes, %u edges, %u turn restrictions)\n",
+               path_buf, cells.size(), node_off, total_edges, hdr.turn_count);
     }
 };
 

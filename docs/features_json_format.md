@@ -51,7 +51,7 @@ Each entry in the JSON file is a key-value pair:
 
 ---
 
-## 4. Layer Priority System (v0.4.0)
+## 4. Layer Priority System
 
 The generator uses a simplified 16-level priority system (0-15). This value determines the rendering order within each of the four rendering passes. If multiple features have the same priority, their order is determined by their sequence in the PBF file.
 
