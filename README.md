@@ -45,30 +45,6 @@ cmake ..
 make -j$(nproc)
 ```
 
-## Docker
-
-The image carries the full toolchain, so the first container run compiles both binaries into `build/`
-when they are missing. The repository is mounted at its own path: every input and output stays exactly
-where it is today. Run the commands from the repository root.
-
-```bash
-docker compose build
-docker compose run --rm generator nav_generator <input.pbf> <output_dir> <features_json> [--zoom min-max] [--water-shp <path>]
-docker compose run --rm generator route_generator <input.pbf> <output_dir>
-```
-
-With Compose v1 the command is `docker-compose`; the file and the arguments are the same.
-
-### Viewer
-
-The `viewer` service opens `tile_viewer.py` on the host display through the mounted X11 socket:
-
-```bash
-xhost +si:localuser:"$USER"
-docker compose run --rm viewer python3 tile_viewer.py <nav_dir> --lat <lat> --lon <lon> [--config <features_json>]
-xhost -si:localuser:"$USER"
-```
-
 ## Usage
 
 ```bash
@@ -177,6 +153,30 @@ rsync -av ROUTE/  /media/sdcard/ROUTE/
 ```
 
 For the full binary format and profile speed tables see [`docs/route_generator.md`](docs/route_generator.md).
+
+## Docker
+
+The image carries the full toolchain, so the first container run compiles both binaries into `build/`
+when they are missing. The repository is mounted at its own path: every input and output stays exactly
+where it is today. Run the commands from the repository root.
+
+```bash
+docker compose build
+docker compose run --rm generator nav_generator <input.pbf> <output_dir> <features_json> [--zoom min-max] [--water-shp <path>]
+docker compose run --rm generator route_generator <input.pbf> <output_dir>
+```
+
+With Compose v1 the command is `docker-compose`; the file and the arguments are the same.
+
+### Viewer
+
+The `viewer` service opens `tile_viewer.py` on the host display through the mounted X11 socket:
+
+```bash
+xhost +si:localuser:"$USER"
+docker compose run --rm viewer python3 tile_viewer.py <nav_dir> --lat <lat> --lon <lon> [--config <features_json>]
+xhost -si:localuser:"$USER"
+```
 
 ## Internal Format Details
 
