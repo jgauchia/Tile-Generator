@@ -1,0 +1,12 @@
+version: "3.8"
+
+services:
+  generator:
+    build: .
+    image: tile-generator:local
+    working_dir: "${PWD}"
+    user: "${UID:-1000}:${GID:-1000}"
+    environment:
+      HOME: /tmp
+    volumes:
+      - "${PWD}:${PWD}"

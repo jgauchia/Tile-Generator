@@ -45,6 +45,20 @@ cmake ..
 make -j$(nproc)
 ```
 
+## Docker
+
+The image carries the full toolchain, so the first container run compiles both binaries into `build/`
+when they are missing. The repository is mounted at its own path: every input and output stays exactly
+where it is today. Run the commands from the repository root.
+
+```bash
+docker compose build
+docker compose run --rm generator nav_generator andorra-latest.osm.pbf NAVMAP features.json --zoom 6-17
+docker compose run --rm generator route_generator cataluna-latest.osm.pbf .
+```
+
+With Compose v1 the command is `docker-compose`; the file and the arguments are the same.
+
 ## Usage
 
 ```bash
