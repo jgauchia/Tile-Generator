@@ -10,3 +10,14 @@ services:
       HOME: /tmp
     volumes:
       - "${PWD}:${PWD}"
+
+  viewer:
+    image: tile-generator:local
+    working_dir: "${PWD}"
+    user: "${UID:-1000}:${GID:-1000}"
+    environment:
+      DISPLAY: "${DISPLAY}"
+      HOME: /tmp
+    volumes:
+      - "${PWD}:${PWD}"
+      - /tmp/.X11-unix:/tmp/.X11-unix:ro

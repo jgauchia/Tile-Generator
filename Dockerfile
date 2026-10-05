@@ -14,6 +14,7 @@ RUN apt-get update \
         nlohmann-json3-dev \
         python3 \
         python3-shapely \
+        python3-pygame \
         osmium-tool \
     && rm -rf /var/lib/apt/lists/*
 
