@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Vector map generator</title>
+<link rel="icon" href="/static/favicon.ico" sizes="16x16 32x32 48x48 64x64">
+<link rel="apple-touch-icon" href="/static/apple-touch-icon.png">
+<link rel="stylesheet" href="/static/vendor/leaflet.css">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div id="map"></div>
+<aside id="panel">
+  <div class="panelbody">
+    <header class="brand">
+      <img class="logo" src="/static/icenav_logo.png" alt="IceNav">
+      <h1>Vector map generator</h1>
+    </header>
+    <p class="hint">Scroll to zoom and drag to move the map. To pick the region, press
+      <strong>Draw area</strong> and drag on the map.</p>
+    <div class="modes">
+      <button type="button" id="mode" class="mode">Draw area</button>
+      <button type="button" id="clear" class="mode">Clear area</button>
+    </div>
+    <p class="bounds"><span id="bbox" class="boundskey" hidden>BBOX:&nbsp;</span><span id="rectangle">No area selected yet</span></p>
+    <div class="planrow">
+      <div id="plan" class="plan">Draw an area to see what it downloads.</div>
+      <button type="button" id="retry" class="retry" hidden>Retry</button>
+    </div>
+
+    <form id="form">
+      <label for="name">Map name</label>
+      <input id="name" name="name" placeholder="map-YYYYMMDD-HHMMSS">
+      <label for="route_name" id="routename" hidden>Route name</label>
+      <input id="route_name" name="route_name" placeholder="route-YYYYMMDD-HHMMSS" hidden>
+      <label for="zoom_min">Zoom min / max</label>
+      <div class="pair">
+        <input id="zoom_min" name="zoom_min" type="number" value="6" min="0" max="20" title="Zoom min">
+        <input id="zoom_max" name="zoom_max" type="number" value="17" min="0" max="20" title="Zoom max">
+      </div>
+      <label for="features">Features JSON</label>
+      <input id="features" name="features" value="features.json">
+      <label><span></span><input id="route" name="route" type="checkbox"> Route files</label>
+      <label><span></span><input id="water" name="water" type="checkbox"> Water shapefile</label>
+      <button type="submit" id="generate">Generate</button>
+    </form>
+
+    <div class="statusrow">
+      <p id="status">Idle</p>
+      <button type="button" id="cancel" class="retry" hidden>Cancel</button>
+      <button type="button" id="retryjob" class="retry" hidden>Retry job</button>
+    </div>
+    <div class="progress" id="progress" hidden>
+      <div class="progresshead">
+        <span id="progresslabel"></span>
+        <span id="progresszoom" hidden></span>
+      </div>
+      <div class="progressbar"><div id="progressfill"></div></div>
+      <p class="progressnote"><span class="noteKey" id="progresskey" hidden>elapsed</span><span id="progressdetail"></span></p>
+    </div>
+    <div id="result" class="result"></div>
+    <div id="stats" class="stats" hidden></div>
+  </div>
+  <footer class="attribution">
+    <p>
+      Map data: &copy;
+      <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap contributors</a>,
+      under the
+      <a href="https://opendatacommons.org/licenses/odbl/" target="_blank" rel="noopener">Open Database License</a>.
+    </p>
+    <p>
+      Region index and PBF extracts from
+      <a href="https://download.geofabrik.de/" target="_blank" rel="noopener">Geofabrik</a>.
+    </p>
+    <p>
+      Base map from
+      <a href="https://www.naturalearthdata.com/" target="_blank" rel="noopener">Natural Earth</a>
+      (public domain). Map drawn with
+      <a href="https://leafletjs.com/" target="_blank" rel="noopener">Leaflet</a> (BSD-2-Clause).
+    </p>
+  </footer>
+</aside>
+<script src="/static/vendor/leaflet.js"></script>
+<script src="/static/app.js"></script>
+</body>
+</html>

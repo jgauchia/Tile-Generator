@@ -12,13 +12,15 @@ The `--water-shp` option is **optional** -- inland users can skip it entirely to
 
 ## Setup
 
-Download the WGS84 shapefile (once, ~540 MB):
+Download the WGS84 shapefile (once, ~900 MB):
 ```bash
 wget https://osmdata.openstreetmap.de/download/water-polygons-split-4326.zip
 unzip water-polygons-split-4326.zip
 ```
 
-This creates `water-polygons-split-4326/water_polygons.shp` and associated files.
+This creates `water-polygons-split-4326/water_polygons.shp` and associated files (~1.2 GB).
+
+The web service does this step for you the first time the water option is used.
 
 ## Usage
 
