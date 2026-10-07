@@ -1,0 +1,532 @@
+:root {
+  color-scheme: dark;
+  font-family: system-ui, sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+}
+
+/* Only the body lays out its children: a flex html would shrink the body to the
+   width of the panel and leave the map with no room at all. */
+body {
+  display: flex;
+  background: #0b1a2b;
+  color: #e6edf3;
+}
+
+#map {
+  flex: 1;
+  background: #0b1a2b;
+  user-select: none;
+  min-width: 0;
+}
+
+/* The panel is a column of two: what the job needs to be set up and watched,
+   which scrolls, and the credits, which stay pinned at its bottom. The room of
+   the credits is never taken by the list above, so whatever grows (the plan,
+   the progress, the packs) scrolls over it. */
+#panel {
+  display: flex;
+  flex-direction: column;
+  width: 27rem;
+  overflow: hidden;
+  background: #101c2b;
+  border-left: 1px solid #24374d;
+}
+
+.panelbody {
+  flex: 1;
+  min-height: 0;
+  padding: 1rem 1.2rem;
+  overflow-y: auto;
+}
+
+/* The header is a block of its own: a hairline and a little room keep the hint
+   away from it, the way the form is kept away from the plan. */
+.brand {
+  padding-bottom: .75rem;
+  border-bottom: 1px solid #1b2b3d;
+  text-align: center;
+}
+
+.brand .logo {
+  display: block;
+  width: 13rem;
+  margin: 0 auto .5rem;
+}
+
+h1 {
+  margin: 0;
+  font-size: 1.2rem;
+}
+
+.hint, .bounds {
+  margin: .2rem 0;
+  font-size: .82rem;
+  line-height: 1.45;
+  color: #93a6bb;
+}
+
+.hint {
+  margin-top: .6rem;
+}
+
+/* The coordinates sit between the buttons and the plan with the same room above
+   and below, behind a label that says what the two pairs of numbers are. */
+.bounds {
+  margin: .6rem 0 0;
+  font-family: monospace;
+  color: #cfe3f7;
+}
+
+.boundskey {
+  color: #93a6bb;
+}
+
+.plan {
+  margin: .6rem 0;
+  padding: .5rem .6rem;
+  font-size: .78rem;
+  font-family: monospace;
+  white-space: pre-wrap;
+  background: #0a1420;
+  border: 1px solid #24374d;
+  border-radius: 4px;
+  max-height: 12rem;
+  overflow-y: auto;
+}
+
+/* The plan keeps its size and scrolls inside: the thin bar is the only hint
+   that the list of regions goes on below. */
+.plan {
+  scrollbar-width: thin;
+  scrollbar-color: #3f6ea8 #0a1420;
+}
+
+.plan.ok {
+  border-color: #3f6ea8;
+}
+
+.plan.bad {
+  border-color: #7a2f2f;
+  color: #ffb4b4;
+}
+
+/* The plan is a list of lines: one for each figure of the area and one for each
+   region, with the state of that region as a chip of its own colour. */
+.prow {
+  display: flex;
+  gap: .5rem;
+  align-items: baseline;
+}
+
+.prow .plankey {
+  flex: 0 0 4.6rem;
+  color: #93a6bb;
+}
+
+.prow .regionname {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.prow .regionsize {
+  flex: 0 0 auto;
+  color: #b7c7d8;
+}
+
+.prow .regionage {
+  flex: 0 0 auto;
+  color: #93a6bb;
+}
+
+.prow .regionwarn {
+  flex: 0 0 auto;
+  color: #ffb4b4;
+}
+
+.chip {
+  flex: 0 0 4.8rem;
+  padding: .05rem .3rem;
+  font-family: system-ui, sans-serif;
+  font-size: .68rem;
+  text-align: center;
+  text-transform: uppercase;
+  letter-spacing: .02em;
+  border-radius: 3px;
+}
+
+/* The colour of the chip is the colour of what is about to happen to it: the
+   copy that is already here, the one that will be downloaded, the one that is
+   too old to use, and the two ways a cached file leaves the cache. */
+.chip.cached {
+  color: #9fe6b4;
+  background: #1d3b28;
+}
+
+.chip.download {
+  color: #a9cdf5;
+  background: #16304d;
+}
+
+.chip.refresh {
+  color: #ffd9a0;
+  background: #3d2f16;
+}
+
+.chip.partial {
+  color: #ffc6c6;
+  background: #3d1f22;
+}
+
+.chip.other {
+  color: #cbb9e8;
+  background: #2b2340;
+}
+
+/* The retry button only exists while the plan failed for a reason that asking
+   again can fix, so it lives and dies with the message next to it. */
+.planrow {
+  display: flex;
+  gap: .4rem;
+  align-items: flex-start;
+}
+
+.planrow .plan {
+  flex: 1;
+  min-width: 0;
+}
+
+.retry {
+  flex: 0 0 auto;
+  align-self: center;
+  padding: .4rem .7rem;
+  font: inherit;
+  font-size: .78rem;
+  color: #cfe3f7;
+  background: #1b3855;
+  border: 1px solid #3f6ea8;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.retry:hover {
+  background: #24476b;
+}
+
+/* The status line and the buttons that act on the job that is running (or has
+   just failed): cancel while it runs, retry once it stopped. */
+.statusrow {
+  display: flex;
+  gap: .4rem;
+  align-items: center;
+  margin-top: .9rem;
+  padding-top: .9rem;
+  border-top: 1px solid #1b2b3d;
+}
+
+.statusrow #status {
+  flex: 1;
+  min-width: 0;
+}
+
+/* The panel is three areas -- pick the area, fill the form, watch the job --
+   and a hairline keeps them apart without shouting. */
+form {
+  display: grid;
+  grid-template-columns: 8rem 1fr;
+  gap: .35rem .6rem;
+  align-items: center;
+  margin: .8rem 0 0;
+  padding-top: .9rem;
+  border-top: 1px solid #1b2b3d;
+}
+
+label {
+  text-align: left;
+  font-size: .82rem;
+  color: #b7c7d8;
+}
+
+/* The two zoom bounds share one row, next to each other and small. */
+.pair {
+  display: flex;
+  gap: .4rem;
+}
+
+.pair input[type="number"] {
+  flex: 0 0 auto;
+  width: 4rem;
+}
+
+input[type="text"], input[type="number"], input:not([type]) {
+  font: inherit;
+  font-size: .85rem;
+  padding: .2rem .35rem;
+  color: #e6edf3;
+  background: #0a1420;
+  border: 1px solid #24374d;
+  border-radius: 4px;
+  width: 100%;
+}
+
+/* The buttons carry the brighter end of the blues of the panel; the greens are
+   left to what a colour has to mean (a cached region, a job that came out
+   well), never to something to press. */
+button {
+  font: inherit;
+  padding: .35rem;
+  color: #06172b;
+  background: #4f9bf0;
+  border: 0;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+#generate {
+  grid-column: 1 / -1;
+  justify-self: center;
+  width: 12rem;
+  margin-top: .4rem;
+}
+
+button:disabled {
+  opacity: .5;
+  cursor: default;
+}
+
+.modes {
+  display: flex;
+  gap: .4rem;
+  margin: .5rem 0 0;
+}
+
+.mode {
+  flex: 1;
+  padding: .45rem;
+  font: inherit;
+  color: #cfe3f7;
+  background: #1b3855;
+  border: 1px solid #3f6ea8;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.mode.active {
+  color: #06172b;
+  background: #4f9bf0;
+  border-color: #4f9bf0;
+}
+
+/* While drawing, the map must not advertise the hand that moves it. */
+#map.drawing,
+#map.drawing .leaflet-grab,
+#map.drawing.leaflet-grab {
+  cursor: crosshair !important;
+}
+
+/* The label of the area of the job, over the map: the dark box of the panel,
+   so it reads as part of the tool and not as a feature of the map. */
+.leaflet-tooltip.joblabel {
+  padding: .15rem .5rem;
+  font-size: .72rem;
+  color: #cfe3f7;
+  background: #101c2b;
+  border: 1px solid #24374d;
+  border-radius: 3px;
+  box-shadow: 0 1px 4px #00000066;
+}
+
+#status {
+  font-weight: 600;
+  font-size: .85rem;
+}
+
+/* The status line carries the colour of the state it tells: what the job is
+   doing, and what came of it. */
+#status.running {
+  color: #cfe3f7;
+}
+
+#status.done {
+  color: #6fb3f5;
+}
+
+#status.cancelled {
+  color: #ffd9a0;
+}
+
+#status.failed {
+  color: #ff9f9f;
+}
+
+/* The bars of the job.  The one on top is the step that is running, with the
+   numbers it prints (the bytes of a download, the tiles of a zoom); under it
+   comes the job as a whole, which counts zooms: one step per zoom asked for.
+   The label never wraps and the numbers get a line of their own, so a long step
+   cannot push them around. */
+.progress {
+  margin: .5rem 0 0;
+}
+
+.progresshead {
+  display: flex;
+  gap: .5rem;
+  align-items: baseline;
+  justify-content: space-between;
+  margin-bottom: .3rem;
+  font-size: .78rem;
+  color: #b7c7d8;
+}
+
+.progresshead #progresslabel {
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+/* The zoom of the tiles, written out beside the name of the step (`zoom
+   14/17`): the same line, no box of its own. */
+.progresshead #progresszoom {
+  flex: 0 0 auto;
+  font-family: monospace;
+  font-size: .7rem;
+  color: #a9cdf5;
+}
+
+.progressnote {
+  margin: .3rem 0 0;
+  font-family: monospace;
+  font-size: .72rem;
+  color: #c7d3e0;
+}
+
+.noteKey {
+  margin-right: .45rem;
+  color: #93a6bb;
+}
+
+.progressbar {
+  height: .5rem;
+  overflow: hidden;
+  background: #0a1420;
+  border: 1px solid #24374d;
+  border-radius: 999px;
+}
+
+/* The bar is of the blues of the panel, not of the green the buttons carry: it
+   reports, it is not something to press.  The page only sets its width, so a
+   fill with no colour and no height of its own draws nothing at all: the fill of
+   the bar of the whole job was like that, an empty track as wide as it should
+   be, and that bar is gone (the user kept only the one of the tiles). */
+#progressfill {
+  width: 0;
+  height: 100%;
+  background: #4a86c8;
+  transition: width .35s linear;
+}
+
+/* A step that cannot say how far along it is (a merge, a clip) shows a bar
+   that moves rather than a fraction that would be made up. */
+.progress.unknown #progressfill {
+  width: 100%;
+  background-image: repeating-linear-gradient(115deg, #22405f 0 .5rem, #3f6ea8 .5rem 1rem);
+  background-size: 200% 100%;
+  animation: progress-sweep 1.1s linear infinite;
+}
+
+@keyframes progress-sweep {
+  from { background-position: 0 0; }
+  to { background-position: -2rem 0; }
+}
+
+/* The figures of a job that is over, under the packs it left: the same rows as
+   the plan, in a box of its own where the log box used to be, with the key to
+   the left and the figure to the right. */
+.stats {
+  margin-top: .5rem;
+  padding: .5rem .6rem;
+  font-family: monospace;
+  font-size: .78rem;
+  background: #0a1420;
+  border: 1px solid #24374d;
+  border-radius: 4px;
+}
+
+.stats .prow .plankey {
+  flex: 0 0 5.6rem;
+}
+
+.stats .prow .planval {
+  flex: 1;
+  text-align: right;
+  color: #cfe3f7;
+}
+
+/* The time of each step, under the total it adds up to. */
+.stats .prow.sub {
+  padding: .1rem 0 0 .8rem;
+  color: #b7c7d8;
+}
+
+.stats .prow.sub .plankey {
+  flex: 0 0 4.8rem;
+  color: #8fa3b8;
+}
+
+/* The data behind a map is not the work of this tool and its licence asks for
+   the credit to be at hand while a map is generated: the footer is pinned to
+   the bottom of the panel, outside the part that scrolls. */
+.attribution {
+  flex: 0 0 auto;
+  padding: .55rem 1.2rem .75rem;
+  border-top: 1px solid #24374d;
+  background: #101c2b;
+  font-size: .72rem;
+  line-height: 1.45;
+  color: #7f93a8;
+}
+
+.attribution p {
+  margin: 0 0 .3rem;
+}
+
+.attribution p:last-child {
+  margin-bottom: 0;
+}
+
+.attribution a {
+  color: #8fb8e8;
+}
+
+.result a {
+  display: block;
+  margin: .3rem 0;
+  color: #8fb8e8;
+  font-size: .85rem;
+}
+
+/* The packs are the point of the run, so they are buttons and not links. */
+.result a.download {
+  margin: .45rem 0;
+  padding: .45rem .7rem;
+  font-weight: 600;
+  text-align: center;
+  color: #06172b;
+  background: #4f9bf0;
+  border-radius: 4px;
+  text-decoration: none;
+}
+
+.result a.download:hover {
+  background: #74b3f5;
+}
