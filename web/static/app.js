@@ -91,15 +91,10 @@ function showBounds() {
   elements.bbox.hidden = false;
 }
 
-/* The map moves like any other map; drawing is a mode of its own, so the hand
-   that moves the view is never the one that draws.  Shift+drag draws from
-   either mode, and the map goes back to moving once the area is picked.
-
-   The button says the same thing whether or not the map is waiting: the area
-   is picked by dragging and the drag ends by itself on release, so there is no
-   drawing to stop and nothing else for it to be called.  Waiting shows as the
-   button lit and the map under the crosshair, and pressing it again calls the
-   drawing off. */
+/* Drawing is a mode of its own, so the hand that moves the view never draws:
+   shift+drag draws from either mode, and the map goes back to moving once the
+   area is picked.  The button keeps its name while it waits (lit, under the
+   crosshair) and pressing it again calls the drawing off. */
 
 function setDrawMode(enabled) {
   drawMode = enabled;
@@ -111,15 +106,11 @@ function setDrawMode(enabled) {
 
 elements.mode.addEventListener('click', () => setDrawMode(!drawMode));
 
-/* Start over: no rectangle, no preview, no highlight, no mark of a job.
-
-   The packs of the job are part of what is left over, so `Clear area` starts the
-   service over as well: it asks for the packs of the jobs that are over to be
-   deleted — the state a download would have left them in — and takes back what
-   was on offer, the buttons of the packs and the box of figures.  Nothing is
-   taken back while the service keeps a pack (it is being streamed to the browser)
-   or while the request fails: a button for a pack that is still on disk has to
-   stay.  The form is left alone; it is not a thing the area carried. */
+/* Start over: no rectangle, no preview, no highlight, no mark of a job.  The
+   packs are part of what is left over, so it also asks for the packs of the jobs
+   that are over to be deleted and takes back their buttons and figures.  Nothing
+   is taken back while a pack is being streamed or while the request fails, and
+   the form is left alone: it is not a thing the area carried. */
 
 function clearOffer() {
   elements.result.textContent = '';
@@ -571,11 +562,10 @@ async function poll(job) {
   }
 }
 
-/* The bar of the step that is running.  The chain reports how far along it is in
-   two ways: a download counts bytes, and the tile generator counts the tiles of
-   the zoom it is building, which is the only step that knows its own length.  A
-   step with no number of its own (a merge, a clip) shows the bar as working,
-   never as a fraction the page made up, and says how long it has been running. */
+/* The bar of the step that is running: a download counts bytes, and the tile
+   generator counts the tiles of the zoom it is building.  A step with no number
+   of its own shows the bar as working, never as a fraction the page made up,
+   and says how long it has been running. */
 
 let stepKey = null;
 let stepStarted = 0;
@@ -602,11 +592,8 @@ function updateProgress(state, progress) {
   elements.progressDetail.textContent = known
     ? progressNumbers(progress)
     : humanElapsed(Math.floor((Date.now() - stepStarted) / 1000));
-  // The zoom being built is named beside the step, where it was: `zoom 14/17`.
-  // It is the only count of the whole job that is known while the tiles are
-  // built: the tiles of the zooms still to come are not known until each one
-  // starts, so a bar for the whole job would have to guess them, and it is not
-  // drawn.
+  // The zoom being built is the only count of the whole job: the tiles of the
+  // zooms still to come are unknown, so no bar for the whole job is drawn.
   const zooming = progress.zoom !== null;
   elements.progressZoom.hidden = !zooming;
   elements.progressZoom.textContent = zooming ? `zoom ${progress.zoom}/${progress.zoom_max}` : '';

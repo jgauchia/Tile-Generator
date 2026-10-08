@@ -368,11 +368,9 @@ button:disabled {
   color: #ff9f9f;
 }
 
-/* The bars of the job.  The one on top is the step that is running, with the
-   numbers it prints (the bytes of a download, the tiles of a zoom); under it
-   comes the job as a whole, which counts zooms: one step per zoom asked for.
-   The label never wraps and the numbers get a line of their own, so a long step
-   cannot push them around. */
+/* The bar of the step that is running, with the numbers it prints (the bytes of
+   a download, the tiles of a zoom).  The label never wraps and the numbers get a
+   line of their own, so a long step cannot push them around. */
 .progress {
   margin: .5rem 0 0;
 }
@@ -424,10 +422,8 @@ button:disabled {
 }
 
 /* The bar is of the blues of the panel, not of the green the buttons carry: it
-   reports, it is not something to press.  The page only sets its width, so a
-   fill with no colour and no height of its own draws nothing at all: the fill of
-   the bar of the whole job was like that, an empty track as wide as it should
-   be, and that bar is gone (the user kept only the one of the tiles). */
+   reports, it is not something to press.  The page only sets its width, so the
+   fill needs its own colour and height. */
 #progressfill {
   width: 0;
   height: 100%;
@@ -450,8 +446,7 @@ button:disabled {
 }
 
 /* The figures of a job that is over, under the packs it left: the same rows as
-   the plan, in a box of its own where the log box used to be, with the key to
-   the left and the figure to the right. */
+   the plan, with the key to the left and the figure to the right. */
 .stats {
   margin-top: .5rem;
   padding: .5rem .6rem;

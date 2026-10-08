@@ -60,15 +60,3 @@ def stream_zip(directory, arcname=""):
         if chunk is None:
             break
         yield chunk
-
-
-def _main():
-    import sys
-
-    with open(sys.argv[2], "wb") as handle:
-        for chunk in stream_zip(sys.argv[1]):
-            handle.write(chunk)
-
-
-if __name__ == "__main__":
-    _main()

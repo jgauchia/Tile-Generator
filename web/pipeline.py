@@ -56,15 +56,12 @@ class Pipeline:
         """Run a command in the repository root, streaming its output to the log.
 
         Every chunk reaches the log with the line ending it came with: the
-        generators redraw their progress bar with a carriage return, and only
-        the log can tell that redraw from a line of its own.  Universal
-        newlines would turn it into a new line before it gets there.  The same
-        chunk carries the numbers of that bar, which the page draws as a bar.
+        generators redraw their bar with a carriage return, and only the log can
+        tell that redraw from a line of its own.  The same chunk carries the
+        numbers of that bar, which the page draws as a bar.
 
-        ``quiet`` keeps the command line out of the log.  It is for the tools
-        whose call is a wall of absolute paths and whose step the bar of the
-        job already names, so the box of logs has nothing to gain from it; a
-        command that fails still says which one it was.
+        ``quiet`` keeps the command line out of the log; a command that fails
+        still says which one it was.
         """
         if self.cancelled.is_set():
             raise PipelineError("cancelled by the user")
@@ -115,11 +112,9 @@ class Pipeline:
     def fetch_regions(self, regions):
         """Delete what the area does not need and download what it is missing.
 
-        The deletions are the ones the plan announced before the button was
-        pressed.  A cached copy that the published file has left behind is
-        downloaded again, over itself, so a failed download still leaves the
-        old copy in place.  A copy the freshness probe could not confirm is
-        kept: a check that failed is not a reason to throw data away.
+        The deletions are the ones the plan announced.  A stale copy is
+        downloaded again over itself, so a failed download leaves the old copy
+        in place, and a copy the freshness probe could not confirm is kept.
         """
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.progress.step("download", "Checking the cached copies")
@@ -156,13 +151,10 @@ class Pipeline:
     def merge(self, files, destination):
         """Combine the inputs into one file with one version of every object.
 
-        Geofabrik extracts share whole ways and relations along their borders,
-        and a cached copy from another day carries another version of them.
-        ``osmium merge`` keeps every version it is given (its manual documents
-        it for history files) and ``osmium extract`` refuses an input with a
-        repeated ID ("Way ID twice in input"), so the merge is followed by a
-        pass of ``osmium time-filter`` with no instant: the newest version of
-        each object and nothing else, which is the file the engine can read.
+        Geofabrik extracts share ways and relations along their borders, so
+        ``osmium merge`` keeps repeated versions of them, and ``osmium extract``
+        refuses an input with a repeated ID.  ``osmium time-filter`` with no
+        instant keeps the newest version of each object and nothing else.
         """
         destination = Path(destination)
         destination.parent.mkdir(parents=True, exist_ok=True)

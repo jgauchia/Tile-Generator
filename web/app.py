@@ -34,9 +34,11 @@ DEFAULT_WATER_SHAPE = "water-polygons-split-4326/water_polygons.shp"
 LOG_TAIL_LINES = 200
 ZOOM_MIN = 0
 ZOOM_MAX = 20
-# The name of the route pack ends up in the name of the file the browser saves,
-# so it is kept to what a file name carries: letters, digits, spaces, dots,
-# dashes and underscores.
+DEFAULT_ZOOM_MIN = 6
+DEFAULT_ZOOM_MAX = 17
+# The names of the map and the route pack end up in the name of the file the
+# browser saves, so they are kept to what a file name carries: letters, digits,
+# spaces, dots, dashes and underscores.
 PLAIN_NAME = re.compile(r"^[A-Za-z0-9 ._-]{1,80}$")
 
 app = Flask(__name__, static_folder=str(STATIC_DIR), static_url_path="/static")
@@ -67,7 +69,7 @@ def _water_extra(payload):
 
 
 def _log_lines(log_path):
-    """The tail of the job log, as the page shows it."""
+    """The tail of the job log that the API hands back."""
     try:
         return log_path.read_text(encoding="utf-8", errors="replace").splitlines()[-LOG_TAIL_LINES:]
     except FileNotFoundError:
@@ -108,10 +110,9 @@ def _dir_bytes(directory):
 
 
 def _area_km2(bbox):
-    """The area of the rectangle, near enough: a degree of latitude is 110.57 km
-    everywhere and a degree of longitude is 111.32 km shrunk by the cosine of the
-    latitude (so a degree is 80.06 km at 44 degrees north).  Under one percent off
-    for the rectangles this tool is given."""
+    """The area of the rectangle: a degree of latitude is 110.57 km and a degree
+    of longitude is 111.32 km shrunk by the cosine of the latitude.  Under one
+    percent off at this scale."""
     west, south, east, north = bbox
     middle = math.radians((south + north) / 2)
     return (east - west) * 111.32 * math.cos(middle) * (north - south) * 110.57
@@ -157,6 +158,45 @@ def _describe(plan):
             mark = "partial" if item["partial"] else "other area"
             lines.append(f"  {mark:11} {item['name']} ({item['size'] / 1e6:.1f} MB)")
     return lines
+
+
+def _validate_payload(payload):
+    """Everything a new job needs from the form, checked before it exists."""
+    name = (payload.get("name") or "").strip() or time.strftime("map-%Y%m%d-%H%M%S")
+    if not PLAIN_NAME.match(name):
+        raise ValueError("map name may only carry letters, digits, spaces, "
+                         "dots, dashes and underscores")
+    output = (payload.get("output") or "").strip() or f"out/{name}"
+    features = _existing_file("features JSON", (payload.get("features") or DEFAULT_FEATURES).strip())
+    zoom_min = int(payload.get("zoom_min", DEFAULT_ZOOM_MIN))
+    zoom_max = int(payload.get("zoom_max", DEFAULT_ZOOM_MAX))
+    if not ZOOM_MIN <= zoom_min <= zoom_max <= ZOOM_MAX:
+        raise ValueError(f"zoom range must satisfy {ZOOM_MIN} <= min <= max <= {ZOOM_MAX}")
+    bbox = _parse_bbox(payload) if payload.get("bbox") else None
+    input_pbf = None
+    if bbox is None:
+        input_pbf = _existing_file("input PBF", (payload.get("input") or "").strip())
+    water = bool(payload.get("water"))
+    route = bool(payload.get("route"))
+    # The route pack has a name of its own, named after the clock when
+    # the field is left empty, the way the map does.
+    route_name = (payload.get("route_name") or "").strip() if route else ""
+    if route:
+        route_name = route_name or time.strftime("route-%Y%m%d-%H%M%S")
+        if not PLAIN_NAME.match(route_name):
+            raise ValueError("route name may only carry letters, digits, spaces, "
+                             "dots, dashes and underscores")
+    return {
+        "name": name,
+        "route_name": route_name,
+        "output": output,
+        "features": str(features),
+        "zoom": [zoom_min, zoom_max],
+        "bbox": bbox,
+        "input": input_pbf,
+        "water": water,
+        "route": route,
+    }
 
 
 def _run_job(job, spec):
@@ -227,9 +267,8 @@ def config():
         {
             "features": DEFAULT_FEATURES,
             "water_ready": _repo_path(DEFAULT_WATER_SHAPE).is_file(),
-            "zoom_min": 6,
-            "zoom_max": 17,
-            "free_bytes": geofabrik.free_space(REPO_ROOT),
+            "zoom_min": DEFAULT_ZOOM_MIN,
+            "zoom_max": DEFAULT_ZOOM_MAX,
         }
     )
 
@@ -277,31 +316,11 @@ def generate():
         if any(job["state"] == "running" for job in _jobs.values()):
             return jsonify({"error": "a job is already running"}), 409
         try:
-            name = (payload.get("name") or "").strip() or time.strftime("map-%Y%m%d-%H%M%S")
-            output = (payload.get("output") or "").strip() or f"out/{name}"
-            features = _existing_file("features JSON", (payload.get("features") or DEFAULT_FEATURES).strip())
-            zoom_min = int(payload.get("zoom_min", 6))
-            zoom_max = int(payload.get("zoom_max", 17))
-            if not ZOOM_MIN <= zoom_min <= zoom_max <= ZOOM_MAX:
-                raise ValueError(f"zoom range must satisfy {ZOOM_MIN} <= min <= max <= {ZOOM_MAX}")
-            bbox = _parse_bbox(payload) if payload.get("bbox") else None
-            input_pbf = None
-            if bbox is None:
-                input_pbf = _existing_file("input PBF", (payload.get("input") or "").strip())
-            water = bool(payload.get("water"))
-            route = bool(payload.get("route"))
-            # The route pack has a name of its own, named after the clock when
-            # the field is left empty, the way the map does.
-            route_name = (payload.get("route_name") or "").strip() if route else ""
-            if route:
-                route_name = route_name or time.strftime("route-%Y%m%d-%H%M%S")
-                if not PLAIN_NAME.match(route_name):
-                    raise ValueError("route name may only carry letters, digits, spaces, "
-                                     "dots, dashes and underscores")
+            spec = _validate_payload(payload)
         except (ValueError, TypeError) as error:
             return jsonify({"error": str(error)}), 400
 
-        output_dir = _repo_path(output)
+        output_dir = _repo_path(spec["output"])
         navmap_dir = output_dir / "NAVMAP"
         route_dir = output_dir / "ROUTE"
         LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -310,8 +329,8 @@ def generate():
 
         job = {
             "id": job_id,
-            "name": name,
-            "route_name": route_name or None,
+            "name": spec["name"],
+            "route_name": spec["route_name"] or None,
             "state": "running",
             "error": None,
             "output_dir": output_dir,
@@ -320,22 +339,14 @@ def generate():
             "log_path": log_path,
             "started": time.time(),
             "finished": None,
-            "bbox": bbox,
-            "route": route,
+            "bbox": spec["bbox"],
+            "route": spec["route"],
             "cancel": threading.Event(),
-            "progress": Progress(zoom_min, zoom_max),
+            "progress": Progress(*spec["zoom"]),
             "pipeline": None,
             "downloaded": set(),
             "downloading": None,
             "cleaned": False,
-        }
-        spec = {
-            "bbox": bbox,
-            "input": input_pbf,
-            "features": str(features),
-            "zoom": [zoom_min, zoom_max],
-            "water": water,
-            "route": route,
         }
         _jobs[job_id] = job
         threading.Thread(target=_run_job, args=(job, spec), daemon=True).start()
@@ -343,7 +354,7 @@ def generate():
             {
                 "job": job_id,
                 # The page names the map, never the folder it is written in.
-                "name": name,
+                "name": spec["name"],
                 "route_name": job["route_name"],
                 "output": _relative(output_dir),
                 "navmap": _relative(navmap_dir),
@@ -352,39 +363,40 @@ def generate():
         ), 202
 
 
+def _job_view(job):
+    """The state of a job, the way the page polls it."""
+    return {
+        "id": job["id"],
+        "name": job["name"],
+        "route_name": job["route_name"],
+        "state": job["state"],
+        "error": job["error"],
+        "output": None if job["cleaned"] else _relative(job["output_dir"]),
+        "navmap": None if job["cleaned"] else _relative(job["navmap_dir"]),
+        "route": None if job["cleaned"] or not job["route_dir"].exists()
+        else _relative(job["route_dir"]),
+        "cleaned": job["cleaned"],
+        "progress": job["progress"].snapshot(),
+        "stats": _stats(job) if job["state"] == "done" else None,
+        "log": _log_lines(job["log_path"]),
+    }
+
+
 @app.get("/api/job/<job_id>")
 def job_status(job_id):
     job = _jobs.get(job_id)
     if job is None:
         return jsonify({"error": "unknown job"}), 404
-    return jsonify(
-        {
-            "id": job["id"],
-            "name": job["name"],
-            "route_name": job["route_name"],
-            "state": job["state"],
-            "error": job["error"],
-            "output": None if job["cleaned"] else _relative(job["output_dir"]),
-            "navmap": None if job["cleaned"] else _relative(job["navmap_dir"]),
-            "route": None if job["cleaned"] or not job["route_dir"].exists()
-            else _relative(job["route_dir"]),
-            "cleaned": job["cleaned"],
-            "progress": job["progress"].snapshot(),
-            "stats": _stats(job) if job["state"] == "done" else None,
-            "log": _log_lines(job["log_path"]),
-        }
-    )
+    return jsonify(_job_view(job))
 
 
 @app.post("/api/jobs/clear")
 def clear_packs():
     """Start over: the packs of the jobs that are over are deleted, the way a
-    download would have deleted them, and the page takes back their buttons.
+    download would have deleted them.
 
-    Nothing is touched while a chain is writing its folder, and nothing is
-    touched while an archive is being streamed out of it: deleting the pack of a
-    download in flight would break it under the user's feet.  A job that is left
-    alone is named in the answer, so what was kept is not a mystery.
+    Nothing is touched while a chain is writing its folder or streaming an
+    archive out of it, and a job that is left alone is named in the answer.
     """
     cleared, kept = [], []
     with _lock:

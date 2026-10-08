@@ -69,7 +69,7 @@ def _request(url, method):
     return urllib.request.Request(url, method=method, headers={"User-Agent": USER_AGENT})
 
 
-def load_index(cache_dir, log=None, force=False):
+def load_index(cache_dir):
     """Return the Geofabrik index, refreshing the cached copy once a day.
 
     A failed refresh keeps the cached copy: the service keeps working offline.
@@ -78,16 +78,12 @@ def load_index(cache_dir, log=None, force=False):
     cache_dir.mkdir(parents=True, exist_ok=True)
     path = cache_dir / INDEX_FILE
     age = time.time() - path.stat().st_mtime if path.is_file() else None
-    if force or age is None or age > INDEX_MAX_AGE:
+    if age is None or age > INDEX_MAX_AGE:
         try:
-            if log:
-                log("refreshing the Geofabrik index")
             download(INDEX_URL, path)
         except OSError as error:
             if not path.is_file():
                 raise
-            if log:
-                log(f"keeping the cached index ({error})")
     return json.loads(path.read_text())
 
 
@@ -135,13 +131,10 @@ def map_regions(index):
 def select_regions(index, bbox):
     """Smallest set of regions whose polygons cover the rectangle.
 
-    Regions are taken from the smallest polygon up, so a rectangle inside
-    Cataluna only pulls Cataluna and one straddling France and Spain pulls the
-    two border regions instead of the whole countries.
-
-    A parent of an already chosen region is never added: the parent would cover
-    whatever the region left, which is usually sea, at the price of a whole
-    continent.  The leftover stays uncovered and is reported as coverage.
+    Regions are taken from the smallest polygon up, so a rectangle on the border
+    pulls the two border regions instead of the whole countries.  A parent of an
+    already chosen region is never added: it would cover the leftover, usually
+    sea, at the price of a continent, and the leftover is reported as coverage.
     """
     target = bbox_polygon(bbox)
     target_area = target.area
@@ -201,13 +194,10 @@ def _published_epoch(value):
 def remote_info(url):
     """Size and publication date of a Geofabrik file, from its first byte.
 
-    A HEAD request is not usable any more: the download servers answer the
-    redirect of a ``-latest.osm.pbf`` URL with the headers of the redirect
-    itself and then never send those of the final response, so the probe sits
-    there until the timeout and the plan fails.  Asking for a single byte
-    follows the redirect, answers in half a second and reports the full size in
-    Content-Range and the publication date in Last-Modified, both of them in
-    the same request.
+    A HEAD on a ``-latest.osm.pbf`` URL is not usable: the servers answer it
+    with the headers of the redirect and then never send the final response.
+    A one-byte GET follows the redirect and reports the full size in
+    Content-Range and the date in Last-Modified, both in the same request.
     """
     request = _request(url, "GET")
     request.add_header("Range", "bytes=0-0")
@@ -379,18 +369,17 @@ def plan(bbox, cache_dir, disk_path, extra_bytes=0):
                         # The published file replaces the stale copy.
                         region["size"] = size
 
-    regions = selected
-    total = sum(region["size"] for region in regions)
-    missing = sum(region["size"] for region in regions
+    total = sum(region["size"] for region in selected)
+    missing = sum(region["size"] for region in selected
                   if not region["cached"] or region["stale"])
     # A rectangle no region covers deletes nothing: there is no area to keep.
-    deletions = cache_deletions(cache_dir, {region["file"] for region in regions}) if regions else []
+    deletions = cache_deletions(cache_dir, {region["file"] for region in selected}) if selected else []
     required = required_space(total, missing) + extra_bytes
     free = free_space(disk_path)
     return {
         "bbox": list(bbox),
         "coverage": coverage,
-        "regions": regions,
+        "regions": selected,
         "deletes": deletions,
         "frees_bytes": sum(item["size"] for item in deletions),
         "total_bytes": total,
@@ -400,23 +389,3 @@ def plan(bbox, cache_dir, disk_path, extra_bytes=0):
         "free_bytes": free,
         "fits": free >= required,
     }
-
-
-def _main():
-    import sys
-
-    bbox = [float(value) for value in sys.argv[1:5]]
-    cache_dir = Path(__file__).resolve().parent.parent / "cache"
-    report = plan(bbox, cache_dir, cache_dir.parent)
-    print(f"coverage: {report['coverage'] * 100:.1f}%")
-    for region in report["regions"]:
-        mark = "cached" if region["cached"] else "download"
-        print(f"  {mark:8} {region['id']:40} {region['size'] / 1e6:10.1f} MB")
-    print(f"download: {report['download_bytes'] / 1e6:.1f} MB")
-    print(f"required: {report['required_bytes'] / 1e6:.1f} MB")
-    print(f"free:     {report['free_bytes'] / 1e6:.1f} MB")
-    print(f"fits:     {report['fits']}")
-
-
-if __name__ == "__main__":
-    _main()

@@ -1,16 +1,15 @@
 """Live progress of a job, in the shape the page draws it.
 
-Only one step of the chain says how far along it is: the tile generator
-redraws a bar with the zoom, the percentage and the tiles it has packed, five
-times a second (``src/tile_processor.hpp``).  The rest take minutes without a
-number of their own, so the page shows the step that is running and, when that
-step reports one, how much of it is done.
+Only one step of the chain says how far along it is: the tile generator redraws
+a bar with the zoom, the percentage and the tiles it has packed, five times a
+second (``src/tile_processor.hpp``).  The rest take minutes without a number of
+their own, so the page shows the step that is running and, when that step
+reports one, how much of it is done.
 
-The tiles of a zoom are only known once that zoom has started, so there is no
-total of tiles for the job as a whole: the engine groups the features into tiles
-before packing them (``src/tile_processor.hpp``) and never prints a count for the
-zooms that are still to come.  The page counts zooms for the whole job for that
-reason, and this module keeps what the engine said of the zoom at hand.
+The tiles of a zoom are only known once that zoom has started: the engine never
+prints a count for the zooms still to come, so there is no total of tiles for
+the job as a whole, and the page draws no bar for it.  This module keeps what
+the engine said of the zoom at hand.
 """
 
 import re
