@@ -3,6 +3,16 @@
    scale.  Antarctica is left out of the base map and out of reach, so the whole
    world fits at the least zoom with nothing painted below 60 S. */
 
+/* The base map's zoom ceiling; the preview of a job raises it to the zooms of
+   that job while its tiles are over the map. */
+const BASE_MAX_ZOOM = 12;
+
+/* A pack paints its landcover with its own colours, and over the dark land of
+   the base map a see-through preview arrives at little more than half of their
+   brightness: the tiles are drawn opaque, so the preview shows the pack as the
+   device would, and the base map stays readable around the area of the job. */
+const PREVIEW_OPACITY = 1;
+
 const map = L.map('map', {
   zoomControl: true,
   attributionControl: false,
@@ -11,7 +21,7 @@ const map = L.map('map', {
   boxZoom: false,
   touchZoom: false,
   minZoom: 2,
-  maxZoom: 12,
+  maxZoom: BASE_MAX_ZOOM,
   maxBounds: [[-58, -180], [84, 180]],
   maxBoundsViscosity: 1.0,
 });
@@ -116,6 +126,7 @@ function clearOffer() {
   elements.result.textContent = '';
   elements.stats.textContent = '';
   elements.stats.hidden = true;
+  clearPreview();
 }
 
 async function clearPacks() {
@@ -197,6 +208,7 @@ document.addEventListener('mouseup', (event) => {
    overlay pane, so a rectangle or a highlight is never hidden by it. */
 
 map.createPane('basemap').style.zIndex = 350;
+map.createPane('preview').style.zIndex = 390;
 
 const basemapStyle = {
   land: { color: '#2f5f88', weight: 0.6, fillColor: '#173c5c', fillOpacity: 0.85 },
@@ -412,10 +424,13 @@ const JOB_WORDS = {
 
 let jobArea = null;
 let jobRectangle = null;
+let jobEdge = null;
 
 function clearJobArea() {
   if (jobRectangle) map.removeLayer(jobRectangle);
+  if (jobEdge) map.removeLayer(jobEdge);
   jobRectangle = null;
+  jobEdge = null;
   jobArea = null;
 }
 
@@ -431,10 +446,24 @@ function showJobArea(state) {
       fillOpacity: 0.07,
       interactive: false,
     }).addTo(map);
-    jobRectangle.bindTooltip('', { permanent: true, direction: 'center', className: 'joblabel' });
+    // Leaflet hangs the permanent tooltip of a shape at the middle of its
+    // bounds, which would print the label over the map inside the rectangle.
+    // Bound to the bottom edge it lands below the rectangle instead, out of the
+    // way, and still centred on it.
+    jobEdge = L.polyline([[south, west], [south, east]], {
+      weight: 0,
+      opacity: 0,
+      interactive: false,
+    }).addTo(map);
+    jobEdge.bindTooltip('', {
+      permanent: true,
+      direction: 'bottom',
+      offset: [0, 4],
+      className: 'joblabel',
+    });
   }
   jobRectangle.setStyle({ color, fillColor: color, dashArray: state === 'running' ? '7 5' : null });
-  jobRectangle.setTooltipContent(`${JOB_WORDS[state] || state} ${jobArea.label}`);
+  jobEdge.setTooltipContent(`${JOB_WORDS[state] || state} ${jobArea.label}`);
 }
 
 /* Run the chain and follow its progress.  The payload is kept as it was sent,
@@ -696,4 +725,52 @@ function renderResult(body) {
     link.addEventListener('click', () => followCleanup(body.id));
     elements.result.appendChild(link);
   }
+  if (body.preview) addPreview(body);
+}
+
+/* The preview of a job that is over: the tiles of its pack, rendered by the
+   service with the viewer's own code, over the rectangle of the job.  It lives
+   while the packs live: the download and `Clear area` take it away with them. */
+let previewLayer = null;
+
+function addPreview(body) {
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.className = 'previewtoggle';
+  button.textContent = 'Hide preview';
+  button.addEventListener('click', () => {
+    if (previewLayer) {
+      clearPreview();
+      button.textContent = 'Show preview';
+    } else {
+      showPreview(body);
+      button.textContent = 'Hide preview';
+    }
+  });
+  elements.result.appendChild(button);
+  showPreview(body);
+}
+
+function showPreview(body) {
+  clearPreview();
+  const [west, south, east, north] = body.preview.bbox;
+  const bounds = L.latLngBounds([[south, west], [north, east]]);
+  // The map has to reach the zooms of the job; the base map below just scales
+  // when they go deeper than the zooms it was drawn for.
+  map.setMaxZoom(body.preview.zoom_max);
+  previewLayer = L.tileLayer(`/api/job/${body.id}/tile/{z}/{x}/{y}.png`, {
+    pane: 'preview',
+    bounds,
+    opacity: PREVIEW_OPACITY,
+    minZoom: body.preview.zoom_min,
+    maxZoom: body.preview.zoom_max,
+    noWrap: true,
+  }).addTo(map);
+  map.fitBounds(bounds, { padding: [20, 20] });
+}
+
+function clearPreview() {
+  if (previewLayer) map.removeLayer(previewLayer);
+  previewLayer = null;
+  map.setMaxZoom(BASE_MAX_ZOOM);
 }

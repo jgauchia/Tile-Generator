@@ -334,7 +334,9 @@ button:disabled {
 }
 
 /* The label of the area of the job, over the map: the dark box of the panel,
-   so it reads as part of the tool and not as a feature of the map. */
+   so it reads as part of the tool and not as a feature of the map.  It hangs
+   from the bottom edge of the rectangle, so the white arrow Leaflet draws on
+   that side is dropped: this is the panel's box, not a bubble of the map. */
 .leaflet-tooltip.joblabel {
   padding: .15rem .5rem;
   font-size: .72rem;
@@ -343,6 +345,10 @@ button:disabled {
   border: 1px solid #24374d;
   border-radius: 3px;
   box-shadow: 0 1px 4px #00000066;
+}
+
+.leaflet-tooltip.joblabel:before {
+  display: none;
 }
 
 #status {
@@ -524,4 +530,25 @@ button:disabled {
 
 .result a.download:hover {
   background: #74b3f5;
+}
+
+/* The preview of a job that is over is a button of the result area, next to the
+   packs whose tiles it shows. */
+.result .previewtoggle {
+  display: block;
+  width: 100%;
+  margin: .45rem 0 0;
+  padding: .45rem .7rem;
+  font: inherit;
+  font-size: .85rem;
+  font-weight: 600;
+  color: #cfe3f7;
+  background: #1b3855;
+  border: 1px solid #3f6ea8;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.result .previewtoggle:hover {
+  background: #24476b;
 }

@@ -21,6 +21,7 @@ import geofabrik
 from joblog import JobLog
 from pipeline import (Pipeline, PipelineError, WATER_ARCHIVE_BYTES,
                       WATER_EXTRACTED_BYTES)
+from preview import Preview
 from progress import Progress
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -254,6 +255,26 @@ def _run_job(job, spec):
             # job closes, which is what the box of statistics reads afterwards.
             job["progress"].close()
             job["finished"] = time.time()
+    if job["state"] == "done":
+        _start_preview(job)
+
+
+def _start_preview(job):
+    """Give a job that is over its tiles, prepared in the background."""
+    if job["bbox"] is None or job["cleaned"]:
+        return
+    snapshot = job["progress"].snapshot()
+    renderer = Preview(job["navmap_dir"], job["output_dir"] / "preview", job["bbox"],
+                       snapshot["zoom_min"], snapshot["zoom_max"])
+    job["preview"] = renderer
+    threading.Thread(target=renderer.warm, daemon=True).start()
+
+
+def _stop_preview(job):
+    """The packs are gone: the tiles of the job go with them."""
+    if job["preview"] is not None:
+        job["preview"].cancel()
+        job["preview"] = None
 
 
 @app.get("/")
@@ -347,6 +368,7 @@ def generate():
             "downloaded": set(),
             "downloading": None,
             "cleaned": False,
+            "preview": None,
         }
         _jobs[job_id] = job
         threading.Thread(target=_run_job, args=(job, spec), daemon=True).start()
@@ -365,6 +387,7 @@ def generate():
 
 def _job_view(job):
     """The state of a job, the way the page polls it."""
+    renderer = job["preview"]
     return {
         "id": job["id"],
         "name": job["name"],
@@ -379,6 +402,9 @@ def _job_view(job):
         "progress": job["progress"].snapshot(),
         "stats": _stats(job) if job["state"] == "done" else None,
         "log": _log_lines(job["log_path"]),
+        "preview": None if renderer is None or renderer.cancelled
+        else {"bbox": renderer.bbox, "zoom_min": renderer.zoom_min,
+              "zoom_max": renderer.zoom_max},
     }
 
 
@@ -408,6 +434,7 @@ def clear_packs():
                 continue
             shutil.rmtree(job["output_dir"], ignore_errors=True)
             job["cleaned"] = True
+            _stop_preview(job)
             cleared.append(job["id"])
     return jsonify({"cleared": cleared, "kept": kept})
 
@@ -464,6 +491,22 @@ def job_archive(job_id):
     return Response(stream(), mimetype="application/zip", headers=headers)
 
 
+@app.get("/api/job/<job_id>/tile/<int:zoom>/<int:x>/<int:y>.png")
+def job_tile(job_id, zoom, x, y):
+    job = _jobs.get(job_id)
+    renderer = job["preview"] if job is not None else None
+    if renderer is None or renderer.cancelled or job["cleaned"]:
+        return jsonify({"error": "this job has no preview"}), 404
+    if not renderer.covers(zoom, x, y):
+        return jsonify({"error": "the tile is outside the area of the job"}), 404
+    try:
+        data = renderer.tile(zoom, x, y)
+    except OSError as error:
+        return jsonify({"error": f"the tile could not be rendered: {error}"}), 500
+    return Response(data, mimetype="image/png",
+                    headers={"Cache-Control": "public, max-age=86400"})
+
+
 def _downloaded(job, part):
     """Delete the output of a job once every part of it has been downloaded.
 
@@ -477,6 +520,7 @@ def _downloaded(job, part):
         return
     shutil.rmtree(job["output_dir"], ignore_errors=True)
     job["cleaned"] = True
+    _stop_preview(job)
 
 
 def clear_outputs(out_dir):
