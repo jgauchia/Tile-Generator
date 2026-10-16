@@ -2,7 +2,7 @@
  * @file main.cpp
  * @author Jordi Gauchía (jgauchia @jgauchia.com)
  * @brief Entry point for the NAV Tile Generator C++ implementation with packed container support.
- * @version 1.0.0
+ * @version 1.0.1
  * @date 2026-10
  */
 

@@ -2,7 +2,7 @@
  * @file constants.hpp
  * @author Jordi Gauchía (jgauchia @jgauchia.com)
  * @brief Rendering constants and per-zoom lookup tables (ported from Python constants.py).
- * @version 1.0.0
+ * @version 1.0.1
  * @date 2026-10
  */
 
