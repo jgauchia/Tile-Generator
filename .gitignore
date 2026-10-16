@@ -17,3 +17,6 @@ NAVMAP_AND
 NAVMAP_AND
 NAVMAP_CAT
 build.host/
+cache/
+out/
+logs/

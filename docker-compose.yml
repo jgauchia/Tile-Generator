@@ -11,6 +11,22 @@ services:
     volumes:
       - "${PWD}:${PWD}"
 
+  web:
+    build: .
+    image: tile-generator:local
+    working_dir: "${PWD}"
+    user: "${UID:-1000}:${GID:-1000}"
+    environment:
+      HOME: /tmp
+    volumes:
+      - "${PWD}:${PWD}"
+      # The default map name carries a timestamp, so the container reads the
+      # timezone from the host instead of stamping everything in UTC.
+      - /etc/localtime:/etc/localtime:ro
+    ports:
+      - "127.0.0.1:8080:8080"
+    command: ["python3", "web/app.py"]
+
   viewer:
     image: tile-generator:local
     working_dir: "${PWD}"
