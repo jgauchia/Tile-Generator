@@ -154,6 +154,60 @@ rsync -av ROUTE/  /media/sdcard/ROUTE/
 
 For the full binary format and profile speed tables see [`docs/route_generator.md`](docs/route_generator.md).
 
+## Docker
+
+The image carries the full toolchain, so the first container run compiles both binaries into `build/`
+when they are missing. The repository is mounted at its own path: every input and output stays exactly
+where it is today. Run the commands from the repository root.
+
+```bash
+docker compose build
+docker compose run --rm generator nav_generator <input.pbf> <output_dir> <features_json> [--zoom min-max] [--water-shp <path>]
+docker compose run --rm generator route_generator <input.pbf> <output_dir>
+```
+
+With Compose v1 the command is `docker-compose`; the file and the arguments are the same.
+
+### Web service
+
+The `web` service draws the area on a map and runs the whole chain for it — download, merge, clip and
+the generators — so no `osmium` command has to be typed. It listens on `127.0.0.1:8080` only.
+
+```bash
+docker compose build web          # once, or whenever the Dockerfile changes
+docker compose up -d web          # serves the page on 127.0.0.1:8080
+docker compose logs -f web        # follow the service log
+docker compose restart web        # after editing web/*.py
+docker compose down
+```
+
+A change under `web/static/` needs no restart (the browser picks it up on reload). If the daemon answers
+`permission denied while trying to connect to the Docker daemon socket`, run `newgrp docker` once or
+prefix the commands with `sg docker -c "..."`.
+
+See [`docs/web_service.md`](docs/web_service.md) for the workflow on the page, the cache rules, the API
+and where the figures and the logs end up.
+
+### Viewer
+
+The `viewer` service opens `tile_viewer.py` on the host display through the mounted X11 socket:
+
+```bash
+xhost +si:localuser:"$USER"
+docker compose run --rm viewer python3 tile_viewer.py <nav_dir> --lat <lat> --lon <lon> [--config <features_json>]
+xhost -si:localuser:"$USER"
+```
+
+## Data sources
+
+- Map data: © [OpenStreetMap contributors](https://www.openstreetmap.org/copyright), under the
+  [Open Database License](https://opendatacommons.org/licenses/odbl/).
+- Region index and PBF extracts from [Geofabrik](https://download.geofabrik.de/).
+- The map is drawn with [Leaflet](https://leafletjs.com/) (BSD-2-Clause), vendored in `web/static/vendor/`.
+- The base map is [Natural Earth](https://www.naturalearthdata.com/) 1:10m (public domain), vendored as
+  `web/static/basemap.geojson`; no setup step builds it, see [`docs/basemap.md`](docs/basemap.md) to
+  regenerate it.
+
 ## Internal Format Details
 
 - **Tile container**: NPK2 (Sparse index: coverage bitmap + rank table + compact 8B entries, O(1) lookup) — `docs/bin_tile_format.md`

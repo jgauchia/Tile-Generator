@@ -1,0 +1,12 @@
+.git
+.freebuff
+build*
+graft
+__pycache__
+*.pbf
+NAVMAP*
+ROUTE*
+water-polygons-*
+cache
+out
+logs
