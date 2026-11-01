@@ -23,17 +23,18 @@ The generator operates in multiple passes to ensure topological consistency and 
 ## Dependencies & Installation
 
 ### Required Libraries
-- **Libosmium**: PBF parsing.
+- **Libosmium**: PBF parsing (installs **Protozero** and the `zlib`/`bzip2`/`Expat` headers it builds against).
 - **GEOS**: Geometry operations (clipping, simplification, unions).
 - **GDAL/OGR**: Shapefile support for ocean water polygons.
-- **Protozero**: Low-level OSM data handling.
-- **C++17 Compiler**: GCC 9+ or Clang.
+- **zlib, bzip2, Expat**: PBF decompression, required by CMake and pulled in by the line below.
+- **nlohmann/json**: `features.json` parsing (optional: CMake fetches it if the system package is missing).
+- **CMake 3.14+** and a **C++17 compiler**: GCC 9+ or Clang.
 
 ### Installation (Ubuntu/Debian)
 ```bash
 sudo apt-get update
 sudo apt-get install -y build-essential cmake \
-    libosmium2-dev libgeos-dev libgdal-dev \
+    libosmium2-dev libgeos-dev libgdal-dev nlohmann-json3-dev \
     libbz2-dev zlib1g-dev libexpat1-dev
 ```
 
@@ -48,8 +49,12 @@ make -j$(nproc)
 ## Usage
 
 ```bash
-./nav_generator <osm_pbf_file> <output_dir> <features_json> [--zoom min-max]
+./nav_generator <osm_pbf_file> <output_dir> <features_json> [--zoom min-max] [--water-shp <path>]
 ```
+
+`--zoom` defaults to `6-17`. The `features_json` argument is mandatory: it maps OSM tags to
+colour, priority and minimum zoom — see [`docs/features_json_format.md`](docs/features_json_format.md).
+The repository ships [`features.json`](features.json) as a ready-to-use example.
 
 ### Example
 ```bash
@@ -157,8 +162,10 @@ For the full binary format and profile speed tables see [`docs/route_generator.m
 ## Docker
 
 The image carries the full toolchain, so the first container run compiles both binaries into `build/`
-when they are missing. The repository is mounted at its own path: every input and output stays exactly
-where it is today. Run the commands from the repository root.
+when they are missing. It only builds when a binary is absent, so after editing `src/` rebuild with
+`docker compose run --rm generator cmake --build build -j$(nproc)`. The repository is mounted at its
+own path: every input and output stays exactly where it is today. Run the commands from the
+repository root.
 
 ```bash
 docker compose build

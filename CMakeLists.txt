@@ -1,5 +1,5 @@
-cmake_minimum_required(VERSION 3.10)
-project(nav_generator_cpp VERSION 1.0.1)
+cmake_minimum_required(VERSION 3.14)
+project(nav_generator_cpp VERSION 1.0.2)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -22,8 +22,20 @@ endif()
 message(STATUS "Found GEOS include: ${GEOS_INCLUDE_DIR}")
 message(STATUS "Found GEOS library: ${GEOS_C_LIBRARY}")
 
-# nlohmann-json
-find_package(nlohmann_json QUIET)
+# nlohmann-json: src/config_manager.hpp always needs it, so fall back to a
+# fetched copy when the system package is not installed.
+find_package(nlohmann_json 3.2.0 QUIET)
+if(NOT nlohmann_json_FOUND)
+    message(STATUS "nlohmann_json not found, fetching it with FetchContent")
+    include(FetchContent)
+    FetchContent_Declare(
+        nlohmann_json
+        URL https://github.com/nlohmann/json/releases/download/v3.11.3/json.tar.xz
+        URL_HASH SHA256=d6c65aca6b1ed68e7a182f4757257b107ae403032760ed6ef121c9d55e81757d
+        DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+    )
+    FetchContent_MakeAvailable(nlohmann_json)
+endif()
 
 # Include directories
 include_directories(
@@ -51,9 +63,7 @@ target_link_libraries(nav_generator
     ${GDAL_LIBRARIES}
 )
 
-if(nlohmann_json_FOUND)
-    target_link_libraries(nav_generator PRIVATE nlohmann_json::nlohmann_json)
-endif()
+target_link_libraries(nav_generator PRIVATE nlohmann_json::nlohmann_json)
 
 # Compiler optimization flags
 if(MSVC)
@@ -77,9 +87,7 @@ target_link_libraries(route_generator
     ${GDAL_LIBRARIES}
 )
 
-if(nlohmann_json_FOUND)
-    target_link_libraries(route_generator PRIVATE nlohmann_json::nlohmann_json)
-endif()
+target_link_libraries(route_generator PRIVATE nlohmann_json::nlohmann_json)
 
 if(MSVC)
     target_compile_options(route_generator PRIVATE /O2 /W3)
