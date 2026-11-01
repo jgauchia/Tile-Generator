@@ -173,10 +173,10 @@ sudo usermod -aG docker "$USER"                    # run docker without sudo; lo
 docker-compose version                             # sanity check
 ```
 
-These are the two packages the distribution repositories actually ship — Ubuntu 24.04 and Debian 12
-included — and they give Compose v1, so the commands in this section are `docker-compose`. With Compose
-v2 (only from Docker's own apt repository, <https://docs.docker.com/engine/install/>) they are the same
-with one command instead: `docker compose`.
+Ubuntu 24.04 and Debian 12 ship Compose v1 as `docker-compose`, and the v2 package (`docker-compose-v2`, or
+`docker-compose-plugin` from Docker's own apt repository, <https://docs.docker.com/engine/install/>)
+answers to that same name, so the commands in this section use `docker-compose` throughout; on v2 you can
+write `docker compose` instead — same file, same arguments.
 
 The image carries the full toolchain, so the first container run compiles both binaries into `build/`
 when they are missing. It only builds when a binary is absent, so after editing `src/` rebuild with
