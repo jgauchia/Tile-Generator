@@ -85,7 +85,7 @@ The project includes a Python-based simulator to validate maps before flashing t
 
 ### Prerequisites
 - **Python 3.x**
-- **Pygame**: `pip install pygame`
+- **Pygame**: `sudo apt install python3-pygame`
 
 ### Usage
 ```bash
