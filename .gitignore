@@ -17,6 +17,7 @@ NAVMAP_AND
 NAVMAP_AND
 NAVMAP_CAT
 build.host/
+build-docker/
 cache/
 out/
 logs/
