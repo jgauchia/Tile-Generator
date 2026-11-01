@@ -13,11 +13,11 @@ and reads their output.
 ## Running it
 
 ```bash
-docker compose build web          # once, or whenever the Dockerfile changes
-docker compose up -d web          # serves the page on 127.0.0.1:8080 (loopback only)
-docker compose logs -f web        # follow the service log
-docker compose restart web        # after editing web/*.py
-docker compose down
+docker-compose build web          # once, or whenever the Dockerfile changes
+docker-compose up -d web          # serves the page on 127.0.0.1:8080 (loopback only)
+docker-compose logs -f web        # follow the service log
+docker-compose restart web        # after editing web/*.py
+docker-compose down
 ```
 
 Without `-d` the log stays in the terminal and Ctrl+C stops the service. A change under `web/static/`

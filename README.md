@@ -161,19 +161,34 @@ For the full binary format and profile speed tables see [`docs/route_generator.m
 
 ## Docker
 
+### Prerequisites
+
+Docker Engine and Compose are the only packages the host needs: the compiler, GEOS, GDAL and Libosmium
+all live in the image, so the `apt-get` line above only applies when building without Docker.
+
+```bash
+sudo apt-get update
+sudo apt-get install -y docker.io docker-compose   # Ubuntu/Debian: Compose v1, `docker-compose`
+sudo usermod -aG docker "$USER"                    # run docker without sudo; log out and back in
+docker-compose version                             # sanity check
+```
+
+These are the two packages the distribution repositories actually ship — Ubuntu 24.04 and Debian 12
+included — and they give Compose v1, so the commands in this section are `docker-compose`. With Compose
+v2 (only from Docker's own apt repository, <https://docs.docker.com/engine/install/>) they are the same
+with one command instead: `docker compose`.
+
 The image carries the full toolchain, so the first container run compiles both binaries into `build/`
 when they are missing. It only builds when a binary is absent, so after editing `src/` rebuild with
-`docker compose run --rm generator cmake --build build -j$(nproc)`. The repository is mounted at its
+`docker-compose run --rm generator cmake --build build -j$(nproc)`. The repository is mounted at its
 own path: every input and output stays exactly where it is today. Run the commands from the
 repository root.
 
 ```bash
-docker compose build
-docker compose run --rm generator nav_generator <input.pbf> <output_dir> <features_json> [--zoom min-max] [--water-shp <path>]
-docker compose run --rm generator route_generator <input.pbf> <output_dir>
+docker-compose build
+docker-compose run --rm generator nav_generator <input.pbf> <output_dir> <features_json> [--zoom min-max] [--water-shp <path>]
+docker-compose run --rm generator route_generator <input.pbf> <output_dir>
 ```
-
-With Compose v1 the command is `docker-compose`; the file and the arguments are the same.
 
 ### Web service
 
@@ -181,11 +196,11 @@ The `web` service draws the area on a map and runs the whole chain for it — do
 the generators — so no `osmium` command has to be typed. It listens on `127.0.0.1:8080` only.
 
 ```bash
-docker compose build web          # once, or whenever the Dockerfile changes
-docker compose up -d web          # serves the page on 127.0.0.1:8080
-docker compose logs -f web        # follow the service log
-docker compose restart web        # after editing web/*.py
-docker compose down
+docker-compose build web          # once, or whenever the Dockerfile changes
+docker-compose up -d web          # serves the page on 127.0.0.1:8080
+docker-compose logs -f web        # follow the service log
+docker-compose restart web        # after editing web/*.py
+docker-compose down
 ```
 
 A change under `web/static/` needs no restart (the browser picks it up on reload). If the daemon answers
@@ -201,7 +216,7 @@ The `viewer` service opens `tile_viewer.py` on the host display through the moun
 
 ```bash
 xhost +si:localuser:"$USER"
-docker compose run --rm viewer python3 tile_viewer.py <nav_dir> --lat <lat> --lon <lon> [--config <features_json>]
+docker-compose run --rm viewer python3 tile_viewer.py <nav_dir> --lat <lat> --lon <lon> [--config <features_json>]
 xhost -si:localuser:"$USER"
 ```
 
