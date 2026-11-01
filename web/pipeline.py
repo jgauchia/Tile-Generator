@@ -91,10 +91,18 @@ class Pipeline:
             raise PipelineError(f"{Path(command[0]).name} exited with code {code}")
 
     def binary(self, name):
-        """Locate a generator: the local build first, then PATH."""
-        local = self.repo_root / "build" / name
-        if local.is_file():
-            return local
+        """Locate a generator: the build the container prepared, the local build,
+        then PATH.
+        """
+        roots = []
+        prepared = os.environ.get("TILE_GENERATOR_BUILD_DIR")
+        if prepared:
+            roots.append(Path(prepared))
+        roots.append(self.repo_root / "build")
+        for root in roots:
+            local = root / name
+            if local.is_file():
+                return local
         found = shutil.which(name)
         if not found:
             raise PipelineError(f"{name} not found: build it or add it to PATH")
