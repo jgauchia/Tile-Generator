@@ -23,17 +23,18 @@ The generator operates in multiple passes to ensure topological consistency and 
 ## Dependencies & Installation
 
 ### Required Libraries
-- **Libosmium**: PBF parsing.
+- **Libosmium**: PBF parsing (installs **Protozero** and the `zlib`/`bzip2`/`Expat` headers it builds against).
 - **GEOS**: Geometry operations (clipping, simplification, unions).
 - **GDAL/OGR**: Shapefile support for ocean water polygons.
-- **Protozero**: Low-level OSM data handling.
-- **C++17 Compiler**: GCC 9+ or Clang.
+- **zlib, bzip2, Expat**: PBF decompression, required by CMake and pulled in by the line below.
+- **nlohmann/json**: `features.json` parsing (optional: CMake fetches it if the system package is missing).
+- **CMake 3.14+** and a **C++17 compiler**: GCC 9+ or Clang.
 
 ### Installation (Ubuntu/Debian)
 ```bash
 sudo apt-get update
 sudo apt-get install -y build-essential cmake \
-    libosmium2-dev libgeos-dev libgdal-dev \
+    libosmium2-dev libgeos-dev libgdal-dev nlohmann-json3-dev \
     libbz2-dev zlib1g-dev libexpat1-dev
 ```
 
@@ -48,8 +49,12 @@ make -j$(nproc)
 ## Usage
 
 ```bash
-./nav_generator <osm_pbf_file> <output_dir> <features_json> [--zoom min-max]
+./nav_generator <osm_pbf_file> <output_dir> <features_json> [--zoom min-max] [--water-shp <path>]
 ```
+
+`--zoom` defaults to `6-17`. The `features_json` argument is mandatory: it maps OSM tags to
+colour, priority and minimum zoom — see [`docs/features_json_format.md`](docs/features_json_format.md).
+The repository ships [`features.json`](features.json) as a ready-to-use example.
 
 ### Example
 ```bash
@@ -80,7 +85,7 @@ The project includes a Python-based simulator to validate maps before flashing t
 
 ### Prerequisites
 - **Python 3.x**
-- **Pygame**: `pip install pygame`
+- **Pygame**: `sudo apt install python3-pygame`
 
 ### Usage
 ```bash
@@ -156,17 +161,34 @@ For the full binary format and profile speed tables see [`docs/route_generator.m
 
 ## Docker
 
-The image carries the full toolchain, so the first container run compiles both binaries into `build/`
-when they are missing. The repository is mounted at its own path: every input and output stays exactly
-where it is today. Run the commands from the repository root.
+### Prerequisites
+
+Docker Engine and Compose are the only packages the host needs: the compiler, GEOS, GDAL and Libosmium
+all live in the image, so the `apt-get` line above only applies when building without Docker.
 
 ```bash
-docker compose build
-docker compose run --rm generator nav_generator <input.pbf> <output_dir> <features_json> [--zoom min-max] [--water-shp <path>]
-docker compose run --rm generator route_generator <input.pbf> <output_dir>
+sudo apt-get update
+sudo apt-get install -y docker.io docker-compose   # Ubuntu/Debian: Compose v1, `docker-compose`
+sudo usermod -aG docker "$USER"                    # run docker without sudo; log out and back in
+docker-compose version                             # sanity check
 ```
 
-With Compose v1 the command is `docker-compose`; the file and the arguments are the same.
+Ubuntu 24.04 and Debian 12 ship Compose v1 as `docker-compose`, and the v2 package (`docker-compose-v2`, or
+`docker-compose-plugin` from Docker's own apt repository, <https://docs.docker.com/engine/install/>)
+answers to that same name, so the commands in this section use `docker-compose` throughout; on v2 you can
+write `docker compose` instead — same file, same arguments.
+
+The image carries the full toolchain, so the first container run compiles both binaries into `build/`
+when they are missing. It only builds when a binary is absent, so after editing `src/` rebuild with
+`docker-compose run --rm generator cmake --build build -j$(nproc)`. The repository is mounted at its
+own path: every input and output stays exactly where it is today. Run the commands from the
+repository root.
+
+```bash
+docker-compose build
+docker-compose run --rm generator nav_generator <input.pbf> <output_dir> <features_json> [--zoom min-max] [--water-shp <path>]
+docker-compose run --rm generator route_generator <input.pbf> <output_dir>
+```
 
 ### Web service
 
@@ -174,11 +196,11 @@ The `web` service draws the area on a map and runs the whole chain for it — do
 the generators — so no `osmium` command has to be typed. It listens on `127.0.0.1:8080` only.
 
 ```bash
-docker compose build web          # once, or whenever the Dockerfile changes
-docker compose up -d web          # serves the page on 127.0.0.1:8080
-docker compose logs -f web        # follow the service log
-docker compose restart web        # after editing web/*.py
-docker compose down
+docker-compose build web          # once, or whenever the Dockerfile changes
+docker-compose up -d web          # serves the page on 127.0.0.1:8080
+docker-compose logs -f web        # follow the service log
+docker-compose restart web        # after editing web/*.py
+docker-compose down
 ```
 
 A change under `web/static/` needs no restart (the browser picks it up on reload). If the daemon answers
@@ -194,7 +216,7 @@ The `viewer` service opens `tile_viewer.py` on the host display through the moun
 
 ```bash
 xhost +si:localuser:"$USER"
-docker compose run --rm viewer python3 tile_viewer.py <nav_dir> --lat <lat> --lon <lon> [--config <features_json>]
+docker-compose run --rm viewer python3 tile_viewer.py <nav_dir> --lat <lat> --lon <lon> [--config <features_json>]
 xhost -si:localuser:"$USER"
 ```
 
