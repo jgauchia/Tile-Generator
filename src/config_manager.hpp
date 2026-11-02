@@ -137,7 +137,7 @@ public:
         // Second pass: qualifier tags override primary styling.
         // Deterministic priority order (earlier = higher priority, wins later):
         static const std::vector<std::string> qualifier_priority = {
-            "bicycle", "mtb:scale:uphill", "mtb:scale:imba", "mtb:scale", "surface", "sac_scale", "trail_visibility"
+            "bicycle", "mtb:scale:uphill", "mtb:scale:imba", "mtb:scale", "sac_scale", "trail_visibility"
         };
 
         // Collect matching qualifier configs with their priority rank
