@@ -10,6 +10,7 @@
 #include <string>
 #include <map>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <cstdint>
 #include <cmath>
@@ -73,6 +74,7 @@ inline const std::unordered_map<std::string, PointFeatureDef>& point_features()
 {
     static const std::unordered_map<std::string, PointFeatureDef> T = {
         {"natural=peak",    {"triangle"}},
+        {"natural=saddle",  {"triangle"}},
         {"natural=volcano", {"triangle"}},
     };
     return T;
@@ -97,6 +99,35 @@ inline const std::unordered_map<std::string, TextFeatureDef>& text_features()
 }
 
 constexpr int ROAD_LABEL_SPACING = 75;
+constexpr int WAY_NAME_LABEL_MIN_ZOOM = 16;
+constexpr int WAY_NAME_LABEL_MAX_CHARS = 40;
+constexpr double WAY_NAME_LABEL_MIN_LENGTH_M = 75.0;
+
+/**
+ * @brief Highway classes that get a way-name text label.
+ * @param hw highway_type value.
+ * @return true if the class should carry a name label.
+ */
+inline bool is_way_name_highway(const std::string& hw)
+{
+    static const std::unordered_set<std::string> T = {
+        "primary", "secondary", "tertiary", "unclassified", "residential",
+        "living_street", "pedestrian", "track", "path", "cycleway", "footway", "bridleway"
+    };
+    return T.count(hw) > 0;
+}
+
+/**
+ * @brief Path-like highway classes, ranked below ref shields but above other roads.
+ * @param hw highway_type value.
+ * @return true for path, cycleway, track, footway, bridleway.
+ */
+inline bool is_path_like_highway(const std::string& hw)
+{
+    return hw == "path" || hw == "cycleway" || hw == "track" ||
+           hw == "footway" || hw == "bridleway";
+}
+
 constexpr int PLACE_NAME_BREAK_THRESHOLD = 12;
 constexpr int POINT_SYMBOL_SIZE_PX = 3;
 constexpr int LABEL_CHAR_WIDTH_PX = 7;

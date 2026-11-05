@@ -248,6 +248,9 @@ public:
         feat.layer = layer;
         feat.width_meters = get_width(tags);
         feat.highway_type = get_highway_type(tags);
+        // Per-feature JSON width table (e.g. thicker trails for selected tags)
+        if (!f_cfg.zoom_widths.empty())
+            feat.zoom_widths = f_cfg.zoom_widths;
         feat.ref = tags.count("ref") ? tags.at("ref") : "";
         
 
@@ -343,6 +346,7 @@ public:
 
         // Road labels
         create_road_label(feat.points, feat.ref, feat.highway_type, feat.color_rgb565);
+        create_way_name_label(feat.points, feat.name, feat.highway_type, feat.color_rgb565);
     }
 
     void area(const osmium::Area& a)
@@ -588,8 +592,65 @@ private:
         return 0.0f;
     }
 
-void create_road_label(const std::vector<Point>& coords, const std::string& ref,
-                       const std::string& highway_type, uint16_t color_rgb565)
+    static double way_length_meters(const std::vector<Point>& coords)
+    {
+        double metres = 0;
+        for (size_t i = 1; i < coords.size(); ++i)
+        {
+            double lat1 = coords[i - 1].lat * M_PI / 180.0;
+            double lat2 = coords[i].lat * M_PI / 180.0;
+            double dlat = lat2 - lat1;
+            double dlon = (coords[i].lon - coords[i - 1].lon) * M_PI / 180.0;
+            double a = std::sin(dlat / 2) * std::sin(dlat / 2) +
+                       std::cos(lat1) * std::cos(lat2) * std::sin(dlon / 2) * std::sin(dlon / 2);
+            metres += 6371000.0 * 2.0 * std::atan2(std::sqrt(a), std::sqrt(1.0 - a));
+        }
+        return metres;
+    }
+
+    void create_way_name_label(const std::vector<Point>& coords, const std::string& name,
+                               const std::string& highway_type, uint16_t color_rgb565)
+    {
+        if (name.empty() || coords.size() < 2)
+            return;
+        if (max_zoom_range < constants::WAY_NAME_LABEL_MIN_ZOOM)
+            return;
+        if (!constants::is_way_name_highway(highway_type))
+            return;
+        if (way_length_meters(coords) < constants::WAY_NAME_LABEL_MIN_LENGTH_M)
+            return;
+
+        std::string name_trunc = utils::utf8_truncate(name, constants::WAY_NAME_LABEL_MAX_CHARS);
+        if (name_trunc.empty())
+            return;
+
+        std::vector<Point> candidates;
+        for (double ratio : {0.25, 0.5, 0.75})
+        {
+            int idx = static_cast<int>(coords.size() * ratio);
+            idx = std::min(idx, (int)coords.size() - 1);
+            candidates.push_back(coords[idx]);
+        }
+
+        Feature feat;
+        feat.id = 0;
+        feat.geom_type = GEOM_TEXT;
+        feat.color_rgb565 = utils::darken_rgb565(color_rgb565);
+        // min_zoom nibble 15 is ignored here: text_min_zoom drives placement
+        feat.zoom_priority = utils::pack_zoom_priority(15, 15);
+        feat.text_min_zoom = constants::WAY_NAME_LABEL_MIN_ZOOM;
+        feat.font_size = 0;
+        feat.highway_type = highway_type;
+        feat.text.assign(name_trunc.begin(), name_trunc.end());
+        feat.points.push_back(candidates[1]);
+        feat.ring_ends.push_back(1);
+        feat.coords_candidates = std::move(candidates);
+        text_features_vec.push_back(std::move(feat));
+        stats_text_labels++;
+    }
+
+    void create_road_label(const std::vector<Point>& coords, const std::string& ref,
+                           const std::string& highway_type, uint16_t color_rgb565)
     {
         if (ref.empty()) return;
         if (highway_type != "motorway" && highway_type != "trunk" &&

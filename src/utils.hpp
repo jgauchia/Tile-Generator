@@ -227,5 +227,21 @@ inline std::string split_place_name(const std::string& name, int threshold = 12)
     return name;
 }
 
+/**
+ * @brief Truncate a UTF-8 string to at most max_bytes bytes without splitting a codepoint.
+ * @param s         Input UTF-8 string.
+ * @param max_bytes Maximum number of bytes to keep.
+ * @return Truncated string; may be shorter than max_bytes to end on a codepoint boundary.
+ */
+inline std::string utf8_truncate(const std::string& s, size_t max_bytes)
+{
+    if (s.size() <= max_bytes) return s;
+    size_t cut = max_bytes;
+    // Step back while inside a multi-byte codepoint (its first excluded byte is a
+    // continuation byte 10xxxxxx, so the cut would land mid-codepoint).
+    while (cut > 0 && (static_cast<unsigned char>(s[cut]) & 0xC0) == 0x80) --cut;
+    return s.substr(0, cut);
+}
+
 } // namespace utils
 } // namespace nav
