@@ -941,15 +941,32 @@ private:
             GEOSCoordSeq_setX_r(local_handle, cb, 4, lmin - lm); GEOSCoordSeq_setY_r(local_handle, cb, 4, tmin - tm);
             return GEOSGeom_createPolygon_r(local_handle, GEOSGeom_createLinearRing_r(local_handle, cb), NULL, 0);
         };
-        GEOSGeometry* clip_poly = make_clip_box(constants::CLIP_MARGIN_POLYGON);
-        GEOSGeometry* clip_line = make_clip_box(constants::CLIP_MARGIN_LINE);
+        // The polygon buffer only has to keep the cut edge out of the tile.
+        double poly_margin = static_cast<double>(constants::CLIP_POLYGON_PX) / constants::TILE_SIZE_PX;
+        GEOSGeometry* clip_poly = make_clip_box(poly_margin);
+        GEOSGeometry* clip_casing = make_clip_box(constants::CLIP_MARGIN_CASING);
 
-        double poly_lm = (lmax - lmin) * constants::CLIP_MARGIN_POLYGON;
-        double poly_tm = (tmax - tmin) * constants::CLIP_MARGIN_POLYGON;
+        // The line buffer covers the widest stroke plus one pixel, never a whole tile.
+        int max_line_px = 1;
+        for (const auto& f : lines)
+        {
+            auto wit = f.zoom_widths.find(z);
+            if (wit != f.zoom_widths.end() && wit->second > max_line_px) max_line_px = wit->second;
+        }
+        int line_px = std::max(constants::clip_line_px(z), max_line_px / 2 + 1);
+        double line_margin = static_cast<double>(line_px) / constants::TILE_SIZE_PX;
+        GEOSGeometry* clip_line = make_clip_box(line_margin);
+
+        double poly_lm = (lmax - lmin) * poly_margin;
+        double poly_tm = (tmax - tmin) * poly_margin;
         double clip_poly_xmin = lmin - poly_lm, clip_poly_xmax = lmax + poly_lm;
         double clip_poly_ymin = tmin - poly_tm, clip_poly_ymax = tmax + poly_tm;
-        double line_lm = (lmax - lmin) * constants::CLIP_MARGIN_LINE;
-        double line_tm = (tmax - tmin) * constants::CLIP_MARGIN_LINE;
+        double casing_lm = (lmax - lmin) * constants::CLIP_MARGIN_CASING;
+        double casing_tm = (tmax - tmin) * constants::CLIP_MARGIN_CASING;
+        double clip_casing_xmin = lmin - casing_lm, clip_casing_xmax = lmax + casing_lm;
+        double clip_casing_ymin = tmin - casing_tm, clip_casing_ymax = tmax + casing_tm;
+        double line_lm = (lmax - lmin) * line_margin;
+        double line_tm = (tmax - tmin) * line_margin;
         double clip_line_xmin = lmin - line_lm, clip_line_xmax = lmax + line_lm;
         double clip_line_ymin = tmin - line_tm, clip_line_ymax = tmax + line_tm;
 
@@ -1103,7 +1120,12 @@ private:
             {
                 GEOSGeometry* g = feature_to_geos(f, local_handle);
                 if (!g) continue;
-                GEOSGeometry* clipped = clip_with_bbox(g, clip_poly, clip_poly_xmin, clip_poly_xmax, clip_poly_ymin, clip_poly_ymax);
+                const GEOSGeometry* pbox = f.is_building ? clip_casing : clip_poly;
+                double pxmin = f.is_building ? clip_casing_xmin : clip_poly_xmin;
+                double pxmax = f.is_building ? clip_casing_xmax : clip_poly_xmax;
+                double pymin = f.is_building ? clip_casing_ymin : clip_poly_ymin;
+                double pymax = f.is_building ? clip_casing_ymax : clip_poly_ymax;
+                GEOSGeometry* clipped = clip_with_bbox(g, pbox, pxmin, pxmax, pymin, pymax);
                 GEOSGeom_destroy_r(local_handle, g);
                 if (!clipped || GEOSisEmpty_r(local_handle, clipped)) { if (clipped) GEOSGeom_destroy_r(local_handle, clipped); continue; }
                 if (!GEOSisValid_r(local_handle, clipped)) { GEOSGeometry* v = GEOSMakeValid_r(local_handle, clipped); GEOSGeom_destroy_r(local_handle, clipped); clipped = v; }
@@ -1167,6 +1189,25 @@ private:
         {
             GEOSGeometry* g = feature_to_geos(f, local_handle);
             if (!g) continue;
+
+            // Simplify once per zoom, before the tile split: every tile simplifies the
+            // same source geometry, so the vertices match across the border and the
+            // clip buffer only has to cover the stroke instead of hiding a mismatched join.
+            bool skip_simplify = (f.layer == "water" || f.layer == "roads");
+            double line_tol = tolerance;
+            if (f.layer == "infrastructure") line_tol = pixel_deg * 0.1;
+
+            if (!skip_simplify)
+            {
+                GEOSGeometry* simplified = GEOSTopologyPreserveSimplify_r(local_handle, g, line_tol);
+                if (simplified && !GEOSisEmpty_r(local_handle, simplified))
+                {
+                    GEOSGeom_destroy_r(local_handle, g);
+                    g = simplified;
+                }
+                else if (simplified) GEOSGeom_destroy_r(local_handle, simplified);
+            }
+
             GEOSGeometry* clipped = clip_with_bbox(g, clip_line, clip_line_xmin, clip_line_xmax, clip_line_ymin, clip_line_ymax);
             if (!clipped || GEOSisEmpty_r(local_handle, clipped))
             {
@@ -1187,10 +1228,6 @@ private:
                 }
             }
 
-            bool skip_simplify = (f.layer == "water" || f.layer == "roads");
-            double line_tol = tolerance;
-            if (f.layer == "infrastructure") line_tol = pixel_deg * 0.1;
-
             int n = GEOSGetNumGeometries_r(local_handle, clipped);
             for (int i = 0; i < n; ++i)
             {
@@ -1198,16 +1235,6 @@ private:
                 if (!part || (GEOSGeomTypeId_r(local_handle, part) != GEOS_LINESTRING && GEOSGeomTypeId_r(local_handle, part) != GEOS_LINEARRING) || GEOSisEmpty_r(local_handle, part)) continue;
 
                 const GEOSGeometry* use = part;
-                GEOSGeometry* simplified = nullptr;
-                if (!skip_simplify)
-                {
-                    simplified = GEOSTopologyPreserveSimplify_r(local_handle, part, line_tol);
-                    if (simplified && !GEOSisEmpty_r(local_handle, simplified)) use = simplified;
-                    else { if (simplified) GEOSGeom_destroy_r(local_handle, simplified); simplified = nullptr; }
-                }
-
-                if (GEOSGeomTypeId_r(local_handle, use) != GEOS_LINESTRING && GEOSGeomTypeId_r(local_handle, use) != GEOS_LINEARRING)
-                { if (simplified) GEOSGeom_destroy_r(local_handle, simplified); continue; }
 
                 const GEOSCoordSequence* s = GEOSGeom_getCoordSeq_r(local_handle, use);
                 uint32_t sz = 0; if (s) GEOSCoordSeq_getSize_r(local_handle, s, &sz);
@@ -1224,7 +1251,6 @@ private:
                     }
                     if (pf.rings[0].size() >= 2) final_features.push_back(std::move(pf));
                 }
-                if (simplified) GEOSGeom_destroy_r(local_handle, simplified);
             }
             GEOSGeom_destroy_r(local_handle, g); GEOSGeom_destroy_r(local_handle, clipped);
         }
@@ -1392,7 +1418,7 @@ private:
 
         memcpy(buffer.data() + 4, &written, 2);
 
-        GEOSGeom_destroy_r(local_handle, clip_poly); GEOSGeom_destroy_r(local_handle, clip_line);
+        GEOSGeom_destroy_r(local_handle, clip_poly); GEOSGeom_destroy_r(local_handle, clip_casing); GEOSGeom_destroy_r(local_handle, clip_line);
         if (!island_geoms_owned)
             for (auto* ig : island_geoms) GEOSGeom_destroy_r(local_handle, ig);
         if (island_union) GEOSGeom_destroy_r(local_handle, island_union);

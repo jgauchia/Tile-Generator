@@ -106,8 +106,26 @@ constexpr int POPULATION_MAJOR_CITY = 500000;
 constexpr int POPULATION_LARGE_CITY = 100000;
 constexpr int POPULATION_TOWN = 15000;
 
-constexpr double CLIP_MARGIN_POLYGON = 0.10;
-constexpr double CLIP_MARGIN_LINE = 1.0;
+/// Clip buffer for polygons, in pixels of a TILE_SIZE_PX tile: enough to keep the
+/// cut edge out of the tile, no longer a tenth of it.
+constexpr int CLIP_POLYGON_PX = 2;
+/// Casing keeps the wide buffer: a cut inside the stroke would leave a false
+/// edge along the tile border.
+constexpr double CLIP_MARGIN_CASING = 0.10;
+/// Clip buffer for lines, in pixels of a TILE_SIZE_PX tile. It only has to cover the
+/// widest stroke: the simplification runs once per zoom, before the tile split, so
+/// there is no mismatched join between two tiles left to hide.
+constexpr int TILE_SIZE_PX = 256;
+constexpr int CLIP_LINE_PX_LOW = 4;   ///< z < 15
+constexpr int CLIP_LINE_PX_MID = 8;   ///< z 15..17
+constexpr int CLIP_LINE_PX_HIGH = 16; ///< z > 17
+
+inline int clip_line_px(int z)
+{
+    if (z < 15) return CLIP_LINE_PX_LOW;
+    if (z <= 17) return CLIP_LINE_PX_MID;
+    return CLIP_LINE_PX_HIGH;
+}
 constexpr double K_VISIBILITY = 2.0;
 constexpr double K_HOLE_FACTOR = 10.0;
 constexpr const char* LAND_BG_COLOR = "#f2efe9";
