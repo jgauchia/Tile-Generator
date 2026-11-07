@@ -146,13 +146,28 @@ private:
             return false;
         };
 
-        auto expand_tiles = [&](double lon, double lat) -> std::vector<TileCoord> {
-            int tx = static_cast<int>(utils::lon_to_x(lon, zoom));
-            int ty = static_cast<int>(utils::lat_to_y(lat, zoom));
+        auto labelScale = [](const Feature& f) -> double {
+            if (f.font_size == 0) return 1.0;
+            if (f.font_size == 1) return 1.2;
+            return 1.5;
+        };
+
+        auto tilesForLabel = [&](double lon, double lat, double halfW, double halfH) -> std::vector<TileCoord> {
+            int anchorX = static_cast<int>(utils::lon_to_x(lon, zoom));
+            int anchorY = static_cast<int>(utils::lat_to_y(lat, zoom));
+            int tx0 = static_cast<int>(std::floor(utils::lon_to_x(lon - halfW, zoom)));
+            int tx1 = static_cast<int>(std::floor(utils::lon_to_x(lon + halfW, zoom) - 1e-9));
+            int ty0 = static_cast<int>(std::floor(utils::lat_to_y(lat + halfH, zoom)));
+            int ty1 = static_cast<int>(std::floor(utils::lat_to_y(lat - halfH, zoom) - 1e-9));
+            // Clamp the copies to the anchor offsets the text payload can encode.
+            tx0 = std::max(tx0, anchorX - 2);
+            tx1 = std::min(tx1, anchorX + 3);
+            ty0 = std::max(ty0, anchorY - 2);
+            ty1 = std::min(ty1, anchorY + 3);
             std::vector<TileCoord> tiles;
-            for (int dx = -1; dx <= 1; ++dx)
-                for (int dy = -1; dy <= 1; ++dy)
-                    tiles.push_back({tx + dx, ty + dy});
+            for (int tx = tx0; tx <= tx1; ++tx)
+                for (int ty = ty0; ty <= ty1; ++ty)
+                    tiles.push_back({tx, ty});
             return tiles;
         };
 
@@ -161,12 +176,14 @@ private:
         {
             double half_w = char_w * pf->text.size() / 2.0;
             double half_h = label_h;
-            double lon = pf->points[0].lon, lat = pf->points[0].lat;
+            double scale = labelScale(*pf);
+            double lon = pf->points[0].lon;
+            double lat = pf->points[0].lat;
             Box box{lon - half_w, lat - half_h, lon + half_w, lat + half_h};
             if (!check_overlap(box))
             {
                 placed_boxes.push_back(box);
-                result.push_back({*pf, expand_tiles(lon, lat)});
+                result.push_back({*pf, tilesForLabel(lon, lat, half_w * scale, half_h * scale)});
             }
         }
 
@@ -175,6 +192,7 @@ private:
         {
             double half_w = char_w * rf->text.size() / 2.0;
             double half_h = label_h;
+            double scale = labelScale(*rf);
             for (const auto& cand : rf->coords_candidates)
             {
                 Box box{cand.lon - half_w, cand.lat - half_h, cand.lon + half_w, cand.lat + half_h};
@@ -183,7 +201,7 @@ private:
                     placed_boxes.push_back(box);
                     Feature f_copy = *rf;
                     f_copy.points = {cand};
-                    result.push_back({std::move(f_copy), expand_tiles(cand.lon, cand.lat)});
+                    result.push_back({std::move(f_copy), tilesForLabel(cand.lon, cand.lat, half_w * scale, half_h * scale)});
                     break;
                 }
             }
