@@ -543,7 +543,9 @@ private:
         if ((tags.count("landuse") && tags.at("landuse") == "cemetery") ||
             (tags.count("amenity") && tags.at("amenity") == "grave_yard"))
             nibble = 3;
-        if (tags.count("leisure") && (tags.at("leisure") == "park" || tags.at("leisure") == "nature_reserve"))
+        if (tags.count("leisure") && tags.at("leisure") == "park")
+            nibble = 2;
+        if (tags.count("leisure") && tags.at("leisure") == "nature_reserve")
             nibble = 1;
         if (tags.count("leisure") && tags.at("leisure") == "playground")
             nibble = 4;

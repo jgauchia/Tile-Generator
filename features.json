@@ -1,5 +1,5 @@
 {
-  "_nibble_doc": "priority = z-order nibble 0-15. 0:bg 1:large zones(aerodrome,park,residential,commercial,industrial) 2:landuse base(parking,apron,heath,scrub) 3:landuse detail(retail,cemetery,garages,leisure) 4:surfaces(pitch,beach,wetland,playground) 5:forest/wood 6:infrastructure 7:buildings+water 8-14:roads 15:rail/bridges",
+  "_nibble_doc": "priority = z-order nibble 0-15. 0:bg 1:large zones(aerodrome,nature_reserve,residential,commercial,industrial) 2:landuse base(parking,apron,heath,scrub,park) 3:landuse detail(retail,cemetery,garages,leisure) 4:surfaces(pitch,beach,wetland,playground) 5:forest/wood 6:infrastructure 7:buildings+water 8-14:roads 15:rail/bridges",
   "landuse=forest": {
     "zoom": 8,
     "color": "#add19e",

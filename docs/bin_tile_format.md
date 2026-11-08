@@ -177,7 +177,7 @@ via `palette[color_index]`.
 ```
  0: Background land
  1: Large zones (aerodrome, residential, commercial, industrial)
- 2: Landuse base (parking, heath, scrub), islands
+ 2: Landuse base (parking, heath, scrub, park), islands
  3: Boundaries, retail, cemetery, leisure
  4: Surfaces (pitch, beach, wetland, farmland)
  5: Forest/wood, apron

@@ -18,7 +18,7 @@ Each entry in the JSON file is a key-value pair:
 | :--- | :--- | :--- |
 | `zoom` | integer | Minimum zoom level at which the feature is included in the packed containers. |
 | `color` | string | HTML hex color (`#rrggbb`). Converted to RGB565 in the binary format. |
-| `priority`| integer | Local priority (0-15). Lower nibble of the binary zoom_priority. |
+| `priority`| integer | Local priority (0-15) for line features; it becomes the lower nibble of the binary zoom_priority. Polygon z-order is assigned from the OSM tags. |
 | `widths` | object | **Manual Width Scaling**: Map of zoom level to pixels (0.5px units in binary). |
 
 ---
@@ -53,13 +53,13 @@ Each entry in the JSON file is a key-value pair:
 
 ## 4. Layer Priority System
 
-The generator uses a simplified 16-level priority system (0-15). This value determines the rendering order within each of the four rendering passes. If multiple features have the same priority, their order is determined by their sequence in the PBF file.
+The generator uses a simplified 16-level priority system (0-15). For line features, this value determines the rendering order within each of the four rendering passes, and features with the same priority keep their PBF order. Polygon z-order is assigned by the generator from the OSM tags (see `bin_tile_format.md` §6).
 
 | Priority | Feature Type Examples |
 | :--- | :--- |
 | **0** | Background land. |
-| **1-2** | Large areas (Aerodromes, large forests, terrain). |
-| **3-5** | Smaller areas (Parks, gardens, grass, cemeteries). |
+| **1-2** | Large areas (Aerodromes, large forests, parks, terrain). |
+| **3-5** | Smaller areas (Gardens, grass, cemeteries). |
 | **6-7** | Infrastructure and Buildings. |
 | **8** | Water (Lakes, rivers). |
 | **9-11** | Links and local roads. |
