@@ -118,7 +118,7 @@ private:
 
         for (const auto& f : all_text)
         {
-            int min_z = f.zoom_priority >> 4;
+            int min_z = f.text_min_zoom > 0 ? f.text_min_zoom : (f.zoom_priority >> 4);
             if (min_z > zoom) continue;
             if (f.geom_type != GEOM_TEXT) continue;
             if (f.points.empty()) continue;
@@ -130,6 +130,16 @@ private:
 
         std::sort(place_names.begin(), place_names.end(),
                   [](const Feature* a, const Feature* b) { return a->population > b->population; });
+
+        auto way_label_rank = [](const Feature* f) -> int {
+            if (f->bg_color_rgb565 != 0) return 0; // ref shields first
+            if (constants::is_path_like_highway(f->highway_type)) return 1;
+            return 2;
+        };
+        std::sort(road_labels.begin(), road_labels.end(),
+                  [&](const Feature* a, const Feature* b) {
+                      return way_label_rank(a) < way_label_rank(b);
+                  });
 
         double tile_w_deg = 360.0 / std::pow(2.0, zoom);
         double pixel_deg = tile_w_deg / 256.0;
@@ -511,7 +521,10 @@ private:
         double prep_loop_s = 0.0, prep_insert_s = 0.0;
         uint64_t prep_inserts = 0;
         std::unordered_map<TileCoord, std::vector<size_t>, TileCoordHash> tile_map;
-        for (int b = 0; b <= z; ++b)
+        // features_by_zoom holds buckets 0–17 (pack_zoom_priority clamps min_zoom to 15).
+        // Rendering zoom z needs all buckets b <= z, clamped to the array size.
+        int max_bucket = std::min(z, static_cast<int>(std::size(features_by_zoom)) - 1);
+        for (int b = 0; b <= max_bucket; ++b)
         {
             const auto& bucket = features_by_zoom[b];
             for (size_t offset : bucket)
@@ -1265,7 +1278,13 @@ private:
             uint8_t final_width = 1;
             if (pf.type == GEOM_LINESTRING)
             {
-                if (!pf.highway_type.empty())
+                if (!pf.zoom_widths.empty())
+                {
+                    // Explicit per-feature width table (features JSON) wins
+                    for (auto const& [w_zoom, w_pixels] : pf.zoom_widths)
+                        if (z >= w_zoom) final_width = w_pixels;
+                }
+                else if (!pf.highway_type.empty())
                 {
                     auto wit = width_table.find(pf.highway_type);
                     if (wit != width_table.end())
@@ -1275,11 +1294,6 @@ private:
                     }
                     else if (pf.width > 0)
                         final_width = utils::meters_to_pixels(pf.width, z);
-                }
-                else if (!pf.zoom_widths.empty())
-                {
-                    for (auto const& [w_zoom, w_pixels] : pf.zoom_widths)
-                        if (z >= w_zoom) final_width = w_pixels;
                 }
                 else if (pf.width > 0)
                     final_width = utils::meters_to_pixels(pf.width, z);
