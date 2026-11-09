@@ -1,5 +1,5 @@
 {
-  "_nibble_doc": "priority = z-order nibble 0-15. 0:bg 1:large zones(aerodrome,nature_reserve,residential,commercial,industrial) 2:landuse base(parking,apron,heath,scrub,park) 3:landuse detail(retail,cemetery,garages,leisure) 4:surfaces(pitch,beach,wetland,playground) 5:forest/wood 6:infrastructure 7:buildings+water 8-14:roads 15:rail/bridges",
+  "_nibble_doc": "priority = z-order nibble 0-15. 0:bg 1:large zones(aerodrome,nature_reserve,residential,commercial,industrial) 2:landuse base(apron,heath,scrub,park) 3:landuse detail(retail,cemetery,garages,leisure) 4:surfaces(pitch,beach,wetland,playground) 5:forest/wood/grass/golf base 6:infrastructure/rock/golf bunker,green,tee,parking 7:buildings+water 8:paths/trails/piers 9-14:roads 15:rail/bridges",
   "landuse=forest": {
     "zoom": 8,
     "color": "#add19e",
@@ -177,7 +177,7 @@
   },
   "leisure=golf_course": {
     "zoom": 11,
-    "color": "#ceecb1",
+    "color": "#def6c0",
     "priority": 4
   },
   "leisure=nature_reserve": {
@@ -235,6 +235,36 @@
     "color": "#a9e0cb",
     "priority": 6
   },
+  "golf=bunker": {
+    "zoom": 14,
+    "color": "#f5e9c7",
+    "priority": 6
+  },
+  "golf=driving_range": {
+    "zoom": 12,
+    "color": "#ceecb1",
+    "priority": 5
+  },
+  "golf=fairway": {
+    "zoom": 12,
+    "color": "#ceecb1",
+    "priority": 5
+  },
+  "golf=green": {
+    "zoom": 13,
+    "color": "#a9e0cb",
+    "priority": 6
+  },
+  "golf=rough": {
+    "zoom": 12,
+    "color": "#c9d7ac",
+    "priority": 5
+  },
+  "golf=tee": {
+    "zoom": 13,
+    "color": "#a9e0cb",
+    "priority": 6
+  },
   "natural=beach": {
     "zoom": 10,
     "color": "#fff1b8",
@@ -254,6 +284,21 @@
     "zoom": 12,
     "color": "#c7facb",
     "priority": 1
+  },
+  "leisure=dog_park": {
+    "zoom": 10,
+    "color": "#d8fdda",
+    "priority": 3
+  },
+  "tourism=picnic_site": {
+    "zoom": 10,
+    "color": "#def6c0",
+    "priority": 3
+  },
+  "tourism=camp_site": {
+    "zoom": 10,
+    "color": "#def6c0",
+    "priority": 3
   },
   "amenity=parking": {
     "zoom": 13,
@@ -308,7 +353,7 @@
   "natural=bare_rock": {
     "zoom": 8,
     "color": "#eee6dd",
-    "priority": 2
+    "priority": 6
   },
   "natural=peak": {
     "zoom": 12,
@@ -323,7 +368,7 @@
   "natural=scree": {
     "zoom": 8,
     "color": "#eee6dd",
-    "priority": 2
+    "priority": 6
   },
   "natural=cliff": {
     "zoom": 11,
@@ -432,8 +477,8 @@
   },
   "natural=coastline": {
     "zoom": 12,
-    "color": "#aad2df",
-    "priority": 7
+    "color": "#5a8ca3",
+    "priority": 8
   },
   "natural=wetland": {
     "zoom": 11,
@@ -448,27 +493,32 @@
   "waterway=river": {
     "zoom": 10,
     "color": "#aad2df",
-    "priority": 7
+    "priority": 7,
+    "widths": { "10": 2, "16": 6 }
   },
   "waterway=canal": {
     "zoom": 10,
     "color": "#aad2df",
-    "priority": 7
+    "priority": 7,
+    "widths": { "10": 2, "16": 6 }
   },
   "waterway=stream": {
     "zoom": 13,
     "color": "#aad2df",
-    "priority": 7
+    "priority": 7,
+    "widths": { "13": 2, "16": 6 }
   },
   "waterway=ditch": {
     "zoom": 13,
     "color": "#aad2df",
-    "priority": 7
+    "priority": 7,
+    "widths": { "13": 2, "16": 2 }
   },
   "waterway=drain": {
     "zoom": 13,
     "color": "#aad2df",
-    "priority": 7
+    "priority": 7,
+    "widths": { "13": 2, "16": 2 }
   },
   "railway=rail": {
     "zoom": 10,
@@ -548,7 +598,7 @@
   "highway=tertiary": {
     "zoom": 12,
     "color": "#ffffff",
-    "priority": 13
+    "priority": 12
   },
   "highway=unclassified": {
     "zoom": 13,
@@ -605,6 +655,16 @@
     "color": "#996600",
     "priority": 9
   },
+  "highway=path": {
+    "zoom": 16,
+    "color": "#f88576",
+    "priority": 8
+  },
+  "highway=footway": {
+    "zoom": 16,
+    "color": "#f88576",
+    "priority": 8
+  },
   "highway=construction": {
     "zoom": 13,
     "color": "#aaaaaa",
@@ -658,7 +718,7 @@
   "man_made=pier": {
     "zoom": 11,
     "color": "#f6f1e4",
-    "priority": 6
+    "priority": 8
   },
   "building": {
     "zoom": 13,
@@ -667,6 +727,11 @@
   },
   "man_made=tower": {
     "zoom": 14,
+    "color": "#d9d0c9",
+    "priority": 7
+  },
+  "man_made=storage_tank": {
+    "zoom": 13,
     "color": "#d9d0c9",
     "priority": 7
   },
@@ -701,6 +766,11 @@
     "priority": 4
   },
   "amenity=school": {
+    "zoom": 13,
+    "color": "#ffffe5",
+    "priority": 4
+  },
+  "amenity=kindergarten": {
     "zoom": 13,
     "color": "#ffffe5",
     "priority": 4

@@ -61,7 +61,6 @@ inline const std::unordered_map<std::string, std::map<int,std::string>>& line_co
         {"residential",   {{13,"#cccccc"}}},
         {"unclassified",  {{12,"#cccccc"}}},
         {"living_street", {{12,"#cccccc"}}},
-        {"track",         {{15,"#ffffff"},{16,"#ffffff"}}},
         {"service",       {{16,"#cccccc"}}},
         {"secondary",     {{10,"#bababa"},{11,"#bababa"}}},
     };

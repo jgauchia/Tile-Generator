@@ -903,7 +903,7 @@ class NAVViewer:
             # Polygon casing: the pack flags buildings at z>=16, and the firmware
             # draws a 1px outline 35% darker than the fill. Mirror it here.
             if self.fill_polygons and feature.needs_casing and self.zoom >= 16:
-                casing_color = darken_color(color, amount=0.35)
+                casing_color = darken_color(color, amount=0.18)
                 for ring_pts in all_screen_rings:
                     if len(ring_pts) >= 2:
                         pygame.draw.lines(surface, casing_color, True, ring_pts, 1)

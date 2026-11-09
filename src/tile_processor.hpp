@@ -1309,6 +1309,9 @@ private:
             uint8_t final_width = 1;
             if (pf.type == GEOM_LINESTRING)
             {
+                // TODO(width): for path-like features (path, track, footway,
+                // bridleway, cycleway), prefer OSM width_meters converted to
+                // packed half-pixels when present; otherwise use the table.
                 if (!pf.highway_type.empty())
                 {
                     auto wit = width_table.find(pf.highway_type);
