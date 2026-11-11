@@ -466,9 +466,9 @@
     "priority": 7
   },
   "waterway=boatyard": {
-    "zoom": 12,
-    "color": "#aad2df",
-    "priority": 7
+    "zoom": 10,
+    "color": "#ebdbe8",
+    "priority": 1
   },
   "waterway=riverbank": {
     "zoom": 8,
