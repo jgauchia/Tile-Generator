@@ -10,6 +10,8 @@
 #include <string>
 #include <vector>
 #include <iostream>
+#include <functional>
+#include <ogr_geometry.h>
 #include <ogrsf_frmts.h>
 #include "nav_types.hpp"
 #include "mapped_store.hpp"
@@ -44,10 +46,79 @@ inline size_t load_water_polygons(const std::string& shapefile_path,
         return 0;
     }
 
+    if (bbox_min_lon >= bbox_max_lon || bbox_min_lat >= bbox_max_lat)
+    {
+        std::cerr << "Error: invalid water clip bbox: " << bbox_min_lon << "," << bbox_min_lat
+                  << " -> " << bbox_max_lon << "," << bbox_max_lat << std::endl;
+        GDALClose(ds);
+        return 0;
+    }
+
+    // Spatial filtering only selects whole features: ocean polygons can still
+    // span the world. Clip them to the PBF bbox before they reach the tile grid.
+    OGRLinearRing bbox_ring;
+    bbox_ring.addPoint(bbox_min_lon, bbox_min_lat);
+    bbox_ring.addPoint(bbox_max_lon, bbox_min_lat);
+    bbox_ring.addPoint(bbox_max_lon, bbox_max_lat);
+    bbox_ring.addPoint(bbox_min_lon, bbox_max_lat);
+    bbox_ring.addPoint(bbox_min_lon, bbox_min_lat);
+    OGRPolygon bbox_poly;
+    bbox_poly.addRing(&bbox_ring);
+
     layer->SetSpatialFilterRect(bbox_min_lon, bbox_min_lat, bbox_max_lon, bbox_max_lat);
     layer->ResetReading();
     size_t count = 0;
     static int64_t ocean_id_base = -1000000000;
+
+    auto process_polygon = [&](OGRPolygon* poly)
+    {
+        Feature feat;
+        feat.id = ocean_id_base--;
+        feat.geom_type = GEOM_POLYGON;
+        feat.color_rgb565 = water_color;
+        feat.width_meters = 0;
+        feat.layer = "water";
+        feat.zoom_priority = utils::pack_zoom_priority(min_zoom, 7);
+
+        OGRLinearRing* ext = poly ? poly->getExteriorRing() : nullptr;
+        if (!ext || ext->getNumPoints() < 4)
+            return;
+
+        for (int i = 0; i < ext->getNumPoints(); ++i)
+            feat.points.push_back({ext->getX(i), ext->getY(i)});
+        feat.ring_ends.push_back(static_cast<uint32_t>(feat.points.size()));
+
+        for (int r = 0; r < poly->getNumInteriorRings(); ++r)
+        {
+            OGRLinearRing* inner = poly->getInteriorRing(r);
+            if (!inner || inner->getNumPoints() < 4)
+                continue;
+            for (int i = 0; i < inner->getNumPoints(); ++i)
+                feat.points.push_back({inner->getX(i), inner->getY(i)});
+            feat.ring_ends.push_back(static_cast<uint32_t>(feat.points.size()));
+        }
+
+        if (min_zoom < 18)
+            features_by_zoom[min_zoom].push_back(store.append(feat));
+        ++count;
+    };
+
+    std::function<void(OGRGeometry*)> process_geometry = [&](OGRGeometry* geom)
+    {
+        if (!geom || geom->IsEmpty())
+            return;
+        OGRwkbGeometryType gtype = wkbFlatten(geom->getGeometryType());
+        if (gtype == wkbPolygon)
+        {
+            process_polygon(static_cast<OGRPolygon*>(geom));
+        }
+        else if (gtype == wkbMultiPolygon || gtype == wkbGeometryCollection)
+        {
+            OGRGeometryCollection* collection = static_cast<OGRGeometryCollection*>(geom);
+            for (int i = 0; i < collection->getNumGeometries(); ++i)
+                process_geometry(collection->getGeometryRef(i));
+        }
+    };
 
     OGRFeature* ogr_feat;
     while ((ogr_feat = layer->GetNextFeature()) != nullptr)
@@ -66,49 +137,10 @@ inline size_t load_water_polygons(const std::string& shapefile_path,
             continue;
         }
 
-        auto process_polygon = [&](OGRPolygon* poly)
-        {
-            Feature feat;
-            feat.id = ocean_id_base--;
-            feat.geom_type = GEOM_POLYGON;
-            feat.color_rgb565 = water_color;
-            feat.width_meters = 0;
-            feat.layer = "water";
-            feat.zoom_priority = utils::pack_zoom_priority(min_zoom, 7);
-
-            OGRLinearRing* ext = poly->getExteriorRing();
-            if (!ext || ext->getNumPoints() < 4)
-                return;
-
-            for (int i = 0; i < ext->getNumPoints(); ++i)
-                feat.points.push_back({ext->getX(i), ext->getY(i)});
-            feat.ring_ends.push_back(static_cast<uint32_t>(feat.points.size()));
-
-            for (int r = 0; r < poly->getNumInteriorRings(); ++r)
-            {
-                OGRLinearRing* inner = poly->getInteriorRing(r);
-                if (!inner || inner->getNumPoints() < 4)
-                    continue;
-                for (int i = 0; i < inner->getNumPoints(); ++i)
-                    feat.points.push_back({inner->getX(i), inner->getY(i)});
-                feat.ring_ends.push_back(static_cast<uint32_t>(feat.points.size()));
-            }
-
-            if (min_zoom < 18)
-                features_by_zoom[min_zoom].push_back(store.append(feat));
-            ++count;
-        };
-
-        if (gtype == wkbPolygon)
-        {
-            process_polygon((OGRPolygon*)geom);
-        }
-        else
-        {
-            OGRMultiPolygon* mp = (OGRMultiPolygon*)geom;
-            for (int i = 0; i < mp->getNumGeometries(); ++i)
-                process_polygon((OGRPolygon*)mp->getGeometryRef(i));
-        }
+        OGRGeometry* clipped = geom->Intersection(&bbox_poly);
+        if (clipped && !clipped->IsEmpty())
+            process_geometry(clipped);
+        delete clipped;
 
         OGRFeature::DestroyFeature(ogr_feat);
     }

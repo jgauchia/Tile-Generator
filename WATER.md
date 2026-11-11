@@ -29,14 +29,15 @@ The web service does this step for you the first time the water option is used.
     --water-shp path/to/water-polygons-split-4326/water_polygons.shp
 ```
 
-The generator reads the PBF bounding box and uses OGR spatial filtering to only load water polygons that intersect the extract area. A regional extract like Languedoc-Roussillon loads ~4 polygons, not the entire world.
+The generator reads the PBF bounding box and uses OGR spatial filtering to select water polygons that intersect the extract area. Each selected polygon is then **clipped to that bbox** with an OGR intersection before it enters the feature store. A regional extract like Languedoc-Roussillon loads ~4 polygons, not the entire world.
 
 ## How it works
 
-1. The PBF header provides the bounding box of the extract
+1. The data bbox comes from the PBF nodes read by the generator
 2. GDAL/OGR opens the shapefile and applies a spatial filter (`SetSpatialFilterRect`)
-3. Matching polygons are injected into the feature store as `layer="water"` with the standard water color (`#aad2df`)
-4. The tile processor clips, simplifies, and renders them like any other water feature
+3. Each matching polygon is intersected with the bbox polygon, so a global ocean polygon cannot expand the tile grid outside the extract
+4. Clipped polygons are injected into the feature store as `layer="water"` with the standard water color (`#aad2df`)
+5. The tile processor clips, simplifies, and renders them like any other water feature
 
 ## Dependencies
 
