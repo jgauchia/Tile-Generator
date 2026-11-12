@@ -528,7 +528,26 @@ private:
         auto start = std::chrono::steady_clock::now();
         double prep_loop_s = 0.0, prep_insert_s = 0.0;
         uint64_t prep_inserts = 0;
-        std::unordered_map<TileCoord, std::vector<size_t>, TileCoordHash> tile_map;
+
+        // One span per feature, in the same order the old unordered_map saw them.
+        struct FeatureSpan
+        {
+            size_t offset;
+            int min_x;
+            int max_x;
+            int min_y;
+            int max_y;
+        };
+        std::vector<FeatureSpan> spans;
+        size_t feature_count = 0;
+        for (int b = 0; b <= z; ++b)
+            feature_count += features_by_zoom[b].size();
+        spans.reserve(feature_count);
+
+        int grid_min_x = 1e9;
+        int grid_max_x = -1;
+        int grid_min_y = 1e9;
+        int grid_max_y = -1;
         for (int b = 0; b <= z; ++b)
         {
             const auto& bucket = features_by_zoom[b];
@@ -553,15 +572,13 @@ private:
                     if (ty > max_ty) max_ty = ty;
                 }
                 prep_loop_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - tl0).count();
+                if (min_tx > max_tx) continue;
 
-                auto ti0 = std::chrono::steady_clock::now();
-                for (int x = min_tx; x <= max_tx; ++x)
-                    for (int y = min_ty; y <= max_ty; ++y)
-                    {
-                        tile_map[{x, y}].push_back(offset);
-                        prep_inserts++;
-                    }
-                prep_insert_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - ti0).count();
+                spans.push_back({offset, min_tx, max_tx, min_ty, max_ty});
+                if (min_tx < grid_min_x) grid_min_x = min_tx;
+                if (max_tx > grid_max_x) grid_max_x = max_tx;
+                if (min_ty < grid_min_y) grid_min_y = min_ty;
+                if (max_ty > grid_max_y) grid_max_y = max_ty;
             }
         }
 
@@ -572,34 +589,79 @@ private:
                 tile_label_indices[tc].push_back(li);
         }
 
-        // Label-only tiles need a work item too. Add them before moving the feature
-        // lists so every tile is visited exactly once without a second coordinate set.
+        // Label-only tiles still need a work item, so include them in the grid bounds.
         for (const auto& [tc, _] : tile_label_indices)
-            tile_map.emplace(tc, std::vector<size_t>{});
-
-        if (tile_map.empty()) return;
-
-        struct TileWork
         {
-            TileCoord coord;
-            std::vector<size_t> offsets;
-            std::vector<size_t> label_indices;
-        };
-        std::vector<TileWork> tiles;
-        tiles.reserve(tile_map.size());
-        for (auto& [tc, offsets] : tile_map)
-        {
-            TileWork tw;
-            tw.coord = tc;
-            tw.offsets = std::move(offsets);
-            if (auto it = tile_label_indices.find(tc); it != tile_label_indices.end())
-                tw.label_indices = std::move(it->second);
-            tiles.push_back(std::move(tw));
+            if (tc.x < grid_min_x) grid_min_x = tc.x;
+            if (tc.x > grid_max_x) grid_max_x = tc.x;
+            if (tc.y < grid_min_y) grid_min_y = tc.y;
+            if (tc.y > grid_max_y) grid_max_y = tc.y;
         }
+
+        if (grid_min_x > grid_max_x) return;
+
+        uint32_t grid_wide = static_cast<uint32_t>(grid_max_x - grid_min_x + 1);
+        uint32_t grid_high = static_cast<uint32_t>(grid_max_y - grid_min_y + 1);
+        size_t cell_count = static_cast<size_t>(grid_wide) * grid_high;
+
+        auto ti0 = std::chrono::steady_clock::now();
+        std::vector<uint32_t> cell_starts(cell_count + 1, 0);
+        std::vector<uint8_t> cell_active(cell_count, 0);
+        for (const auto& span : spans)
+        {
+            for (int x = span.min_x; x <= span.max_x; ++x)
+            {
+                for (int y = span.min_y; y <= span.max_y; ++y)
+                {
+                    size_t cell = (size_t)(y - grid_min_y) * grid_wide + (x - grid_min_x);
+                    ++cell_starts[cell + 1];
+                    cell_active[cell] = 1;
+                    ++prep_inserts;
+                }
+            }
+        }
+
+        for (const auto& [tc, _] : tile_label_indices)
+        {
+            size_t cell = (size_t)(tc.y - grid_min_y) * grid_wide + (tc.x - grid_min_x);
+            cell_active[cell] = 1;
+        }
+
+        for (size_t i = 1; i <= cell_count; ++i)
+            cell_starts[i] += cell_starts[i - 1];
+        if (cell_starts[cell_count] > UINT32_MAX)
+            throw std::runtime_error("tile index exceeds 32-bit offsets");
+
+        std::vector<size_t> feature_offsets(cell_starts[cell_count]);
+        std::vector<uint32_t> cursor(cell_starts.begin(), cell_starts.end());
+        for (const auto& span : spans)
+        {
+            for (int x = span.min_x; x <= span.max_x; ++x)
+            {
+                for (int y = span.min_y; y <= span.max_y; ++y)
+                {
+                    size_t cell = (size_t)(y - grid_min_y) * grid_wide + (x - grid_min_x);
+                    feature_offsets[cursor[cell]++] = span.offset;
+                }
+            }
+        }
+
+        std::vector<uint32_t> active_cells;
+        active_cells.reserve(std::min(cell_count, static_cast<size_t>(prep_inserts)));
+        for (size_t cell = 0; cell < cell_count; ++cell)
+            if (cell_active[cell]) active_cells.push_back(static_cast<uint32_t>(cell));
+        prep_insert_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - ti0).count();
+
+        std::vector<FeatureSpan>().swap(spans);
+        std::vector<uint32_t>().swap(cursor);
+        std::vector<uint8_t>().swap(cell_active);
+
+        if (active_cells.empty()) return;
 
         auto t_prep1 = std::chrono::steady_clock::now();
 
-        std::vector<PackedTile> packed_results(tiles.size());
+        const size_t tile_count = active_cells.size();
+        std::vector<PackedTile> packed_results(tile_count);
         unsigned int num_threads = std::thread::hardware_concurrency();
         if (num_threads == 0) num_threads = 4;
         std::atomic<size_t> next_tile(0), merged_count{0};
@@ -609,23 +671,37 @@ private:
         {
             workers.emplace_back([&]() {
                 GEOSContextHandle_t handle = GEOS_init_r();
+                std::vector<const Feature*> tile_labels;
                 while (true)
                 {
                     size_t idx = next_tile.fetch_add(1);
-                    if (idx >= tiles.size()) break;
-                    const auto& tw = tiles[idx];
+                    if (idx >= tile_count) break;
+                    uint32_t cell = active_cells[idx];
+                    int tile_x = grid_min_x + static_cast<int>(cell % grid_wide);
+                    int tile_y = grid_min_y + static_cast<int>(cell / grid_wide);
+                    size_t begin = cell_starts[cell];
+                    size_t end = cell_starts[cell + 1];
                     size_t m = 0;
 
-                    std::vector<const Feature*> tile_labels;
-                    for (size_t li : tw.label_indices)
-                        tile_labels.push_back(&placed_labels[li].feature);
+                    tile_labels.clear();
+                    auto label_it = tile_label_indices.find(TileCoord{tile_x, tile_y});
+                    if (label_it != tile_label_indices.end())
+                    {
+                        tile_labels.reserve(label_it->second.size());
+                        for (size_t li : label_it->second)
+                            tile_labels.push_back(&placed_labels[li].feature);
+                    }
 
-                    auto pt_syms = make_point_symbols(point_features, z, tw.coord.x, tw.coord.y);
+                    auto pt_syms = make_point_symbols(point_features, z, tile_x, tile_y);
 
-                    packed_results[idx].x = (uint32_t)tw.coord.x;
-                    packed_results[idx].y = (uint32_t)tw.coord.y;
-                    packed_results[idx].data = serialize_tile(z, tw.coord.x, tw.coord.y,
-                                                              store, tw.offsets, handle, m,
+                    const size_t* tile_offsets = feature_offsets.empty()
+                        ? nullptr
+                        : feature_offsets.data() + begin;
+                    packed_results[idx].x = (uint32_t)tile_x;
+                    packed_results[idx].y = (uint32_t)tile_y;
+                    packed_results[idx].data = serialize_tile(z, tile_x, tile_y,
+                                                              store, tile_offsets,
+                                                              end - begin, handle, m,
                                                               tile_labels, pt_syms);
                     merged_count += m;
                 }
@@ -633,16 +709,16 @@ private:
             });
         }
 
-        while (next_tile < tiles.size())
+        while (next_tile < tile_count)
         {
             auto now = std::chrono::steady_clock::now();
             std::chrono::duration<double> zoom_elapsed = now - start;
-            float progress = (float)next_tile / tiles.size();
+            float progress = (float)next_tile / tile_count;
             double tps = (zoom_elapsed.count() > 0.1) ? (double)next_tile / zoom_elapsed.count() : 0;
             std::cout << "\r\33[2K  Zoom " << std::setw(2) << z << ": ["
                       << std::string(progress * 20, '#') << std::string(20 - progress * 20, '-')
                       << "] " << std::setw(3) << int(progress * 100.0) << "% | "
-                      << std::setw(8) << (size_t)next_tile << "/" << tiles.size()
+                      << std::setw(8) << (size_t)next_tile << "/" << tile_count
                       << " tiles | " << std::fixed << std::setprecision(1) << tps << " t/s" << std::flush;
             std::this_thread::sleep_for(std::chrono::milliseconds(200));
         }
@@ -828,9 +904,9 @@ private:
         }
         auto end = std::chrono::steady_clock::now();
         std::chrono::duration<double> elapsed = end - start;
-        double avg_tps = (elapsed.count() > 0) ? (double)tiles.size() / elapsed.count() : 0;
+        double avg_tps = (elapsed.count() > 0) ? (double)tile_count / elapsed.count() : 0;
         std::cout << "\r\33[2K  Zoom " << std::setw(2) << z << ": "
-                  << std::setw(8) << tiles.size() << " tiles ("
+                  << std::setw(8) << tile_count << " tiles ("
                   << std::fixed << std::setprecision(1) << avg_tps << " t/s), "
                   << std::setw(8) << (size_t)merged_count << " polygons merged | "
                   << std::setw(6) << std::setprecision(1) << (zoom_bytes / 1024.0 / 1024.0) << " MB done in " << elapsed.count() << "s" << std::endl;
@@ -860,7 +936,7 @@ private:
      *         later collapsed to a 1-byte palette index during the zoom-level palette pass.
      */
     std::vector<uint8_t> serialize_tile(int z, int x, int y, const MappedStore& store,
-                                         const std::vector<size_t>& offsets,
+                                         const size_t* offsets, size_t offset_count,
                                          GEOSContextHandle_t local_handle, size_t& merged_out,
                                          const std::vector<const Feature*>& tile_labels,
                                          const std::vector<ProcessedFeature>& point_symbols)
@@ -877,15 +953,16 @@ private:
         std::map<Style, std::vector<GEOSGeometry*>> poly_groups;
         std::map<Style, std::vector<Feature>> poly_individual;
         std::vector<Feature> lines;
-        lines.reserve(offsets.size());
+        lines.reserve(offset_count);
         std::vector<GEOSGeometry*> island_geoms;
         const auto& width_table = constants::line_width_per_zoom();
         const auto& color_table = constants::line_color_per_zoom();
 
         double pre_min_area = constants::min_area_deg2_for_zoom(z);
 
-        for (size_t offset : offsets)
+        for (size_t oi = 0; oi < offset_count; ++oi)
         {
+            size_t offset = offsets[oi];
             Feature f = store.get(offset);
             if (f.geom_type == GEOM_POLYGON)
             {
@@ -1021,7 +1098,7 @@ private:
             min_hole_area_deg2 = (pixel_deg * pixel_deg) * constants::K_VISIBILITY * hole_factor;
         }
         std::vector<ProcessedFeature> final_features;
-        final_features.reserve(offsets.size() + tile_labels.size() + point_symbols.size() + 8);
+        final_features.reserve(offset_count + tile_labels.size() + point_symbols.size() + 8);
 
         auto project_ring = [&](const GEOSGeometry* ring) -> std::vector<std::pair<int16_t, int16_t>> {
             std::vector<std::pair<int16_t, int16_t>> rpts;
