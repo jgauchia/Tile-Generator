@@ -309,7 +309,25 @@ private:
      * @param tile_y         Tile Y coordinate.
      * @return ProcessedFeature list with one polygon per visible point.
      */
+    std::unordered_map<TileCoord, std::vector<size_t>, TileCoordHash>
+    buildPointIndices(const std::vector<Feature>& point_features, int z)
+    {
+        std::unordered_map<TileCoord, std::vector<size_t>, TileCoordHash> indices;
+        indices.reserve(point_features.size());
+        for (size_t i = 0; i < point_features.size(); ++i)
+        {
+            const auto& f = point_features[i];
+            if ((f.zoom_priority >> 4) > z) continue;
+            if (f.points.empty()) continue;
+            int tx = static_cast<int>(utils::lon_to_x(f.points[0].lon, z));
+            int ty = static_cast<int>(utils::lat_to_y(f.points[0].lat, z));
+            indices[TileCoord{tx, ty}].push_back(i);
+        }
+        return indices;
+    }
+
     std::vector<ProcessedFeature> make_point_symbols(const std::vector<Feature>& point_features,
+                                                      const std::vector<size_t>& point_indices,
                                                       int z, int tile_x, int tile_y)
     {
         std::vector<ProcessedFeature> result;
@@ -317,8 +335,9 @@ private:
         double pixel_deg = tile_w_deg / 256.0;
         double size = pixel_deg * constants::POINT_SYMBOL_SIZE_PX;
 
-        for (const auto& f : point_features)
+        for (size_t point_index : point_indices)
         {
+            const auto& f = point_features[point_index];
             int min_z = f.zoom_priority >> 4;
             if (min_z > z) continue;
             if (f.points.empty()) continue;
@@ -658,6 +677,8 @@ private:
 
         if (active_cells.empty()) return;
 
+        auto point_indices = buildPointIndices(point_features, z);
+
         auto t_prep1 = std::chrono::steady_clock::now();
 
         const size_t tile_count = active_cells.size();
@@ -692,7 +713,10 @@ private:
                             tile_labels.push_back(&placed_labels[li].feature);
                     }
 
-                    auto pt_syms = make_point_symbols(point_features, z, tile_x, tile_y);
+                    std::vector<ProcessedFeature> pt_syms;
+                    auto point_it = point_indices.find(TileCoord{tile_x, tile_y});
+                    if (point_it != point_indices.end())
+                        pt_syms = make_point_symbols(point_features, point_it->second, z, tile_x, tile_y);
 
                     const size_t* tile_offsets = feature_offsets.empty()
                         ? nullptr
