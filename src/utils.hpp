@@ -45,6 +45,31 @@ inline std::vector<uint8_t> to_varint(uint64_t value)
 }
 
 /**
+ * @brief Append a VarInt directly to a byte buffer, avoiding a temporary vector.
+ * @param out   Destination buffer.
+ * @param value Value to encode.
+ */
+inline void append_varint(std::vector<uint8_t>& out, uint64_t value)
+{
+    while (value >= 0x80)
+    {
+        out.push_back(static_cast<uint8_t>((value & 0x7F) | 0x80));
+        value >>= 7;
+    }
+    out.push_back(static_cast<uint8_t>(value));
+}
+
+/**
+ * @brief Exact power-of-two tile scale for a zoom level.
+ * @param z Zoom level (0-30).
+ * @return 2^z as double.
+ */
+inline double zoom_scale(int z)
+{
+    return static_cast<double>(1u << z);
+}
+
+/**
  * @brief Convert longitude to fractional tile X at a given zoom level (Web Mercator).
  * @param lon Longitude in degrees.
  * @param z   Zoom level.
@@ -52,8 +77,7 @@ inline std::vector<uint8_t> to_varint(uint64_t value)
  */
 inline double lon_to_x(double lon, int z)
 {
-    double n = std::pow(2.0, z);
-    return (lon + 180.0) / 360.0 * n;
+    return (lon + 180.0) / 360.0 * zoom_scale(z);
 }
 
 /**
@@ -64,9 +88,8 @@ inline double lon_to_x(double lon, int z)
  */
 inline double lat_to_y(double lat, int z)
 {
-    double n = std::pow(2.0, z);
     double lat_rad = lat * M_PI / 180.0;
-    return (1.0 - std::asinh(std::tan(lat_rad)) / M_PI) / 2.0 * n;
+    return (1.0 - std::asinh(std::tan(lat_rad)) / M_PI) / 2.0 * zoom_scale(z);
 }
 
 /**
@@ -77,7 +100,7 @@ inline double lat_to_y(double lat, int z)
  */
 inline double tile_x_to_lon(double x, int z)
 {
-    return x / std::pow(2.0, z) * 360.0 - 180.0;
+    return x / zoom_scale(z) * 360.0 - 180.0;
 }
 
 /**
@@ -88,7 +111,7 @@ inline double tile_x_to_lon(double x, int z)
  */
 inline double tile_y_to_lat(double y, int z)
 {
-    double n = std::pow(2.0, z);
+    double n = zoom_scale(z);
     double lat_rad = std::atan(std::sinh(M_PI * (1.0 - 2.0 * y / n)));
     return lat_rad * 180.0 / M_PI;
 }
@@ -183,7 +206,7 @@ inline uint8_t pack_zoom_priority(int min_zoom, int priority)
  */
 inline uint8_t meters_to_pixels(double width_meters, int zoom, double lat = 45.0)
 {
-    double meters_per_pixel = 156543.0 * std::cos(lat * M_PI / 180.0) / std::pow(2.0, zoom);
+    double meters_per_pixel = 156543.0 * std::cos(lat * M_PI / 180.0) / zoom_scale(zoom);
     double raw_pixels = width_meters / meters_per_pixel;
     if (zoom >= 13)
         raw_pixels *= 0.7;

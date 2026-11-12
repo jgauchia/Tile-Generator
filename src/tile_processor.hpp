@@ -572,11 +572,12 @@ private:
                 tile_label_indices[tc].push_back(li);
         }
 
-        std::unordered_set<TileCoord, TileCoordHash> all_tile_coords;
-        for (const auto& [tc, _] : tile_map) all_tile_coords.insert(tc);
-        for (const auto& [tc, _] : tile_label_indices) all_tile_coords.insert(tc);
+        // Label-only tiles need a work item too. Add them before moving the feature
+        // lists so every tile is visited exactly once without a second coordinate set.
+        for (const auto& [tc, _] : tile_label_indices)
+            tile_map.emplace(tc, std::vector<size_t>{});
 
-        if (all_tile_coords.empty()) return;
+        if (tile_map.empty()) return;
 
         struct TileWork
         {
@@ -585,12 +586,14 @@ private:
             std::vector<size_t> label_indices;
         };
         std::vector<TileWork> tiles;
-        for (const auto& tc : all_tile_coords)
+        tiles.reserve(tile_map.size());
+        for (auto& [tc, offsets] : tile_map)
         {
             TileWork tw;
             tw.coord = tc;
-            if (tile_map.count(tc)) tw.offsets = tile_map.at(tc);
-            if (tile_label_indices.count(tc)) tw.label_indices = tile_label_indices.at(tc);
+            tw.offsets = std::move(offsets);
+            if (auto it = tile_label_indices.find(tc); it != tile_label_indices.end())
+                tw.label_indices = std::move(it->second);
             tiles.push_back(std::move(tw));
         }
 
@@ -874,6 +877,7 @@ private:
         std::map<Style, std::vector<GEOSGeometry*>> poly_groups;
         std::map<Style, std::vector<Feature>> poly_individual;
         std::vector<Feature> lines;
+        lines.reserve(offsets.size());
         std::vector<GEOSGeometry*> island_geoms;
         const auto& width_table = constants::line_width_per_zoom();
         const auto& color_table = constants::line_color_per_zoom();
@@ -961,8 +965,11 @@ private:
         };
         // The polygon buffer only has to keep the cut edge out of the tile.
         double poly_margin = static_cast<double>(constants::CLIP_POLYGON_PX) / constants::TILE_SIZE_PX;
-        GEOSGeometry* clip_poly = make_clip_box(poly_margin);
-        GEOSGeometry* clip_casing = make_clip_box(constants::CLIP_MARGIN_CASING);
+        // GEOSClipByRect is much faster, but it can slightly change merged/clipped
+        // geometry. Keep z13-z16 bit-for-bit identical and use it only at z17,
+        // where the generator spends most of its time and features are not merged.
+        const bool rect_clip = (z >= 17);
+        GEOSGeometry* clip_poly = rect_clip ? nullptr : make_clip_box(poly_margin);
 
         // The line buffer covers the widest stroke plus one pixel, never a whole tile.
         int max_line_px = 1;
@@ -973,7 +980,6 @@ private:
         }
         int line_px = std::max(constants::clip_line_px(z), max_line_px / 2 + 1);
         double line_margin = static_cast<double>(line_px) / constants::TILE_SIZE_PX;
-        GEOSGeometry* clip_line = make_clip_box(line_margin);
 
         double poly_lm = (lmax - lmin) * poly_margin;
         double poly_tm = (tmax - tmin) * poly_margin;
@@ -983,13 +989,16 @@ private:
         double casing_tm = (tmax - tmin) * constants::CLIP_MARGIN_CASING;
         double clip_casing_xmin = lmin - casing_lm, clip_casing_xmax = lmax + casing_lm;
         double clip_casing_ymin = tmin - casing_tm, clip_casing_ymax = tmax + casing_tm;
+        GEOSGeometry* clip_casing = rect_clip ? nullptr : make_clip_box(constants::CLIP_MARGIN_CASING);
         double line_lm = (lmax - lmin) * line_margin;
         double line_tm = (tmax - tmin) * line_margin;
         double clip_line_xmin = lmin - line_lm, clip_line_xmax = lmax + line_lm;
         double clip_line_ymin = tmin - line_tm, clip_line_ymax = tmax + line_tm;
+        GEOSGeometry* clip_line = rect_clip ? nullptr : make_clip_box(line_margin);
 
-        auto clip_with_bbox = [&](const GEOSGeometry* geom, const GEOSGeometry* clip_box,
-                                  double cxmin, double cxmax, double cymin, double cymax) -> GEOSGeometry* {
+        auto clip_with_bbox = [&](const GEOSGeometry* geom,
+                                  double cxmin, double cxmax, double cymin, double cymax,
+                                  const GEOSGeometry* polygon_clip = nullptr) -> GEOSGeometry* {
             double gxmin, gymin, gxmax, gymax;
             if (GEOSGeom_getExtent_r(local_handle, geom, &gxmin, &gymin, &gxmax, &gymax))
             {
@@ -998,7 +1007,10 @@ private:
                 if (gxmin >= cxmin && gxmax <= cxmax && gymin >= cymin && gymax <= cymax)
                     return GEOSGeom_clone_r(local_handle, geom);
             }
-            return GEOSIntersection_r(local_handle, geom, clip_box);
+            if (polygon_clip)
+                return GEOSIntersection_r(local_handle, geom, polygon_clip);
+            // When no polygon clip is supplied, use GEOS' specialized rectangle clip.
+            return GEOSClipByRect_r(local_handle, geom, cxmin, cymin, cxmax, cymax);
         };
         double tolerance = (lmax - lmin) / 1024.0;
         double pixel_deg = (lmax - lmin) / 256.0;
@@ -1009,6 +1021,7 @@ private:
             min_hole_area_deg2 = (pixel_deg * pixel_deg) * constants::K_VISIBILITY * hole_factor;
         }
         std::vector<ProcessedFeature> final_features;
+        final_features.reserve(offsets.size() + tile_labels.size() + point_symbols.size() + 8);
 
         auto project_ring = [&](const GEOSGeometry* ring) -> std::vector<std::pair<int16_t, int16_t>> {
             std::vector<std::pair<int16_t, int16_t>> rpts;
@@ -1017,6 +1030,7 @@ private:
             if (!s) return rpts;
             uint32_t sz = 0; GEOSCoordSeq_getSize_r(local_handle, s, &sz);
             if (sz < 3) return rpts;
+            rpts.reserve(sz);
             for (uint32_t j = 0; j < sz; ++j)
             {
                 double lon, lat;
@@ -1095,7 +1109,7 @@ private:
             {
                 GEOSGeometry* simplified = GEOSTopologyPreserveSimplify_r(local_handle, merged, tolerance * 0.5);
                 GEOSGeometry* to_clip = (simplified && !GEOSisEmpty_r(local_handle, simplified)) ? simplified : merged;
-                GEOSGeometry* clipped = clip_with_bbox(to_clip, clip_poly, clip_poly_xmin, clip_poly_xmax, clip_poly_ymin, clip_poly_ymax);
+                GEOSGeometry* clipped = clip_with_bbox(to_clip, clip_poly_xmin, clip_poly_xmax, clip_poly_ymin, clip_poly_ymax, clip_poly);
                 if (to_clip != merged) GEOSGeom_destroy_r(local_handle, to_clip);
                 if (clipped)
                 {
@@ -1138,12 +1152,12 @@ private:
             {
                 GEOSGeometry* g = feature_to_geos(f, local_handle);
                 if (!g) continue;
-                const GEOSGeometry* pbox = f.is_building ? clip_casing : clip_poly;
                 double pxmin = f.is_building ? clip_casing_xmin : clip_poly_xmin;
                 double pxmax = f.is_building ? clip_casing_xmax : clip_poly_xmax;
                 double pymin = f.is_building ? clip_casing_ymin : clip_poly_ymin;
                 double pymax = f.is_building ? clip_casing_ymax : clip_poly_ymax;
-                GEOSGeometry* clipped = clip_with_bbox(g, pbox, pxmin, pxmax, pymin, pymax);
+                const GEOSGeometry* pclip = rect_clip ? nullptr : (f.is_building ? clip_casing : clip_poly);
+                GEOSGeometry* clipped = clip_with_bbox(g, pxmin, pxmax, pymin, pymax, pclip);
                 GEOSGeom_destroy_r(local_handle, g);
                 if (!clipped || GEOSisEmpty_r(local_handle, clipped)) { if (clipped) GEOSGeom_destroy_r(local_handle, clipped); continue; }
                 if (!GEOSisValid_r(local_handle, clipped)) { GEOSGeometry* v = GEOSMakeValid_r(local_handle, clipped); GEOSGeom_destroy_r(local_handle, clipped); clipped = v; }
@@ -1226,7 +1240,7 @@ private:
                 else if (simplified) GEOSGeom_destroy_r(local_handle, simplified);
             }
 
-            GEOSGeometry* clipped = clip_with_bbox(g, clip_line, clip_line_xmin, clip_line_xmax, clip_line_ymin, clip_line_ymax);
+            GEOSGeometry* clipped = clip_with_bbox(g, clip_line_xmin, clip_line_xmax, clip_line_ymin, clip_line_ymax, clip_line);
             if (!clipped || GEOSisEmpty_r(local_handle, clipped))
             {
                 GEOSGeom_destroy_r(local_handle, g);
@@ -1260,6 +1274,7 @@ private:
                 {
                     ProcessedFeature pf{GEOM_LINESTRING, line_color, f.zoom_priority, f.width_meters,
                                        {{}}, f.zoom_widths, f.highway_type, f.layer, f.is_bridge, f.is_building};
+                    pf.rings[0].reserve(sz);
                     for (uint32_t j = 0; j < sz; ++j)
                     {
                         double lon, lat;
@@ -1291,6 +1306,7 @@ private:
         }
 
         std::vector<uint8_t> buffer;
+        buffer.reserve(1024 + final_features.size() * 48 + tile_labels.size() * 48);
         double t_max_merc = utils::lat_to_mercator_y(tmax);
         double t_min_merc = utils::lat_to_mercator_y(tmin);
         double merc_range = t_max_merc - t_min_merc;
@@ -1345,7 +1361,10 @@ private:
                 width_byte |= 0x80;
             }
 
+            size_t total_points = 0;
+            for (const auto& r : pf.rings) total_points += r.size();
             std::vector<uint8_t> payload;
+            payload.reserve(total_points * 3 + 8);
             int16_t minx = 4096, maxx = 0, miny = 4096, maxy = 0;
             size_t pts = 0;
             int16_t lx = 0, ly = 0;
@@ -1353,10 +1372,8 @@ private:
             {
                 for (const auto& p : r)
                 {
-                    auto vx = utils::to_varint(utils::zigzag_encode(p.first - lx));
-                    payload.insert(payload.end(), vx.begin(), vx.end());
-                    auto vy = utils::to_varint(utils::zigzag_encode(p.second - ly));
-                    payload.insert(payload.end(), vy.begin(), vy.end());
+                    utils::append_varint(payload, utils::zigzag_encode(p.first - lx));
+                    utils::append_varint(payload, utils::zigzag_encode(p.second - ly));
                     lx = p.first; ly = p.second;
                     int16_t cx = std::max((int16_t)0, std::min((int16_t)4096, p.first));
                     int16_t cy = std::max((int16_t)0, std::min((int16_t)4096, p.second));
@@ -1383,10 +1400,8 @@ private:
                              (uint8_t)std::min(255, minx / 16), (uint8_t)std::min(255, miny / 16),
                              (uint8_t)std::min(255, maxx / 16), (uint8_t)std::min(255, maxy / 16)};
             buffer.insert(buffer.end(), fh, fh + 9);
-            auto vcc = utils::to_varint((uint64_t)pts);
-            buffer.insert(buffer.end(), vcc.begin(), vcc.end());
-            auto vps = utils::to_varint((uint64_t)(payload.size() + ri.size()));
-            buffer.insert(buffer.end(), vps.begin(), vps.end());
+            utils::append_varint(buffer, (uint64_t)pts);
+            utils::append_varint(buffer, (uint64_t)(payload.size() + ri.size()));
             buffer.insert(buffer.end(), payload.begin(), payload.end());
             if (!ri.empty()) buffer.insert(buffer.end(), ri.begin(), ri.end());
             written++;
@@ -1410,6 +1425,7 @@ private:
             uint16_t coord_count = (uint16_t)data_size;
 
             std::vector<uint8_t> text_payload;
+            text_payload.reserve(data_size);
             text_payload.push_back(px & 0xFF); text_payload.push_back(px >> 8);
             text_payload.push_back(py & 0xFF); text_payload.push_back(py >> 8);
             text_payload.push_back(text_len);
@@ -1429,17 +1445,17 @@ private:
                               label->zoom_priority, label->font_size,
                               bx, by, bx, by};
             buffer.insert(buffer.end(), th2, th2 + 9);
-            auto vcc = utils::to_varint((uint64_t)coord_count);
-            buffer.insert(buffer.end(), vcc.begin(), vcc.end());
-            auto vps = utils::to_varint((uint64_t)text_payload.size());
-            buffer.insert(buffer.end(), vps.begin(), vps.end());
+            utils::append_varint(buffer, (uint64_t)coord_count);
+            utils::append_varint(buffer, (uint64_t)text_payload.size());
             buffer.insert(buffer.end(), text_payload.begin(), text_payload.end());
             written++;
         }
 
         memcpy(buffer.data() + 4, &written, 2);
 
-        GEOSGeom_destroy_r(local_handle, clip_poly); GEOSGeom_destroy_r(local_handle, clip_casing); GEOSGeom_destroy_r(local_handle, clip_line);
+        if (clip_poly) GEOSGeom_destroy_r(local_handle, clip_poly);
+        if (clip_casing) GEOSGeom_destroy_r(local_handle, clip_casing);
+        if (clip_line) GEOSGeom_destroy_r(local_handle, clip_line);
         if (!island_geoms_owned)
             for (auto* ig : island_geoms) GEOSGeom_destroy_r(local_handle, ig);
         if (island_union) GEOSGeom_destroy_r(local_handle, island_union);
