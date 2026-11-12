@@ -301,14 +301,6 @@ private:
         }
     }
 
-    /**
-     * @brief Build square polygon symbols for GEOM_POINT features visible in a tile.
-     * @param point_features All POI features in the dataset.
-     * @param z              Current zoom level.
-     * @param tile_x         Tile X coordinate.
-     * @param tile_y         Tile Y coordinate.
-     * @return ProcessedFeature list with one polygon per visible point.
-     */
     std::unordered_map<TileCoord, std::vector<size_t>, TileCoordHash>
     buildPointIndices(const std::vector<Feature>& point_features, int z)
     {
@@ -338,15 +330,7 @@ private:
         for (size_t point_index : point_indices)
         {
             const auto& f = point_features[point_index];
-            int min_z = f.zoom_priority >> 4;
-            if (min_z > z) continue;
-            if (f.points.empty()) continue;
             double lon = f.points[0].lon, lat = f.points[0].lat;
-
-            int tx = static_cast<int>(utils::lon_to_x(lon, z));
-            int ty = static_cast<int>(utils::lat_to_y(lat, z));
-            if (tx != tile_x || ty != tile_y) continue;
-
             double lat_size = size / std::cos(lat * M_PI / 180.0);
 
             std::vector<std::pair<int16_t, int16_t>> pts;
@@ -548,7 +532,6 @@ private:
         double prep_loop_s = 0.0, prep_insert_s = 0.0;
         uint64_t prep_inserts = 0;
 
-        // One span per feature, in the same order the old unordered_map saw them.
         struct FeatureSpan
         {
             size_t offset;
