@@ -745,19 +745,13 @@ private:
             uint16_t fcount;
             memcpy(&fcount, pt.data.data() + 4, 2);
 
-            std::vector<uint8_t> rewritten;
-            rewritten.reserve(pt.data.size());
-            rewritten.insert(rewritten.end(), pt.data.begin(), pt.data.begin() + 6);
-
             size_t p = 6;
-            bool ok = true;
+            size_t d = 6;
             for (uint16_t fi = 0; fi < fcount; ++fi)
             {
                 if (p + 9 > pt.data.size())
-                {
-                    ok = false;
-                    break;
-                }
+                    throw std::runtime_error("corrupt tile payload while compacting palette");
+
                 uint8_t geom = pt.data[p];
                 uint16_t color;
                 memcpy(&color, pt.data.data() + p + 1, 2);
@@ -788,19 +782,16 @@ private:
                     shift += 7;
                 }
                 if (hp + ps > pt.data.size())
-                {
-                    ok = false;
-                    break;
-                }
+                    throw std::runtime_error("corrupt tile payload while compacting palette");
 
-                rewritten.push_back(geom);
-                rewritten.push_back((uint8_t)cidx);
-                rewritten.insert(rewritten.end(), pt.data.begin() + p + 3, pt.data.begin() + hp);
-                rewritten.insert(rewritten.end(), pt.data.begin() + hp, pt.data.begin() + hp + ps);
+                size_t move_len = hp - (p + 3) + ps;
+                std::memmove(pt.data.data() + d + 2, pt.data.data() + p + 3, move_len);
+                pt.data[d] = geom;
+                pt.data[d + 1] = static_cast<uint8_t>(cidx);
+                d += 2 + move_len;
                 p = hp + ps;
             }
-            if (ok)
-                pt.data = std::move(rewritten);
+            pt.data.resize(d);
         }
         auto t_palette1 = std::chrono::steady_clock::now();
 
