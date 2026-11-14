@@ -128,9 +128,21 @@ public:
     {
         stats_ways++;
         std::unordered_map<std::string, std::string> tags;
+        bool is_coastline = false;
+        for (const auto& t : w.tags())
+        {
+            if (std::string(t.key()) == "natural" && std::string(t.value()) == "coastline")
+            {
+                is_coastline = true;
+                break;
+            }
+        }
         bool is_boundary = false;
         int boundary_level = 0;
-        if (way_to_boundary.count(w.id()))
+        // Coastline ways are often outer members of an administrative boundary
+        // relation. Keep them as coastline lines so the shore is not lost under
+        // the boundary layer.
+        if (!is_coastline && way_to_boundary.count(w.id()))
         {
             boundary_level = way_to_boundary.at(w.id());
             tags["admin_level"] = std::to_string(boundary_level);
@@ -197,7 +209,8 @@ public:
                            tags.count("water") || tags.count("amenity") ||
                            tags.count("leisure") || tags.count("natural") ||
                            tags.count("waterway") || tags.count("man_made") ||
-                           tags.count("aeroway");
+                           tags.count("aeroway") || tags.count("golf") ||
+                           tags.count("tourism");
         bool is_area = is_closed && (has_area_tag || (tags.count("area") && tags.at("area") == "yes"));
 
         bool is_aeroway_line = tags.count("aeroway") &&
@@ -248,6 +261,12 @@ public:
         feat.layer = layer;
         feat.width_meters = get_width(tags);
         feat.highway_type = get_highway_type(tags);
+        feat.zoom_widths = f_cfg.zoom_widths;
+        // Water lines below a bridge/grade (layer<0) are kept, but need a
+        // wider stroke at z16 to stay readable next to the at-grade river.
+        if (layer == "water" && tags.count("layer") &&
+            std::atoi(tags.at("layer").c_str()) < 0)
+            feat.zoom_widths[16] = std::max<uint8_t>(feat.zoom_widths[16], 8);
         feat.ref = tags.count("ref") ? tags.at("ref") : "";
         
 
@@ -276,9 +295,13 @@ public:
         if (feat.is_bridge)
             nibble = 15;
 
+        // For water lines, layer<0 is vertical stacking (a river below a bridge),
+        // not necessarily an underground feature. Only tunnels/culverts and
+        // explicitly underground levels are omitted; otherwise Riu Aixec loses
+        // its layer=-1 stretches.
         bool is_underground = (tags.count("tunnel") && (tags.at("tunnel") == "yes" || tags.at("tunnel") == "culvert"))
-            || (tags.count("layer") && std::atoi(tags.at("layer").c_str()) < 0)
-            || (tags.count("level") && std::atoi(tags.at("level").c_str()) < 0);
+            || (tags.count("level") && std::atoi(tags.at("level").c_str()) < 0)
+            || (layer != "water" && tags.count("layer") && std::atoi(tags.at("layer").c_str()) < 0);
         if (is_underground)
         {
             if (layer == "water")
@@ -471,7 +494,7 @@ private:
 
         // Buildings
         if (tags.count("building") || (tags.count("aeroway") && tags.at("aeroway") == "hangar")
-            || (tags.count("man_made") && tags.at("man_made") == "tower"))
+            || (tags.count("man_made") && (tags.at("man_made") == "tower" || tags.at("man_made") == "storage_tank")))
             return "buildings";
 
         // Aeroways (aerodrome only — other aeroway goes to infrastructure)
@@ -482,6 +505,10 @@ private:
         if (tags.count("amenity") && (tags.at("amenity") == "parking" || tags.at("amenity") == "parking_space"))
             return "parking";
 
+        // Campsites and picnic sites (tourism)
+        if (tags.count("tourism") && (tags.at("tourism") == "camp_site" || tags.at("tourism") == "picnic_site"))
+            return "leisure";
+
         // Amenities
         if (tags.count("amenity"))
             return "amenities";
@@ -489,6 +516,10 @@ private:
         // Pitch
         if (tags.count("leisure") && tags.at("leisure") == "pitch")
             return "pitch";
+
+        // Golf details (bunkers, greens, fairways, rough)
+        if (tags.count("golf"))
+            return "golf";
 
         // Leisure
         if (tags.count("leisure"))
@@ -518,16 +549,21 @@ private:
     int get_polygon_nibble(const std::unordered_map<std::string, std::string>& tags, const std::string& layer)
     {
         // 0:bg 1:aerodrome 2:landuse base 3:landuse specific 4:surfaces
-        // 5:forest/wood 6:infrastructure 7:buildings+water 8-14:roads 15:rail/bridges
+        // 5:forest/wood/grass/golf base 6:infrastructure/rock/golf detail 7:buildings+water 8-14:roads 15:rail/bridges
         int nibble = 2;
         if (layer == "aeroways") nibble = 1;
         else if (layer == "landuse" || layer == "terrain") nibble = 2;
-        else if (layer == "parking") nibble = 2;
+        else if (layer == "parking") nibble = 6;
         else if (layer == "leisure" || layer == "amenities") nibble = 3;
         else if (layer == "pitch" || layer == "surface") nibble = 4;
+        else if (layer == "golf") nibble = 5;
         else if (layer == "infrastructure") nibble = 6;
         else if (layer == "buildings") nibble = 7;
         else if (layer == "water") nibble = 7;
+
+        // Orchards and vineyards sit under urban landuse (OSM paints residential on top)
+        if (tags.count("landuse") && (tags.at("landuse") == "orchard" || tags.at("landuse") == "vineyard"))
+            nibble = 0;
 
         if (tags.count("landuse") && tags.at("landuse") == "commercial")
             nibble = 1;
@@ -543,7 +579,9 @@ private:
         if ((tags.count("landuse") && tags.at("landuse") == "cemetery") ||
             (tags.count("amenity") && tags.at("amenity") == "grave_yard"))
             nibble = 3;
-        if (tags.count("leisure") && (tags.at("leisure") == "park" || tags.at("leisure") == "nature_reserve"))
+        if (tags.count("leisure") && tags.at("leisure") == "park")
+            nibble = 2;
+        if (tags.count("leisure") && tags.at("leisure") == "nature_reserve")
             nibble = 1;
         if (tags.count("leisure") && tags.at("leisure") == "playground")
             nibble = 4;
@@ -559,6 +597,9 @@ private:
         if ((tags.count("natural") && tags.at("natural") == "wood") ||
             (tags.count("landuse") && tags.at("landuse") == "forest"))
             nibble = 5;
+        if (tags.count("natural") && (tags.at("natural") == "bare_rock" ||
+            tags.at("natural") == "scree"))
+            nibble = 6;
         if (tags.count("amenity") && (tags.at("amenity") == "school" ||
             tags.at("amenity") == "college" || tags.at("amenity") == "university"))
             nibble = 3;
@@ -568,6 +609,14 @@ private:
             nibble = 2;
         if (tags.count("leisure") && tags.at("leisure") == "track")
             nibble = 6;
+        if (tags.count("golf"))
+        {
+            const std::string& golf = tags.at("golf");
+            if (golf == "bunker" || golf == "green" || golf == "tee")
+                nibble = 6;
+            else if (golf == "fairway" || golf == "rough" || golf == "driving_range")
+                nibble = 5;
+        }
         if ((tags.count("bridge") && (tags.at("bridge") == "yes" || tags.at("bridge") == "viaduct")) ||
             (tags.count("man_made") && tags.at("man_made") == "bridge"))
             nibble = 9;
