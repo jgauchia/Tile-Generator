@@ -37,7 +37,7 @@ The generator reads the PBF bounding box and uses OGR spatial filtering to selec
 2. GDAL/OGR opens the shapefile and applies a spatial filter (`SetSpatialFilterRect`)
 3. Each matching polygon is intersected with the bbox polygon, so a global ocean polygon cannot expand the tile grid outside the extract
 4. Clipped polygons are injected into the feature store as `layer="water"` with the standard water color (`#aad2df`)
-5. The tile processor clips, simplifies, and renders them like any other water feature
+5. The tile processor clips them, subtracts the PBF island union, simplifies and renders them as water features
 
 ## Dependencies
 
@@ -46,6 +46,6 @@ Requires GDAL (`libgdal-dev` on Debian/Ubuntu). Already included in the CMake bu
 ## Notes
 
 - Use `water-polygons-split-4326` (WGS84), not the 3857 (Mercator) variant
-- The shapefile is ~540 MB unzipped but is gitignored
+- The unpacked set is ~1.2 GB and is gitignored
 - Lakes, rivers, and reservoirs come from the PBF data, not from this shapefile
-- Island holes in ocean polygons are handled by the existing `GEOSDifference` logic in the tile processor
+- The tile processor subtracts the PBF `islands` union from every `water` polygon before simplification, so the sea does not paint over islands

@@ -18,7 +18,7 @@ Each entry in the JSON file is a key-value pair:
 | :--- | :--- | :--- |
 | `zoom` | integer | Minimum zoom level at which the feature is included in the packed containers. |
 | `color` | string | HTML hex color (`#rrggbb`). Converted to RGB565 in the binary format. |
-| `priority`| integer | Local priority (0-15) for line features; it becomes the lower nibble of the binary zoom_priority. Polygon z-order is assigned from the OSM tags. |
+| `priority`| integer | Rendering priority (0-15) for line and polygon features; it becomes the lower nibble of the binary zoom_priority. Higher values draw later. |
 | `widths` | object | **Manual Width Scaling**: Map of zoom level to pixels (0.5px units in binary). |
 
 ---
@@ -53,7 +53,7 @@ Each entry in the JSON file is a key-value pair:
 
 ## 4. Layer Priority System
 
-The generator uses a simplified 16-level priority system (0-15). For line features, this value determines the rendering order within each of the four rendering passes, and features with the same priority keep their PBF order. Polygon z-order is assigned by the generator from the OSM tags (see `bin_tile_format.md` §6).
+The generator uses a simplified 16-level priority system (0-15). For line and polygon features, this value determines the rendering order within each of the four rendering passes; features with the same priority share a z-order level.
 
 | Priority | Feature Type Examples |
 | :--- | :--- |
@@ -106,7 +106,7 @@ The generator uses a simplified 16-level priority system (0-15). For line featur
 
 ## 5. Special Handling: Administrative Boundaries
 
-Administrative boundaries are extracted and assigned to specific priority levels to ensure they provide context without cluttering the map.
+Administrative boundaries are extracted using a two-pass scanner and assigned to specific priority levels to ensure they provide context without cluttering the map.
 - **Regional Borders** (admin_level < 8): Render below transport layers (Priority 3).
 - **Municipal Borders** (admin_level >= 8): Render above everything (Priority 15) but using subtle, low-contrast colors.
 
@@ -118,31 +118,12 @@ Labels for places and road references are generated with collision detection:
 - **Place Names**: Priority 12-15 based on population.
 - **Road Shields**: Priority 15, matching the bridge/railway layer.
 
-The generator uses a 10-layer hierarchy. Final priority (0-15) is calculated as:  
-`Final Priority = (Layer_Base / 10) + (priority_from_json / 7)` (clamped to 15).
-
-| Layer | Base Priority | Description |
-| :--- | :--- | :--- |
-| **landuse** | 10 | Terrain, forests, urban areas. |
-| **boundaries**| 35 | Countries, regions, and provinces (Under roads). |
-| **water** | 30 | Lakes and rivers. |
-| **railways** | 40 | Train tracks (surface only). |
-| **roads** | 50 | Streets and highways. |
-| **places** | 90 | City labels and **Municipal boundaries** (Above roads). |
+The final z-order is the configured 0-15 priority nibble; there is no layer-base arithmetic. Special features override it: bridges use 15, place labels use 12-15 by population, and road shields use 15.
 
 ---
 
-## 4. Special Handling: Administrative Boundaries
+## 7. Rendering Order (Bottom to Top)
 
-Administrative boundaries are extracted using a two-pass scanner to ensure full fidelity.
-- **Regional Borders (admin_level < 8)**: Assigned to the `boundaries` layer (Base 35). They render below transport layers to avoid visual clutter.
-- **Municipal Borders (admin_level >= 8)**: Assigned to the `places` layer (Base 90). They render above everything using subtle colors to provide local context without obstructing navigation.
-
----
-
-## 5. Rendering Order (Bottom to Top)
-
-1. **Background** (Base 10-30): Land, Water, Terrain.
-2. **Regional Borders** (Base 35): Countries and provinces.
-3. **Transport** (Base 40-50): Railways and Roads.
-4. **Information** (Base 90): Labels and Municipal limits.
+1. **Background**: priority 0.
+2. **Polygons and lines**: their configured priority from `features.json`.
+3. **Information**: labels and municipal limits on top.

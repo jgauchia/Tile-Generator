@@ -63,7 +63,7 @@ The repository ships [`features.json`](features.json) as a ready-to-use example.
 
 ### Ocean Water Polygons (optional)
 
-Download the pre-computed water polygons shapefile (once, ~540 MB):
+Download the pre-computed water polygons shapefile (once; ~900 MB zipped, ~1.2 GB unpacked):
 
 ```bash
 wget https://osmdata.openstreetmap.de/download/water-polygons-split-4326.zip
