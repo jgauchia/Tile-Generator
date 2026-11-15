@@ -19,6 +19,7 @@
 #include <atomic>
 #include <exception>
 #include <ctime>
+#include <memory>
 #include <map>
 #include <unordered_map>
 #include <unordered_set>
@@ -85,7 +86,8 @@ private:
         std::size_t operator()(const TileCoord& k) const
         { return std::hash<int>()(k.x) ^ (std::hash<int>()(k.y) << 1); }
     };
-    struct PackedTile { uint32_t x, y; std::vector<uint8_t> data; };
+    struct PackedTile { uint32_t x, y; uint32_t offset, size; };
+    static_assert(sizeof(PackedTile) == 16, "PackedTile size mismatch");
 
     struct ProcessedFeature
     {
@@ -519,42 +521,43 @@ private:
     }
 
     // First pass of the palette pass: record the first tile/feature position of every color.
-    void scanPaletteTile(const PackedTile& pt, size_t tileIdx, std::vector<uint64_t>& firstPos) const
+    void scanPaletteTile(const uint8_t* data, size_t size, size_t tileIdx,
+                         std::vector<uint64_t>& firstPos) const
     {
-        if (pt.data.size() < 6)
+        if (size < 6)
             return;
 
         uint16_t fcount;
-        memcpy(&fcount, pt.data.data() + 4, 2);
+        memcpy(&fcount, data + 4, 2);
 
         size_t p = 6;
         for (uint16_t fi = 0; fi < fcount; ++fi)
         {
-            if (p + 9 > pt.data.size())
+            if (p + 9 > size)
                 throw std::runtime_error("corrupt tile payload while scanning palette");
 
             uint16_t color;
-            memcpy(&color, pt.data.data() + p + 1, 2);
+            memcpy(&color, data + p + 1, 2);
             uint64_t pos = (static_cast<uint64_t>(tileIdx) << 32) | fi;
             if (pos < firstPos[color])
                 firstPos[color] = pos;
 
             size_t hp = p + 9;
-            while (hp < pt.data.size() && (pt.data[hp++] & 0x80))
+            while (hp < size && (data[hp++] & 0x80))
             {
             }
 
             uint64_t ps = 0;
             int shift = 0;
-            while (hp < pt.data.size())
+            while (hp < size)
             {
-                uint8_t b = pt.data[hp++];
+                uint8_t b = data[hp++];
                 ps |= (uint64_t)(b & 0x7F) << shift;
                 if (!(b & 0x80))
                     break;
                 shift += 7;
             }
-            if (hp + ps > pt.data.size())
+            if (hp + ps > size)
                 throw std::runtime_error("corrupt tile payload while scanning palette");
 
             p = hp + ps;
@@ -562,24 +565,25 @@ private:
     }
 
     // Second pass: compact one tile in place, independently of all other tiles.
-    void compactPaletteTile(PackedTile& pt, const std::unordered_map<uint16_t, uint16_t>& colorToIndex) const
+    void compactPaletteTile(uint8_t* data, uint32_t& size,
+                            const std::unordered_map<uint16_t, uint16_t>& colorToIndex) const
     {
-        if (pt.data.size() < 6)
+        if (size < 6)
             return;
 
         uint16_t fcount;
-        memcpy(&fcount, pt.data.data() + 4, 2);
+        memcpy(&fcount, data + 4, 2);
 
         size_t p = 6;
         size_t d = 6;
         for (uint16_t fi = 0; fi < fcount; ++fi)
         {
-            if (p + 9 > pt.data.size())
+            if (p + 9 > size)
                 throw std::runtime_error("corrupt tile payload while compacting palette");
 
-            uint8_t geom = pt.data[p];
+            uint8_t geom = data[p];
             uint16_t color;
-            memcpy(&color, pt.data.data() + p + 1, 2);
+            memcpy(&color, data + p + 1, 2);
 
             auto it = colorToIndex.find(color);
             if (it == colorToIndex.end())
@@ -587,31 +591,31 @@ private:
             uint16_t cidx = it->second;
 
             size_t hp = p + 9;
-            while (hp < pt.data.size() && (pt.data[hp++] & 0x80))
+            while (hp < size && (data[hp++] & 0x80))
             {
             }
 
             uint64_t ps = 0;
             int shift = 0;
-            while (hp < pt.data.size())
+            while (hp < size)
             {
-                uint8_t b = pt.data[hp++];
+                uint8_t b = data[hp++];
                 ps |= (uint64_t)(b & 0x7F) << shift;
                 if (!(b & 0x80))
                     break;
                 shift += 7;
             }
-            if (hp + ps > pt.data.size())
+            if (hp + ps > size)
                 throw std::runtime_error("corrupt tile payload while compacting palette");
 
             size_t moveLen = hp - (p + 3) + ps;
-            std::memmove(pt.data.data() + d + 2, pt.data.data() + p + 3, moveLen);
-            pt.data[d] = geom;
-            pt.data[d + 1] = static_cast<uint8_t>(cidx);
+            std::memmove(data + d + 2, data + p + 3, moveLen);
+            data[d] = geom;
+            data[d + 1] = static_cast<uint8_t>(cidx);
             d += 2 + moveLen;
             p = hp + ps;
         }
-        pt.data.resize(d);
+        size = static_cast<uint32_t>(d);
     }
 
     /**
@@ -673,6 +677,8 @@ private:
                 }
                 prep_loop_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - tl0).count();
                 if (min_tx > max_tx) continue;
+                if (offset > UINT32_MAX)
+                    throw std::runtime_error("feature store offset exceeds 32-bit");
 
                 spans.push_back({offset, min_tx, max_tx, min_ty, max_ty});
                 if (min_tx < grid_min_x) grid_min_x = min_tx;
@@ -732,7 +738,7 @@ private:
         if (cell_starts[cell_count] > UINT32_MAX)
             throw std::runtime_error("tile index exceeds 32-bit offsets");
 
-        std::vector<size_t> feature_offsets(cell_starts[cell_count]);
+        std::vector<uint32_t> feature_offsets(cell_starts[cell_count]);
         std::vector<uint32_t> cursor(cell_starts.begin(), cell_starts.end());
         for (const auto& span : spans)
         {
@@ -741,7 +747,7 @@ private:
                 for (int y = span.min_y; y <= span.max_y; ++y)
                 {
                     size_t cell = (size_t)(y - grid_min_y) * grid_wide + (x - grid_min_x);
-                    feature_offsets[cursor[cell]++] = span.offset;
+                    feature_offsets[cursor[cell]++] = static_cast<uint32_t>(span.offset);
                 }
             }
         }
@@ -764,6 +770,42 @@ private:
 
         const size_t tile_count = active_cells.size();
         std::vector<PackedTile> packed_results(tile_count);
+
+        // Tiles are serialized into a reused per-worker buffer and copied into a
+        // chunked arena. The arena replaces 16M per-tile allocations and their
+        // malloc headers; PackedTile keeps a 32-bit offset/size instead of a
+        // 24-byte std::vector, which removes ~500 MB at Z17.
+        constexpr size_t ARENA_BLOCK = 64 << 20;
+        std::vector<std::unique_ptr<uint8_t[]>> payload_blocks;
+        payload_blocks.reserve(32);
+        size_t payload_used = 0;
+        std::mutex payload_mutex;
+
+        auto append_payload = [&](const uint8_t* bytes, size_t n) -> uint32_t {
+            std::lock_guard<std::mutex> lock(payload_mutex);
+            if (n > ARENA_BLOCK)
+                throw std::runtime_error("tile payload exceeds arena block size");
+            size_t block = payload_used / ARENA_BLOCK;
+            size_t within = payload_used % ARENA_BLOCK;
+            if (within + n > ARENA_BLOCK)
+            {
+                payload_used = (block + 1) * ARENA_BLOCK;
+                block++;
+                within = 0;
+            }
+            if (payload_used > UINT32_MAX - n)
+                throw std::runtime_error("payload arena exceeds 32-bit offset");
+            while (block >= payload_blocks.size())
+                payload_blocks.emplace_back(new uint8_t[ARENA_BLOCK]);
+            memcpy(payload_blocks[block].get() + within, bytes, n);
+            uint32_t off = static_cast<uint32_t>(payload_used);
+            payload_used += n;
+            return off;
+        };
+        auto payload_ptr = [&](uint32_t off) -> uint8_t* {
+            return payload_blocks[off / ARENA_BLOCK].get() + (off % ARENA_BLOCK);
+        };
+
         unsigned int num_threads = std::thread::hardware_concurrency();
         if (num_threads == 0) num_threads = 4;
         std::atomic<size_t> next_tile(0), merged_count{0};
@@ -774,6 +816,7 @@ private:
             workers.emplace_back([&]() {
                 GEOSContextHandle_t handle = GEOS_init_r();
                 std::vector<const Feature*> tile_labels;
+                std::vector<uint8_t> tile_buffer;
                 while (true)
                 {
                     size_t idx = next_tile.fetch_add(1);
@@ -799,15 +842,16 @@ private:
                     if (point_it != point_indices.end())
                         pt_syms = make_point_symbols(point_features, point_it->second, z, tile_x, tile_y);
 
-                    const size_t* tile_offsets = feature_offsets.empty()
+                    const uint32_t* tile_offsets = feature_offsets.empty()
                         ? nullptr
                         : feature_offsets.data() + begin;
                     packed_results[idx].x = (uint32_t)tile_x;
                     packed_results[idx].y = (uint32_t)tile_y;
-                    packed_results[idx].data = serialize_tile(z, tile_x, tile_y,
-                                                              store, tile_offsets,
-                                                              end - begin, handle, m,
-                                                              tile_labels, pt_syms);
+                    serialize_tile(z, tile_x, tile_y, store, tile_offsets,
+                                   end - begin, handle, m, tile_labels, pt_syms,
+                                   tile_buffer);
+                    packed_results[idx].offset = append_payload(tile_buffer.data(), tile_buffer.size());
+                    packed_results[idx].size = static_cast<uint32_t>(tile_buffer.size());
                     merged_count += m;
                 }
                 GEOS_finish_r(handle);
@@ -828,6 +872,16 @@ private:
             std::this_thread::sleep_for(std::chrono::milliseconds(200));
         }
         for (auto& w : workers) w.join();
+
+        // The workers are done with the feature index and the label/point maps;
+        // release them before the palette pass and the final write.
+        std::vector<uint32_t>().swap(active_cells);
+        std::vector<uint32_t>().swap(cell_starts);
+        std::vector<uint32_t>().swap(feature_offsets);
+        tile_label_indices.clear();
+        tile_label_indices.rehash(0);
+        point_indices.clear();
+        point_indices.rehash(0);
 
         auto t_palette0 = std::chrono::steady_clock::now();
         // Build global color palette from serialized tiles and collapse 2B color -> 1B index.
@@ -855,7 +909,11 @@ private:
                             break;
                         size_t end = std::min(begin + PALETTE_CHUNK, paletteTileCount);
                         for (size_t i = begin; i < end; ++i)
-                            scanPaletteTile(packed_results[i], i, localFirst[t]);
+                        {
+                            const PackedTile& pt = packed_results[i];
+                            if (pt.size >= 6)
+                                scanPaletteTile(payload_ptr(pt.offset), pt.size, i, localFirst[t]);
+                        }
                     }
                 }
                 catch (...)
@@ -917,7 +975,11 @@ private:
                             break;
                         size_t end = std::min(begin + PALETTE_CHUNK, paletteTileCount);
                         for (size_t i = begin; i < end; ++i)
-                            compactPaletteTile(packed_results[i], colorToIndex);
+                        {
+                            PackedTile& pt = packed_results[i];
+                            if (pt.size >= 6)
+                                compactPaletteTile(payload_ptr(pt.offset), pt.size, colorToIndex);
+                        }
                     }
                 }
                 catch (...)
@@ -952,25 +1014,21 @@ private:
         // Sparse index: only tiles with data get entries, sorted by flat index. Coverage
         // is a 1-bit-per-cell bitmap; a rank table (u32 per 64 bitmap bytes = 512 cells)
         // locates each entry in the compact array in O(1) with 2-3 small SD reads.
-        std::vector<const PackedTile*> real_tiles;
+        // packed_results follows active_cells, which is built in ascending flat
+        // order, so it is already sorted by flat index. Filter empty tiles in
+        // place instead of keeping a second 16M-pointer vector.
+        uint32_t index_count = 0;
         for (const auto& pt : packed_results)
-        {
-            if (pt.data.size() < 6)
-                continue;
-            real_tiles.push_back(&pt);
-        }
-        std::sort(real_tiles.begin(), real_tiles.end(), [&](const PackedTile* a, const PackedTile* b)
-        {
-            uint32_t fa = (a->y - min_y) * tiles_wide + (a->x - min_x);
-            uint32_t fb = (b->y - min_y) * tiles_wide + (b->x - min_x);
-            return fa < fb;
-        });
+            if (pt.size >= 6)
+                ++index_count;
 
         uint32_t bitmap_bytes = (flat_count + 7) / 8;
         std::vector<uint8_t> bitmap(bitmap_bytes, 0);
-        for (const PackedTile* pt : real_tiles)
+        for (const auto& pt : packed_results)
         {
-            uint32_t flat = (pt->y - min_y) * tiles_wide + (pt->x - min_x);
+            if (pt.size < 6)
+                continue;
+            uint32_t flat = (pt.y - min_y) * tiles_wide + (pt.x - min_x);
             bitmap[flat >> 3] |= (uint8_t)(1u << (flat & 7));
         }
 
@@ -996,7 +1054,6 @@ private:
         if (out)
         {
             uint32_t palette_bytes = (uint32_t)palette.size() * sizeof(uint16_t);
-            uint32_t index_count = (uint32_t)real_tiles.size();
             uint64_t data_offset = sizeof(MapHeader) + sizeof(index_count) + bitmap_bytes +
                                    (uint64_t)rank_count * sizeof(uint32_t) +
                                    (uint64_t)index_count * sizeof(IndexEntry) + palette_bytes;
@@ -1018,20 +1075,26 @@ private:
             out.write((char*)rank.data(), rank.size() * sizeof(uint32_t));
 
             uint64_t current_data_offset = data_offset;
-            for (const PackedTile* pt : real_tiles)
+            for (const auto& pt : packed_results)
             {
+                if (pt.size < 6)
+                    continue;
                 IndexEntry entry;
                 entry.offset = (uint32_t)current_data_offset;
-                entry.size   = (uint32_t)pt->data.size();
-                current_data_offset += pt->data.size();
+                entry.size   = pt.size;
+                current_data_offset += pt.size;
                 out.write((char*)&entry, sizeof(entry));
             }
 
             if (!palette.empty())
                 out.write((char*)palette.data(), palette_bytes);
 
-            for (const PackedTile* pt : real_tiles)
-                out.write((char*)pt->data.data(), pt->data.size());
+            for (const auto& pt : packed_results)
+            {
+                if (pt.size < 6)
+                    continue;
+                out.write((char*)payload_ptr(pt.offset), pt.size);
+            }
 
             zoom_bytes = current_data_offset;
             total_generated_bytes += current_data_offset;
@@ -1084,14 +1147,15 @@ private:
      * @param merged_out    Incremented by the number of polygons merged in this tile.
      * @param tile_labels   Pre-placed text label features for this tile.
      * @param point_symbols Pre-built polygon symbols for POI features in this tile.
-     * @return Raw NAV1 tile bytes with a temporary 2-byte color per feature; the color is
-     *         later collapsed to a 1-byte palette index during the zoom-level palette pass.
+     * @param buffer        Reused output buffer; cleared on entry and filled with the raw
+     *                      NAV1 tile bytes (temporary 2-byte color per feature).
      */
-    std::vector<uint8_t> serialize_tile(int z, int x, int y, const MappedStore& store,
-                                         const size_t* offsets, size_t offset_count,
-                                         GEOSContextHandle_t local_handle, size_t& merged_out,
-                                         const std::vector<const Feature*>& tile_labels,
-                                         const std::vector<ProcessedFeature>& point_symbols)
+    void serialize_tile(int z, int x, int y, const MappedStore& store,
+                        const uint32_t* offsets, size_t offset_count,
+                        GEOSContextHandle_t local_handle, size_t& merged_out,
+                        const std::vector<const Feature*>& tile_labels,
+                        const std::vector<ProcessedFeature>& point_symbols,
+                        std::vector<uint8_t>& buffer)
     {
         struct Style {
             uint16_t color; uint8_t prio; std::string subclass; bool is_building;
@@ -1534,7 +1598,7 @@ private:
             final_features.insert(final_features.begin(), std::move(bg));
         }
 
-        std::vector<uint8_t> buffer;
+        buffer.clear();
         buffer.reserve(1024 + final_features.size() * 48 + tile_labels.size() * 48);
         double t_max_merc = utils::lat_to_mercator_y(tmax);
         double t_min_merc = utils::lat_to_mercator_y(tmin);
@@ -1689,12 +1753,8 @@ private:
             for (auto* ig : island_geoms) GEOSGeom_destroy_r(local_handle, ig);
         if (island_union) GEOSGeom_destroy_r(local_handle, island_union);
 
-        // Drop the reserve() slack before the payload is kept alive for the whole
-        // zoom. Without this every tile pins ~1KB (the reserve floor) instead of
-        // its real ~82B, which at Z17 means ~18GB across 16M tiles and pushes the
-        // process into swap during the palette and write phases.
-        buffer.shrink_to_fit();
-        return buffer;
+        // The caller copies this buffer into the zoom arena and reuses it for the
+        // next tile, so no per-tile allocation or shrink_to_fit() is needed.
     }
 };
 
