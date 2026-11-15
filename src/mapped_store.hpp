@@ -23,7 +23,6 @@ namespace nav {
 
 struct FeatureView
 {
-    int64_t id = 0;
     uint8_t geom_type = 0;
     uint16_t color_rgb565 = 0;
     uint8_t zoom_priority = 0;
@@ -37,11 +36,8 @@ struct FeatureView
     std::string_view highway_type;
     std::string_view layer;
     std::string_view ref;
-    std::string_view name;
     bool is_bridge = false;
     bool is_building = false;
-    uint8_t oneway = 0;
-    uint8_t maxspeed = 0;
 
     int width_zoom(uint32_t i) const
     {
@@ -89,7 +85,6 @@ public:
         size_t widths_size = f.zoom_widths.size() * (sizeof(int) + sizeof(uint8_t));
 
         size_t total_size = sizeof(int64_t) + 4 + 4 + 4 + 4 + pts_size + ends_size + sizeof(size_t) + widths_size;
-        // Extra fields: highway_type, layer, is_bridge, is_building, ref, name
         total_size += sizeof(uint16_t) + f.highway_type.size();
         total_size += sizeof(uint16_t) + f.layer.size();
         total_size += sizeof(uint16_t) + f.ref.size();
@@ -137,64 +132,12 @@ public:
         return start_offset;
     }
 
-    Feature get(size_t offset) const
-    {
-        Feature f;
-        const uint8_t* p = mapped_ptr + offset;
-
-        memcpy(&f.id, p, sizeof(int64_t)); p += sizeof(int64_t);
-        f.geom_type = *p++;
-        memcpy(&f.color_rgb565, p, 2); p += 2;
-        f.zoom_priority = *p++;
-        memcpy(&f.width_meters, p, 4); p += 4;
-
-        uint32_t n_pts, n_rings;
-        memcpy(&n_pts, p, 4); p += 4;
-        memcpy(&n_rings, p, 4); p += 4;
-
-        if (n_pts > 0)
-        {
-            f.points.resize(n_pts);
-            memcpy(f.points.data(), p, n_pts * sizeof(Point));
-            p += n_pts * sizeof(Point);
-        }
-
-        if (n_rings > 0)
-        {
-            f.ring_ends.resize(n_rings);
-            memcpy(f.ring_ends.data(), p, n_rings * sizeof(uint32_t));
-            p += n_rings * sizeof(uint32_t);
-        }
-
-        size_t n_widths;
-        memcpy(&n_widths, p, sizeof(size_t)); p += sizeof(size_t);
-        for (size_t i = 0; i < n_widths; ++i)
-        {
-            int z; uint8_t w;
-            memcpy(&z, p, sizeof(int)); p += sizeof(int);
-            w = *p++;
-            f.zoom_widths[z] = w;
-        }
-
-        // Extended fields
-        p = read_string(p, f.highway_type);
-        p = read_string(p, f.layer);
-        p = read_string(p, f.ref);
-        p = read_string(p, f.name);
-        f.is_bridge = (*p++ != 0);
-        f.is_building = (*p++ != 0);
-        f.oneway = *p++;
-        f.maxspeed = *p++;
-
-        return f;
-    }
-
     FeatureView get_view(size_t offset) const
     {
         FeatureView f;
         const uint8_t* p = mapped_ptr + offset;
 
-        memcpy(&f.id, p, sizeof(int64_t)); p += sizeof(int64_t);
+        p += sizeof(int64_t);
         f.geom_type = *p++;
         memcpy(&f.color_rgb565, p, 2); p += 2;
         f.zoom_priority = *p++;
@@ -221,11 +164,9 @@ public:
         f.highway_type = read_string_view(p);
         f.layer = read_string_view(p);
         f.ref = read_string_view(p);
-        f.name = read_string_view(p);
+        read_string_view(p); // Skip the name; the tile path does not use it.
         f.is_bridge = (*p++ != 0);
         f.is_building = (*p++ != 0);
-        f.oneway = *p++;
-        f.maxspeed = *p++;
 
         return f;
     }
@@ -236,15 +177,6 @@ private:
         uint16_t len = (uint16_t)s.size();
         memcpy(p, &len, 2); p += 2;
         if (len > 0) { memcpy(p, s.data(), len); p += len; }
-        return p;
-    }
-
-    const uint8_t* read_string(const uint8_t* p, std::string& s) const
-    {
-        uint16_t len;
-        memcpy(&len, p, 2); p += 2;
-        if (len > 0) { s.assign((const char*)p, len); p += len; }
-        else s.clear();
         return p;
     }
 

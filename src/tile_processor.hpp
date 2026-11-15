@@ -253,12 +253,6 @@ private:
         return 0;
     }
 
-    /**
-     * @brief Convert a nav::Feature polygon or linestring to a GEOS geometry for clipping.
-     * @param f      Source feature with ring_ends and points populated.
-     * @param handle GEOS thread-local context.
-     * @return Caller-owned GEOSGeometry*, or nullptr if the feature is degenerate.
-     */
     GEOSCoordSequence* coord_seq_from_doubles(const double* xy, uint32_t n, GEOSContextHandle_t handle)
     {
 #if defined(GEOS_VERSION_MAJOR) && (GEOS_VERSION_MAJOR > 3 || (GEOS_VERSION_MAJOR == 3 && GEOS_VERSION_MINOR >= 10))
@@ -294,6 +288,12 @@ private:
         return coord_seq_from_doubles(xy.data(), static_cast<uint32_t>(pts.size()), handle);
     }
 
+    /**
+     * @brief Convert a FeatureView polygon or linestring to a GEOS geometry for clipping.
+     * @param f      Source view with points and ring_ends populated.
+     * @param handle GEOS thread-local context.
+     * @return Caller-owned GEOSGeometry*, or nullptr if the feature is degenerate.
+     */
     GEOSGeometry* feature_to_geos(const FeatureView& f, GEOSContextHandle_t handle)
     {
         if (f.n_rings == 0) return nullptr;
@@ -1283,8 +1283,8 @@ private:
         // where the generator spends most of its time and features are not merged.
         const bool rect_clip = (z >= 17);
         auto has_building = [&]() {
-            for (const auto& [style, feats] : poly_individual)
-                for (const auto& f : feats)
+            for (const auto& entry : poly_individual)
+                for (const auto& f : entry.second)
                     if (f.is_building) return true;
             return false;
         };
