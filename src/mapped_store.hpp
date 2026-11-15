@@ -14,11 +14,43 @@
 #include <filesystem>
 #include <vector>
 #include <string>
+#include <string_view>
 #include <cstring>
 #include <stdexcept>
 #include "nav_types.hpp"
 
 namespace nav {
+
+struct FeatureView
+{
+    int64_t id = 0;
+    uint8_t geom_type = 0;
+    uint16_t color_rgb565 = 0;
+    uint8_t zoom_priority = 0;
+    float width_meters = 0.0f;
+    const Point* points = nullptr;
+    uint32_t n_points = 0;
+    const uint32_t* ring_ends = nullptr;
+    uint32_t n_rings = 0;
+    const uint8_t* widths = nullptr; // 5 bytes per entry: int zoom + uint8_t pixels
+    uint32_t n_widths = 0;
+    std::string_view highway_type;
+    std::string_view layer;
+    std::string_view ref;
+    std::string_view name;
+    bool is_bridge = false;
+    bool is_building = false;
+    uint8_t oneway = 0;
+    uint8_t maxspeed = 0;
+
+    int width_zoom(uint32_t i) const
+    {
+        int z;
+        std::memcpy(&z, widths + i * 5, sizeof(int));
+        return z;
+    }
+    uint8_t width_px(uint32_t i) const { return widths[i * 5 + 4]; }
+};
 
 class MappedStore
 {
@@ -157,6 +189,47 @@ public:
         return f;
     }
 
+    FeatureView get_view(size_t offset) const
+    {
+        FeatureView f;
+        const uint8_t* p = mapped_ptr + offset;
+
+        memcpy(&f.id, p, sizeof(int64_t)); p += sizeof(int64_t);
+        f.geom_type = *p++;
+        memcpy(&f.color_rgb565, p, 2); p += 2;
+        f.zoom_priority = *p++;
+        memcpy(&f.width_meters, p, 4); p += 4;
+
+        uint32_t n_pts, n_rings;
+        memcpy(&n_pts, p, 4); p += 4;
+        memcpy(&n_rings, p, 4); p += 4;
+
+        f.n_points = n_pts;
+        f.points = reinterpret_cast<const Point*>(p);
+        p += n_pts * sizeof(Point);
+
+        f.n_rings = n_rings;
+        f.ring_ends = reinterpret_cast<const uint32_t*>(p);
+        p += n_rings * sizeof(uint32_t);
+
+        size_t n_widths;
+        memcpy(&n_widths, p, sizeof(size_t)); p += sizeof(size_t);
+        f.n_widths = static_cast<uint32_t>(n_widths);
+        f.widths = p;
+        p += n_widths * (sizeof(int) + sizeof(uint8_t));
+
+        f.highway_type = read_string_view(p);
+        f.layer = read_string_view(p);
+        f.ref = read_string_view(p);
+        f.name = read_string_view(p);
+        f.is_bridge = (*p++ != 0);
+        f.is_building = (*p++ != 0);
+        f.oneway = *p++;
+        f.maxspeed = *p++;
+
+        return f;
+    }
+
 private:
     uint8_t* write_string(uint8_t* p, const std::string& s)
     {
@@ -173,6 +246,15 @@ private:
         if (len > 0) { s.assign((const char*)p, len); p += len; }
         else s.clear();
         return p;
+    }
+
+    std::string_view read_string_view(const uint8_t*& p) const
+    {
+        uint16_t len;
+        memcpy(&len, p, 2); p += 2;
+        std::string_view s(reinterpret_cast<const char*>(p), len);
+        p += len;
+        return s;
     }
 
     void grow()

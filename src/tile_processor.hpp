@@ -9,6 +9,7 @@
 #pragma once
 #include <vector>
 #include <string>
+#include <string_view>
 #include <filesystem>
 #include <fstream>
 #include <cmath>
@@ -258,32 +259,59 @@ private:
      * @param handle GEOS thread-local context.
      * @return Caller-owned GEOSGeometry*, or nullptr if the feature is degenerate.
      */
-    GEOSGeometry* feature_to_geos(const Feature& f, GEOSContextHandle_t handle)
+    GEOSCoordSequence* coord_seq_from_doubles(const double* xy, uint32_t n, GEOSContextHandle_t handle)
     {
-        if (f.ring_ends.empty()) return nullptr;
+#if defined(GEOS_VERSION_MAJOR) && (GEOS_VERSION_MAJOR > 3 || (GEOS_VERSION_MAJOR == 3 && GEOS_VERSION_MINOR >= 10))
+        return GEOSCoordSeq_copyFromBuffer_r(handle, xy, n, 0, 0);
+#else
+        GEOSCoordSequence* seq = GEOSCoordSeq_create_r(handle, n, 2);
+        if (!seq) return nullptr;
+        for (uint32_t i = 0; i < n; ++i)
+        {
+            GEOSCoordSeq_setX_r(handle, seq, i, xy[2 * i]);
+            GEOSCoordSeq_setY_r(handle, seq, i, xy[2 * i + 1]);
+        }
+        return seq;
+#endif
+    }
+
+    GEOSCoordSequence* coord_seq_from_points(const Point* pts, uint32_t n, GEOSContextHandle_t handle)
+    {
+        static_assert(sizeof(Point) == 2 * sizeof(double), "Point must be two interleaved doubles");
+        return coord_seq_from_doubles(reinterpret_cast<const double*>(pts), n, handle);
+    }
+
+    GEOSCoordSequence* coord_seq_from_pairs(const std::vector<std::pair<int16_t, int16_t>>& pts,
+                                            GEOSContextHandle_t handle)
+    {
+        std::vector<double> xy;
+        xy.reserve(pts.size() * 2);
+        for (const auto& p : pts)
+        {
+            xy.push_back(p.first);
+            xy.push_back(p.second);
+        }
+        return coord_seq_from_doubles(xy.data(), static_cast<uint32_t>(pts.size()), handle);
+    }
+
+    GEOSGeometry* feature_to_geos(const FeatureView& f, GEOSContextHandle_t handle)
+    {
+        if (f.n_rings == 0) return nullptr;
         if (f.geom_type == GEOM_POLYGON)
         {
             uint32_t end = f.ring_ends[0];
             if (end < 3) return nullptr;
-            GEOSCoordSequence* seq = GEOSCoordSeq_create_r(handle, end, 2);
-            for (uint32_t i = 0; i < end; ++i)
-            {
-                GEOSCoordSeq_setX_r(handle, seq, i, f.points[i].lon);
-                GEOSCoordSeq_setY_r(handle, seq, i, f.points[i].lat);
-            }
+            GEOSCoordSequence* seq = coord_seq_from_points(f.points, end, handle);
+            if (!seq) return nullptr;
             GEOSGeometry* shell = GEOSGeom_createLinearRing_r(handle, seq);
             if (!shell) { GEOSCoordSeq_destroy_r(handle, seq); return nullptr; }
             std::vector<GEOSGeometry*> holes;
-            for (size_t r = 1; r < f.ring_ends.size(); ++r)
+            for (uint32_t r = 1; r < f.n_rings; ++r)
             {
                 uint32_t start = f.ring_ends[r - 1], r_end = f.ring_ends[r], r_size = r_end - start;
                 if (r_size < 3) continue;
-                GEOSCoordSequence* hseq = GEOSCoordSeq_create_r(handle, r_size, 2);
-                for (uint32_t j = 0; j < r_size; ++j)
-                {
-                    GEOSCoordSeq_setX_r(handle, hseq, j, f.points[start + j].lon);
-                    GEOSCoordSeq_setY_r(handle, hseq, j, f.points[start + j].lat);
-                }
+                GEOSCoordSequence* hseq = coord_seq_from_points(f.points + start, r_size, handle);
+                if (!hseq) continue;
                 GEOSGeometry* hole = GEOSGeom_createLinearRing_r(handle, hseq);
                 if (hole) holes.push_back(hole); else GEOSCoordSeq_destroy_r(handle, hseq);
             }
@@ -295,12 +323,8 @@ private:
         {
             uint32_t size = f.ring_ends[0];
             if (size < 2) return nullptr;
-            GEOSCoordSequence* seq = GEOSCoordSeq_create_r(handle, size, 2);
-            for (uint32_t i = 0; i < size; ++i)
-            {
-                GEOSCoordSeq_setX_r(handle, seq, i, f.points[i].lon);
-                GEOSCoordSeq_setY_r(handle, seq, i, f.points[i].lat);
-            }
+            GEOSCoordSequence* seq = coord_seq_from_points(f.points, size, handle);
+            if (!seq) return nullptr;
             return GEOSGeom_createLineString_r(handle, seq);
         }
     }
@@ -407,7 +431,6 @@ private:
         const auto& width_table = constants::line_width_per_zoom();
 
         std::vector<GEOSGeometry*> tight_buffers;
-        std::vector<GEOSGeometry*> generous_buffers;
 
         for (const auto& pf : line_features)
         {
@@ -418,12 +441,8 @@ private:
 
             if (pf.rings.empty() || pf.rings[0].size() < 2) continue;
 
-            GEOSCoordSequence* seq = GEOSCoordSeq_create_r(handle, (uint32_t)pf.rings[0].size(), 2);
-            for (size_t j = 0; j < pf.rings[0].size(); ++j)
-            {
-                GEOSCoordSeq_setX_r(handle, seq, (uint32_t)j, pf.rings[0][j].first);
-                GEOSCoordSeq_setY_r(handle, seq, (uint32_t)j, pf.rings[0][j].second);
-            }
+            GEOSCoordSequence* seq = coord_seq_from_pairs(pf.rings[0], handle);
+            if (!seq) continue;
             GEOSGeometry* line = GEOSGeom_createLineString_r(handle, seq);
             if (!line) continue;
 
@@ -438,17 +457,13 @@ private:
             }
 
             double rail_extra = is_rail ? 2.0 : 1.0;
-            double px_scale = 4096.0 / 256.0; 
+            double px_scale = 4096.0 / 256.0;
             double tight_buf = (road_width * 0.4 + rail_extra) * px_scale;
-            double extra = 5.0 * (1 << (z - 16));
-            double generous_buf = (road_width / 4.0 + extra) * px_scale;
 
             GEOSGeometry* tb = GEOSBufferWithStyle_r(handle, line, tight_buf, 4, GEOSBUF_CAP_FLAT, GEOSBUF_JOIN_ROUND, 0.0);
-            GEOSGeometry* gb = GEOSBufferWithStyle_r(handle, line, generous_buf, 4, GEOSBUF_CAP_FLAT, GEOSBUF_JOIN_ROUND, 0.0);
             GEOSGeom_destroy_r(handle, line);
 
             if (tb) tight_buffers.push_back(tb);
-            if (gb) generous_buffers.push_back(gb);
         }
 
         std::vector<ProcessedFeature> result;
@@ -480,7 +495,6 @@ private:
 
         GEOSGeom_destroy_r(handle, tight_coll);
         if (tight_union) GEOSGeom_destroy_r(handle, tight_union);
-        for (auto* g : generous_buffers) GEOSGeom_destroy_r(handle, g);
 
         return result;
     }
@@ -658,7 +672,7 @@ private:
             for (size_t offset : bucket)
             {
                 auto tl0 = std::chrono::steady_clock::now();
-                Feature f = store.get(offset);
+                FeatureView f = store.get_view(offset);
                 if (z == 9 && f.highway_type == "secondary" && f.ref.empty())
                 {
                     prep_loop_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - tl0).count();
@@ -666,8 +680,9 @@ private:
                 }
 
                 int min_tx = 1e9, max_tx = -1, min_ty = 1e9, max_ty = -1;
-                for (const auto& p : f.points)
+                for (uint32_t pi = 0; pi < f.n_points; ++pi)
                 {
+                    const Point& p = f.points[pi];
                     int tx = static_cast<int>(utils::lon_to_x(p.lon, z));
                     int ty = static_cast<int>(utils::lat_to_y(p.lat, z));
                     if (tx < min_tx) min_tx = tx;
@@ -1158,7 +1173,7 @@ private:
                         std::vector<uint8_t>& buffer)
     {
         struct Style {
-            uint16_t color; uint8_t prio; std::string subclass; bool is_building;
+            uint16_t color; uint8_t prio; std::string_view subclass; bool is_building;
             bool operator<(const Style& o) const {
                 if (color != o.color) return color < o.color;
                 if (prio != o.prio) return prio < o.prio;
@@ -1167,8 +1182,8 @@ private:
             }
         };
         std::map<Style, std::vector<GEOSGeometry*>> poly_groups;
-        std::map<Style, std::vector<Feature>> poly_individual;
-        std::vector<Feature> lines;
+        std::map<Style, std::vector<FeatureView>> poly_individual;
+        std::vector<FeatureView> lines;
         lines.reserve(offset_count);
         std::vector<GEOSGeometry*> island_geoms;
         const auto& width_table = constants::line_width_per_zoom();
@@ -1179,13 +1194,13 @@ private:
         for (size_t oi = 0; oi < offset_count; ++oi)
         {
             size_t offset = offsets[oi];
-            Feature f = store.get(offset);
+            FeatureView f = store.get_view(offset);
             if (f.geom_type == GEOM_POLYGON)
             {
-                if (pre_min_area > 0 && !f.points.empty())
+                if (pre_min_area > 0 && f.n_points > 0)
                 {
                     double area2 = 0;
-                    size_t npts = f.ring_ends.empty() ? f.points.size() : f.ring_ends[0];
+                    size_t npts = (f.n_rings == 0) ? f.n_points : f.ring_ends[0];
                     for (size_t i = 0; i < npts; ++i)
                     {
                         size_t j = (i + 1) % npts;
@@ -1248,13 +1263,18 @@ private:
 
         auto make_clip_box = [&](double margin) -> GEOSGeometry* {
             double lm = (lmax - lmin) * margin, tm = (tmax - tmin) * margin;
-            GEOSCoordSequence* cb = GEOSCoordSeq_create_r(local_handle, 5, 2);
-            GEOSCoordSeq_setX_r(local_handle, cb, 0, lmin - lm); GEOSCoordSeq_setY_r(local_handle, cb, 0, tmin - tm);
-            GEOSCoordSeq_setX_r(local_handle, cb, 1, lmax + lm); GEOSCoordSeq_setY_r(local_handle, cb, 1, tmin - tm);
-            GEOSCoordSeq_setX_r(local_handle, cb, 2, lmax + lm); GEOSCoordSeq_setY_r(local_handle, cb, 2, tmax + tm);
-            GEOSCoordSeq_setX_r(local_handle, cb, 3, lmin - lm); GEOSCoordSeq_setY_r(local_handle, cb, 3, tmax + tm);
-            GEOSCoordSeq_setX_r(local_handle, cb, 4, lmin - lm); GEOSCoordSeq_setY_r(local_handle, cb, 4, tmin - tm);
-            return GEOSGeom_createPolygon_r(local_handle, GEOSGeom_createLinearRing_r(local_handle, cb), NULL, 0);
+            double xy[10] = {
+                lmin - lm, tmin - tm, lmax + lm, tmin - tm,
+                lmax + lm, tmax + tm, lmin - lm, tmax + tm,
+                lmin - lm, tmin - tm
+            };
+            GEOSCoordSequence* cb = coord_seq_from_doubles(xy, 5, local_handle);
+            if (!cb) return nullptr;
+            GEOSGeometry* ring = GEOSGeom_createLinearRing_r(local_handle, cb);
+            if (!ring) { GEOSCoordSeq_destroy_r(local_handle, cb); return nullptr; }
+            GEOSGeometry* poly = GEOSGeom_createPolygon_r(local_handle, ring, NULL, 0);
+            if (!poly) { GEOSGeom_destroy_r(local_handle, ring); return nullptr; }
+            return poly;
         };
         // The polygon buffer only has to keep the cut edge out of the tile.
         double poly_margin = static_cast<double>(constants::CLIP_POLYGON_PX) / constants::TILE_SIZE_PX;
@@ -1262,14 +1282,22 @@ private:
         // geometry. Keep z13-z16 bit-for-bit identical and use it only at z17,
         // where the generator spends most of its time and features are not merged.
         const bool rect_clip = (z >= 17);
-        GEOSGeometry* clip_poly = rect_clip ? nullptr : make_clip_box(poly_margin);
+        auto has_building = [&]() {
+            for (const auto& [style, feats] : poly_individual)
+                for (const auto& f : feats)
+                    if (f.is_building) return true;
+            return false;
+        };
+        GEOSGeometry* clip_poly = (rect_clip || (poly_groups.empty() && poly_individual.empty()))
+            ? nullptr : make_clip_box(poly_margin);
 
         // The line buffer covers the widest stroke plus one pixel, never a whole tile.
         int max_line_px = 1;
         for (const auto& f : lines)
         {
-            auto wit = f.zoom_widths.find(z);
-            if (wit != f.zoom_widths.end() && wit->second > max_line_px) max_line_px = wit->second;
+            for (uint32_t wi = 0; wi < f.n_widths; ++wi)
+                if (f.width_zoom(wi) == z && f.width_px(wi) > max_line_px)
+                    max_line_px = f.width_px(wi);
         }
         int line_px = std::max(constants::clip_line_px(z), max_line_px / 2 + 1);
         double line_margin = static_cast<double>(line_px) / constants::TILE_SIZE_PX;
@@ -1282,12 +1310,14 @@ private:
         double casing_tm = (tmax - tmin) * constants::CLIP_MARGIN_CASING;
         double clip_casing_xmin = lmin - casing_lm, clip_casing_xmax = lmax + casing_lm;
         double clip_casing_ymin = tmin - casing_tm, clip_casing_ymax = tmax + casing_tm;
-        GEOSGeometry* clip_casing = rect_clip ? nullptr : make_clip_box(constants::CLIP_MARGIN_CASING);
+        GEOSGeometry* clip_casing = (rect_clip || !has_building())
+            ? nullptr : make_clip_box(constants::CLIP_MARGIN_CASING);
         double line_lm = (lmax - lmin) * line_margin;
         double line_tm = (tmax - tmin) * line_margin;
         double clip_line_xmin = lmin - line_lm, clip_line_xmax = lmax + line_lm;
         double clip_line_ymin = tmin - line_tm, clip_line_ymax = tmax + line_tm;
-        GEOSGeometry* clip_line = rect_clip ? nullptr : make_clip_box(line_margin);
+        GEOSGeometry* clip_line = (rect_clip || lines.empty())
+            ? nullptr : make_clip_box(line_margin);
 
         auto clip_with_bbox = [&](const GEOSGeometry* geom,
                                   double cxmin, double cxmax, double cymin, double cymax,
@@ -1298,7 +1328,7 @@ private:
                 if (gxmax < cxmin || gxmin > cxmax || gymax < cymin || gymin > cymax)
                     return nullptr;
                 if (gxmin >= cxmin && gxmax <= cxmax && gymin >= cymin && gymax <= cymax)
-                    return GEOSGeom_clone_r(local_handle, geom);
+                    return const_cast<GEOSGeometry*>(geom);
             }
             if (polygon_clip)
                 return GEOSIntersection_r(local_handle, geom, polygon_clip);
@@ -1335,7 +1365,7 @@ private:
         };
 
         auto emit_polygon = [&](const GEOSGeometry* safe, uint16_t color, uint8_t prio,
-                                const std::string& feat_layer = "", bool is_building = false) {
+                                std::string_view feat_layer = "", bool is_building = false) {
             if (!safe || GEOSGeomTypeId_r(local_handle, safe) != GEOS_POLYGON || GEOSisEmpty_r(local_handle, safe)) return;
             bool is_water = ((prio & 0x0F) == 8);
 
@@ -1358,7 +1388,7 @@ private:
                 if (pixel_area < min_pixel_area) return;
             }
 
-            ProcessedFeature pf{GEOM_POLYGON, color, prio, 0, {}, {}, "", feat_layer, false, is_building};
+            ProcessedFeature pf{GEOM_POLYGON, color, prio, 0, {}, {}, "", std::string(feat_layer), false, is_building};
             pf.rings.push_back(std::move(ext_pts));
 
             int nh = GEOSGetNumInteriorRings_r(local_handle, safe);
@@ -1403,7 +1433,7 @@ private:
                 GEOSGeometry* simplified = GEOSTopologyPreserveSimplify_r(local_handle, merged, tolerance * 0.5);
                 GEOSGeometry* to_clip = (simplified && !GEOSisEmpty_r(local_handle, simplified)) ? simplified : merged;
                 GEOSGeometry* clipped = clip_with_bbox(to_clip, clip_poly_xmin, clip_poly_xmax, clip_poly_ymin, clip_poly_ymax, clip_poly);
-                if (to_clip != merged) GEOSGeom_destroy_r(local_handle, to_clip);
+                if (to_clip != merged && clipped != to_clip) GEOSGeom_destroy_r(local_handle, to_clip);
                 if (clipped)
                 {
                     if (!GEOSisValid_r(local_handle, clipped))
@@ -1413,7 +1443,8 @@ private:
                     }
                     else final_geom = clipped;
                 }
-                GEOSGeom_destroy_r(local_handle, merged);
+                if (merged && final_geom != merged && clipped != merged)
+                    GEOSGeom_destroy_r(local_handle, merged);
             }
             if (!final_geom) { GEOSGeom_destroy_r(local_handle, coll); continue; }
 
@@ -1451,7 +1482,7 @@ private:
                 double pymax = f.is_building ? clip_casing_ymax : clip_poly_ymax;
                 const GEOSGeometry* pclip = rect_clip ? nullptr : (f.is_building ? clip_casing : clip_poly);
                 GEOSGeometry* clipped = clip_with_bbox(g, pxmin, pxmax, pymin, pymax, pclip);
-                GEOSGeom_destroy_r(local_handle, g);
+                if (clipped != g) GEOSGeom_destroy_r(local_handle, g);
                 if (!clipped || GEOSisEmpty_r(local_handle, clipped)) { if (clipped) GEOSGeom_destroy_r(local_handle, clipped); continue; }
                 if (!GEOSisValid_r(local_handle, clipped)) { GEOSGeometry* v = GEOSMakeValid_r(local_handle, clipped); GEOSGeom_destroy_r(local_handle, clipped); clipped = v; }
                 if (!clipped) continue;
@@ -1536,7 +1567,7 @@ private:
             GEOSGeometry* clipped = clip_with_bbox(g, clip_line_xmin, clip_line_xmax, clip_line_ymin, clip_line_ymax, clip_line);
             if (!clipped || GEOSisEmpty_r(local_handle, clipped))
             {
-                GEOSGeom_destroy_r(local_handle, g);
+                if (clipped != g) GEOSGeom_destroy_r(local_handle, g);
                 if (clipped) GEOSGeom_destroy_r(local_handle, clipped);
                 continue;
             }
@@ -1544,7 +1575,7 @@ private:
             uint16_t line_color = f.color_rgb565;
             if (!f.highway_type.empty())
             {
-                auto cit = color_table.find(f.highway_type);
+                auto cit = color_table.find(std::string(f.highway_type));
                 if (cit != color_table.end())
                 {
                     auto zit = cit->second.find(z);
@@ -1565,8 +1596,11 @@ private:
                 uint32_t sz = 0; if (s) GEOSCoordSeq_getSize_r(local_handle, s, &sz);
                 if (sz >= 2)
                 {
+                    std::map<int, uint8_t> zoom_widths;
+                    for (uint32_t wi = 0; wi < f.n_widths; ++wi)
+                        zoom_widths[f.width_zoom(wi)] = f.width_px(wi);
                     ProcessedFeature pf{GEOM_LINESTRING, line_color, f.zoom_priority, f.width_meters,
-                                       {{}}, f.zoom_widths, f.highway_type, f.layer, f.is_bridge, f.is_building};
+                                       {{}}, std::move(zoom_widths), std::string(f.highway_type), std::string(f.layer), f.is_bridge, f.is_building};
                     pf.rings[0].reserve(sz);
                     for (uint32_t j = 0; j < sz; ++j)
                     {
@@ -1578,7 +1612,8 @@ private:
                     if (pf.rings[0].size() >= 2) final_features.push_back(std::move(pf));
                 }
             }
-            GEOSGeom_destroy_r(local_handle, g); GEOSGeom_destroy_r(local_handle, clipped);
+            if (g != clipped) GEOSGeom_destroy_r(local_handle, g);
+            GEOSGeom_destroy_r(local_handle, clipped);
         }
 
         auto bridge_decks = make_bridge_decks(final_features, z, x, y, local_handle);
@@ -1656,7 +1691,8 @@ private:
 
             size_t total_points = 0;
             for (const auto& r : pf.rings) total_points += r.size();
-            std::vector<uint8_t> payload;
+            static thread_local std::vector<uint8_t> payload;
+            payload.clear();
             payload.reserve(total_points * 3 + 8);
             int16_t minx = 4096, maxx = 0, miny = 4096, maxy = 0;
             size_t pts = 0;
@@ -1677,7 +1713,8 @@ private:
                 }
                 pts += r.size();
             }
-            std::vector<uint8_t> ri;
+            static thread_local std::vector<uint8_t> ri;
+            ri.clear();
             if (pf.type == GEOM_POLYGON)
             {
                 uint16_t nr = (uint16_t)pf.rings.size();
@@ -1717,7 +1754,8 @@ private:
             int data_size = 4 + 1 + text_len + (has_shield ? 4 : 0);
             uint16_t coord_count = (uint16_t)data_size;
 
-            std::vector<uint8_t> text_payload;
+            static thread_local std::vector<uint8_t> text_payload;
+            text_payload.clear();
             text_payload.reserve(data_size);
             text_payload.push_back(px & 0xFF); text_payload.push_back(px >> 8);
             text_payload.push_back(py & 0xFF); text_payload.push_back(py >> 8);
