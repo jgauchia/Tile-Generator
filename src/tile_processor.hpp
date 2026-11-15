@@ -17,6 +17,8 @@
 #include <thread>
 #include <future>
 #include <atomic>
+#include <exception>
+#include <ctime>
 #include <map>
 #include <unordered_map>
 #include <unordered_set>
@@ -516,6 +518,102 @@ private:
         result.push_back(std::move(pf));
     }
 
+    // First pass of the palette pass: record the first tile/feature position of every color.
+    void scanPaletteTile(const PackedTile& pt, size_t tileIdx, std::vector<uint64_t>& firstPos) const
+    {
+        if (pt.data.size() < 6)
+            return;
+
+        uint16_t fcount;
+        memcpy(&fcount, pt.data.data() + 4, 2);
+
+        size_t p = 6;
+        for (uint16_t fi = 0; fi < fcount; ++fi)
+        {
+            if (p + 9 > pt.data.size())
+                throw std::runtime_error("corrupt tile payload while scanning palette");
+
+            uint16_t color;
+            memcpy(&color, pt.data.data() + p + 1, 2);
+            uint64_t pos = (static_cast<uint64_t>(tileIdx) << 32) | fi;
+            if (pos < firstPos[color])
+                firstPos[color] = pos;
+
+            size_t hp = p + 9;
+            while (hp < pt.data.size() && (pt.data[hp++] & 0x80))
+            {
+            }
+
+            uint64_t ps = 0;
+            int shift = 0;
+            while (hp < pt.data.size())
+            {
+                uint8_t b = pt.data[hp++];
+                ps |= (uint64_t)(b & 0x7F) << shift;
+                if (!(b & 0x80))
+                    break;
+                shift += 7;
+            }
+            if (hp + ps > pt.data.size())
+                throw std::runtime_error("corrupt tile payload while scanning palette");
+
+            p = hp + ps;
+        }
+    }
+
+    // Second pass: compact one tile in place, independently of all other tiles.
+    void compactPaletteTile(PackedTile& pt, const std::unordered_map<uint16_t, uint16_t>& colorToIndex) const
+    {
+        if (pt.data.size() < 6)
+            return;
+
+        uint16_t fcount;
+        memcpy(&fcount, pt.data.data() + 4, 2);
+
+        size_t p = 6;
+        size_t d = 6;
+        for (uint16_t fi = 0; fi < fcount; ++fi)
+        {
+            if (p + 9 > pt.data.size())
+                throw std::runtime_error("corrupt tile payload while compacting palette");
+
+            uint8_t geom = pt.data[p];
+            uint16_t color;
+            memcpy(&color, pt.data.data() + p + 1, 2);
+
+            auto it = colorToIndex.find(color);
+            if (it == colorToIndex.end())
+                throw std::runtime_error("palette color missing while compacting tile");
+            uint16_t cidx = it->second;
+
+            size_t hp = p + 9;
+            while (hp < pt.data.size() && (pt.data[hp++] & 0x80))
+            {
+            }
+
+            uint64_t ps = 0;
+            int shift = 0;
+            while (hp < pt.data.size())
+            {
+                uint8_t b = pt.data[hp++];
+                ps |= (uint64_t)(b & 0x7F) << shift;
+                if (!(b & 0x80))
+                    break;
+                shift += 7;
+            }
+            if (hp + ps > pt.data.size())
+                throw std::runtime_error("corrupt tile payload while compacting palette");
+
+            size_t moveLen = hp - (p + 3) + ps;
+            std::memmove(pt.data.data() + d + 2, pt.data.data() + p + 3, moveLen);
+            pt.data[d] = geom;
+            pt.data[d + 1] = static_cast<uint8_t>(cidx);
+            d += 2 + moveLen;
+            p = hp + ps;
+        }
+        pt.data.resize(d);
+    }
+
     /**
      * @brief Generate the NPK2 tile file for a single zoom level.
      * @param features_by_zoom Feature offset arrays indexed by zoom bucket (0–17).
@@ -735,69 +833,107 @@ private:
         // Build global color palette from serialized tiles and collapse 2B color -> 1B index.
         // Tiles are serialized with a temporary 2-byte color in each feature header;
         // here we gather the real color set, assign indices and rewrite every tile in place.
-        std::vector<uint16_t> palette;
-        std::unordered_map<uint16_t, uint16_t> color_to_index;
+        constexpr size_t PALETTE_CHUNK = 4096;
+        const size_t paletteTileCount = packed_results.size();
+        std::vector<std::vector<uint64_t>> localFirst(num_threads,
+            std::vector<uint64_t>(65536, UINT64_MAX));
+        std::atomic<size_t> nextPaletteTile{0};
+        std::atomic<bool> paletteFailed{false};
+        std::vector<std::exception_ptr> paletteErrors(num_threads);
+        std::vector<std::thread> paletteWorkers;
+        paletteWorkers.reserve(num_threads);
 
-        for (auto& pt : packed_results)
+        for (unsigned int t = 0; t < num_threads; ++t)
         {
-            if (pt.data.size() < 6)
-                continue;
-            uint16_t fcount;
-            memcpy(&fcount, pt.data.data() + 4, 2);
-
-            size_t p = 6;
-            size_t d = 6;
-            for (uint16_t fi = 0; fi < fcount; ++fi)
-            {
-                if (p + 9 > pt.data.size())
-                    throw std::runtime_error("corrupt tile payload while compacting palette");
-
-                uint8_t geom = pt.data[p];
-                uint16_t color;
-                memcpy(&color, pt.data.data() + p + 1, 2);
-
-                auto it = color_to_index.find(color);
-                uint16_t cidx;
-                if (it == color_to_index.end())
+            paletteWorkers.emplace_back([&, t]() {
+                try
                 {
-                    cidx = (uint16_t)palette.size();
-                    color_to_index.emplace(color, cidx);
-                    palette.push_back(color);
+                    while (!paletteFailed.load(std::memory_order_relaxed))
+                    {
+                        size_t begin = nextPaletteTile.fetch_add(PALETTE_CHUNK, std::memory_order_relaxed);
+                        if (begin >= paletteTileCount)
+                            break;
+                        size_t end = std::min(begin + PALETTE_CHUNK, paletteTileCount);
+                        for (size_t i = begin; i < end; ++i)
+                            scanPaletteTile(packed_results[i], i, localFirst[t]);
+                    }
                 }
-                else
-                    cidx = it->second;
-
-                size_t hp = p + 9;
-                while (hp < pt.data.size() && (pt.data[hp++] & 0x80))
+                catch (...)
                 {
+                    paletteErrors[t] = std::current_exception();
+                    paletteFailed.store(true, std::memory_order_relaxed);
                 }
-                uint64_t ps = 0;
-                int shift = 0;
-                while (hp < pt.data.size())
-                {
-                    uint8_t b = pt.data[hp++];
-                    ps |= (uint64_t)(b & 0x7F) << shift;
-                    if (!(b & 0x80))
-                        break;
-                    shift += 7;
-                }
-                if (hp + ps > pt.data.size())
-                    throw std::runtime_error("corrupt tile payload while compacting palette");
-
-                size_t move_len = hp - (p + 3) + ps;
-                std::memmove(pt.data.data() + d + 2, pt.data.data() + p + 3, move_len);
-                pt.data[d] = geom;
-                pt.data[d + 1] = static_cast<uint8_t>(cidx);
-                d += 2 + move_len;
-                p = hp + ps;
-            }
-            pt.data.resize(d);
+            });
         }
-        auto t_palette1 = std::chrono::steady_clock::now();
+        for (auto& worker : paletteWorkers)
+            worker.join();
+        for (const auto& error : paletteErrors)
+            if (error)
+                std::rethrow_exception(error);
 
-        if (palette.size() > 255)
-            throw std::runtime_error("Z" + std::to_string(z) + " palette has " + std::to_string(palette.size()) +
+        std::vector<uint64_t> firstPos(65536, UINT64_MAX);
+        for (const auto& local : localFirst)
+            for (uint32_t color = 0; color < 65536; ++color)
+                if (local[color] < firstPos[color])
+                    firstPos[color] = local[color];
+
+        std::vector<std::pair<uint64_t, uint16_t>> paletteOrder;
+        paletteOrder.reserve(64);
+        for (uint32_t color = 0; color < 65536; ++color)
+            if (firstPos[color] != UINT64_MAX)
+                paletteOrder.emplace_back(firstPos[color], static_cast<uint16_t>(color));
+        std::sort(paletteOrder.begin(), paletteOrder.end(),
+                  [](const auto& a, const auto& b) { return a.first < b.first; });
+
+        if (paletteOrder.size() > 255)
+            throw std::runtime_error("Z" + std::to_string(z) + " palette has " + std::to_string(paletteOrder.size()) +
                                      " colors (>255), 1-byte color index would overflow");
+
+        std::vector<uint16_t> palette;
+        palette.reserve(paletteOrder.size());
+        std::unordered_map<uint16_t, uint16_t> colorToIndex;
+        colorToIndex.reserve(paletteOrder.size());
+        for (size_t i = 0; i < paletteOrder.size(); ++i)
+        {
+            palette.push_back(paletteOrder[i].second);
+            colorToIndex.emplace(paletteOrder[i].second, static_cast<uint16_t>(i));
+        }
+
+        std::atomic<size_t> nextCompactTile{0};
+        std::atomic<bool> compactFailed{false};
+        std::vector<std::exception_ptr> compactErrors(num_threads);
+        std::vector<std::thread> compactWorkers;
+        compactWorkers.reserve(num_threads);
+
+        for (unsigned int t = 0; t < num_threads; ++t)
+        {
+            compactWorkers.emplace_back([&, t]() {
+                try
+                {
+                    while (!compactFailed.load(std::memory_order_relaxed))
+                    {
+                        size_t begin = nextCompactTile.fetch_add(PALETTE_CHUNK, std::memory_order_relaxed);
+                        if (begin >= paletteTileCount)
+                            break;
+                        size_t end = std::min(begin + PALETTE_CHUNK, paletteTileCount);
+                        for (size_t i = begin; i < end; ++i)
+                            compactPaletteTile(packed_results[i], colorToIndex);
+                    }
+                }
+                catch (...)
+                {
+                    compactErrors[t] = std::current_exception();
+                    compactFailed.store(true, std::memory_order_relaxed);
+                }
+            });
+        }
+        for (auto& worker : compactWorkers)
+            worker.join();
+        for (const auto& error : compactErrors)
+            if (error)
+                std::rethrow_exception(error);
+
+        auto t_palette1 = std::chrono::steady_clock::now();
 
         // Compute bounding box of tiles in this zoom level
         uint32_t min_x = UINT32_MAX, min_y = UINT32_MAX;
@@ -853,6 +989,7 @@ private:
         }
 
         auto t_write0 = std::chrono::steady_clock::now();
+        const std::clock_t writeCpu0 = std::clock();
         uint64_t zoom_bytes = 0;
         std::string pack_path = output_dir + "/Z" + std::to_string(z) + ".nav";
         std::ofstream out(pack_path, std::ios::binary);
@@ -900,7 +1037,15 @@ private:
             total_generated_bytes += current_data_offset;
             total_generated_files++;
         }
-        auto end = std::chrono::steady_clock::now();
+        auto t_write1 = std::chrono::steady_clock::now();
+        if (out.is_open())
+            out.flush();
+        auto t_flush1 = std::chrono::steady_clock::now();
+        if (out.is_open())
+            out.close();
+        auto t_close1 = std::chrono::steady_clock::now();
+        const std::clock_t writeCpu1 = std::clock();
+        auto end = t_close1;
         std::chrono::duration<double> elapsed = end - start;
         double avg_tps = (elapsed.count() > 0) ? (double)tile_count / elapsed.count() : 0;
         std::cout << "\r\33[2K  Zoom " << std::setw(2) << z << ": "
@@ -912,7 +1057,16 @@ private:
             auto secs = [](auto a, auto b) { return std::chrono::duration<double>(b - a).count(); };
             std::cout << "    [CLOSE z" << z << "] prep_tilemap=" << std::fixed << std::setprecision(1)
                       << secs(start, t_prep1) << "s  palette_pass=" << secs(t_palette0, t_palette1)
-                      << "s  write_nav=" << secs(t_write0, end) << "s" << std::endl;
+                      << "s  write_nav=" << secs(t_write0, t_write1) << "s  flush="
+                      << secs(t_write1, t_flush1) << "s  close=" << secs(t_flush1, t_close1) << "s" << std::endl;
+            // TEMP: write metrics for deciding whether a parallel writer can help.
+            const double writeWall = secs(t_write0, t_close1);
+            std::cout << "    [WRITE z" << z << "] bytes=" << zoom_bytes
+                      << "  wall=" << std::fixed << std::setprecision(3) << writeWall
+                      << "s  cpu=" << (static_cast<double>(writeCpu1 - writeCpu0) / CLOCKS_PER_SEC)
+                      << "s  MB/s=" << std::setprecision(1)
+                      << (writeWall > 0.0 ? (zoom_bytes / (1024.0 * 1024.0)) / writeWall : 0.0)
+                      << std::endl;
             std::cout << "    [PREP z" << z << "] feat_loop=" << std::fixed << std::setprecision(1)
                       << prep_loop_s << "s  map_insert=" << prep_insert_s << "s  inserts="
                       << prep_inserts << std::endl;
@@ -1534,6 +1688,12 @@ private:
         if (!island_geoms_owned)
             for (auto* ig : island_geoms) GEOSGeom_destroy_r(local_handle, ig);
         if (island_union) GEOSGeom_destroy_r(local_handle, island_union);
+
+        // Drop the reserve() slack before the payload is kept alive for the whole
+        // zoom. Without this every tile pins ~1KB (the reserve floor) instead of
+        // its real ~82B, which at Z17 means ~18GB across 16M tiles and pushes the
+        // process into swap during the palette and write phases.
+        buffer.shrink_to_fit();
         return buffer;
     }
 };
