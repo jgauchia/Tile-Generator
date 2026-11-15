@@ -1061,6 +1061,46 @@ private:
             }
         }
 
+        const uint32_t palette_bytes = (uint32_t)palette.size() * sizeof(uint16_t);
+        const uint64_t data_offset = sizeof(MapHeader) + sizeof(index_count) + bitmap_bytes +
+                                     (uint64_t)rank_count * sizeof(uint32_t) +
+                                     (uint64_t)index_count * sizeof(IndexEntry) + palette_bytes;
+        if (data_offset > UINT32_MAX)
+            throw std::runtime_error("pack header/index/palette exceeds 32-bit offsets");
+
+        // Deduplicate identical serialized tiles after the palette is final. The
+        // index still has one entry per tile, but duplicate entries point to the
+        // first block; NAV1 itself is unchanged.
+        struct UniqueBlock
+        {
+            uint32_t arena_offset;
+            uint32_t file_offset;
+            uint32_t size;
+        };
+        std::vector<UniqueBlock> unique_blocks;
+        unique_blocks.reserve(std::min<size_t>(packed_results.size(), 1'000'000));
+        std::vector<uint32_t> entry_offsets(packed_results.size(), 0);
+        std::unordered_map<std::string_view, uint32_t> unique_by_payload;
+        unique_by_payload.reserve(std::min<size_t>(packed_results.size(), 1'000'000));
+        uint64_t unique_bytes = 0;
+        for (size_t i = 0; i < packed_results.size(); ++i)
+        {
+            const PackedTile& pt = packed_results[i];
+            if (pt.size < 6)
+                continue;
+            const std::string_view block(reinterpret_cast<const char*>(payload_ptr(pt.offset)), pt.size);
+            auto [it, inserted] = unique_by_payload.emplace(block, static_cast<uint32_t>(unique_blocks.size()));
+            if (inserted)
+            {
+                const uint64_t file_offset = data_offset + unique_bytes;
+                if (file_offset > UINT32_MAX)
+                    throw std::runtime_error("deduplicated pack exceeds 32-bit offsets");
+                unique_blocks.push_back({pt.offset, static_cast<uint32_t>(file_offset), pt.size});
+                unique_bytes += pt.size;
+            }
+            entry_offsets[i] = unique_blocks[it->second].file_offset;
+        }
+
         auto t_write0 = std::chrono::steady_clock::now();
         const std::clock_t writeCpu0 = std::clock();
         uint64_t zoom_bytes = 0;
@@ -1068,11 +1108,6 @@ private:
         std::ofstream out(pack_path, std::ios::binary);
         if (out)
         {
-            uint32_t palette_bytes = (uint32_t)palette.size() * sizeof(uint16_t);
-            uint64_t data_offset = sizeof(MapHeader) + sizeof(index_count) + bitmap_bytes +
-                                   (uint64_t)rank_count * sizeof(uint32_t) +
-                                   (uint64_t)index_count * sizeof(IndexEntry) + palette_bytes;
-
             // Write header
             MapHeader mh;
             memcpy(mh.magic, "NPK2", 4);
@@ -1089,30 +1124,25 @@ private:
             out.write((char*)bitmap.data(), bitmap.size());
             out.write((char*)rank.data(), rank.size() * sizeof(uint32_t));
 
-            uint64_t current_data_offset = data_offset;
-            for (const auto& pt : packed_results)
+            for (size_t i = 0; i < packed_results.size(); ++i)
             {
+                const PackedTile& pt = packed_results[i];
                 if (pt.size < 6)
                     continue;
                 IndexEntry entry;
-                entry.offset = (uint32_t)current_data_offset;
+                entry.offset = entry_offsets[i];
                 entry.size   = pt.size;
-                current_data_offset += pt.size;
                 out.write((char*)&entry, sizeof(entry));
             }
 
             if (!palette.empty())
                 out.write((char*)palette.data(), palette_bytes);
 
-            for (const auto& pt : packed_results)
-            {
-                if (pt.size < 6)
-                    continue;
-                out.write((char*)payload_ptr(pt.offset), pt.size);
-            }
+            for (const auto& block : unique_blocks)
+                out.write((char*)payload_ptr(block.arena_offset), block.size);
 
-            zoom_bytes = current_data_offset;
-            total_generated_bytes += current_data_offset;
+            zoom_bytes = data_offset + unique_bytes;
+            total_generated_bytes += zoom_bytes;
             total_generated_files++;
         }
         auto t_write1 = std::chrono::steady_clock::now();
