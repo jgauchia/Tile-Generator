@@ -1367,12 +1367,13 @@ private:
         auto emit_polygon = [&](const GEOSGeometry* safe, uint16_t color, uint8_t prio,
                                 std::string_view feat_layer = "", bool is_building = false) {
             if (!safe || GEOSGeomTypeId_r(local_handle, safe) != GEOS_POLYGON || GEOSisEmpty_r(local_handle, safe)) return;
-            bool is_water = ((prio & 0x0F) == 8);
+            // Legacy filter policy: priority nibble 8 skips the area/hole filters.
+            bool skip_area_filters = ((prio & 0x0F) == 8);
 
             auto ext_pts = project_ring(GEOSGetExteriorRing_r(local_handle, safe));
             if (ext_pts.size() < 3) return;
 
-            if (!is_water && min_pixel_area > 0)
+            if (!skip_area_filters && min_pixel_area > 0)
             {
                 int16_t minx = 4096, maxx = 0, miny = 4096, maxy = 0;
                 for (const auto& p : ext_pts)
@@ -1397,7 +1398,7 @@ private:
                 const GEOSGeometry* hole = GEOSGetInteriorRingN_r(local_handle, safe, h);
                 if (!hole) continue;
 
-                if (!is_water && min_hole_area_deg2 > 0)
+                if (!skip_area_filters && min_hole_area_deg2 > 0)
                 {
                     const GEOSCoordSequence* hs = GEOSGeom_getCoordSeq_r(local_handle, hole);
                     if (hs)
@@ -1470,10 +1471,14 @@ private:
         for (auto& [style, feats] : poly_individual)
         {
             uint8_t nibble = style.prio & 0x0F;
-            bool is_water = (nibble == 8);
             bool is_landuse_low = (nibble <= 3) && z < 14;
+            bool legacy_prio8 = (nibble == 8);
             for (auto& f : feats)
             {
+                // Only water gains the island subtraction; priority-8 non-water
+                // layers keep their legacy path.
+                bool is_water = (f.layer == "water");
+                bool subtract_islands = is_water || legacy_prio8;
                 GEOSGeometry* g = feature_to_geos(f, local_handle);
                 if (!g) continue;
                 double pxmin = f.is_building ? clip_casing_xmin : clip_poly_xmin;
@@ -1487,7 +1492,10 @@ private:
                 if (!GEOSisValid_r(local_handle, clipped)) { GEOSGeometry* v = GEOSMakeValid_r(local_handle, clipped); GEOSGeom_destroy_r(local_handle, clipped); clipped = v; }
                 if (!clipped) continue;
 
-                if (is_water && island_union)
+                // Subtract islands so water does not paint over them. Keep the
+                // normal simplification: skipping it exposes a rectangular land
+                // gap in the current water source at z6.
+                if (subtract_islands && island_union)
                 {
                     GEOSGeometry* diff = GEOSDifference_r(local_handle, clipped, island_union);
                     if (diff && !GEOSisEmpty_r(local_handle, diff))
@@ -1514,7 +1522,7 @@ private:
                     GEOSGeometry* s = GEOSTopologyPreserveSimplify_r(local_handle, clipped, tolerance);
                     if (s && !GEOSisEmpty_r(local_handle, s)) result = s;
                 }
-                else if (!is_water)
+                else if (!legacy_prio8)
                 {
                     GEOSGeometry* s = GEOSTopologyPreserveSimplify_r(local_handle, clipped, tolerance * 0.5);
                     if (s && !GEOSisEmpty_r(local_handle, s)) result = s;
