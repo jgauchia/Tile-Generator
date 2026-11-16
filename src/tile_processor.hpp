@@ -19,7 +19,6 @@
 #include <future>
 #include <atomic>
 #include <exception>
-#include <ctime>
 #include <memory>
 #include <map>
 #include <unordered_map>
@@ -645,7 +644,6 @@ private:
                             const std::vector<Feature>& point_features)
     {
         auto start = std::chrono::steady_clock::now();
-        double prep_loop_s = 0.0, prep_insert_s = 0.0;
         uint64_t prep_inserts = 0;
 
         struct FeatureSpan
@@ -671,13 +669,9 @@ private:
             const auto& bucket = features_by_zoom[b];
             for (size_t offset : bucket)
             {
-                auto tl0 = std::chrono::steady_clock::now();
                 FeatureView f = store.get_view(offset);
                 if (z == 9 && f.highway_type == "secondary" && f.ref.empty())
-                {
-                    prep_loop_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - tl0).count();
                     continue;
-                }
 
                 int min_tx = 1e9, max_tx = -1, min_ty = 1e9, max_ty = -1;
                 for (uint32_t pi = 0; pi < f.n_points; ++pi)
@@ -690,7 +684,6 @@ private:
                     if (ty < min_ty) min_ty = ty;
                     if (ty > max_ty) max_ty = ty;
                 }
-                prep_loop_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - tl0).count();
                 if (min_tx > max_tx) continue;
                 if (offset > UINT32_MAX)
                     throw std::runtime_error("feature store offset exceeds 32-bit");
@@ -725,7 +718,6 @@ private:
         uint32_t grid_high = static_cast<uint32_t>(grid_max_y - grid_min_y + 1);
         size_t cell_count = static_cast<size_t>(grid_wide) * grid_high;
 
-        auto ti0 = std::chrono::steady_clock::now();
         std::vector<uint32_t> cell_starts(cell_count + 1, 0);
         std::vector<uint8_t> cell_active(cell_count, 0);
         for (const auto& span : spans)
@@ -771,7 +763,6 @@ private:
         active_cells.reserve(std::min(cell_count, static_cast<size_t>(prep_inserts)));
         for (size_t cell = 0; cell < cell_count; ++cell)
             if (cell_active[cell]) active_cells.push_back(static_cast<uint32_t>(cell));
-        prep_insert_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - ti0).count();
 
         std::vector<FeatureSpan>().swap(spans);
         std::vector<uint32_t>().swap(cursor);
@@ -780,8 +771,6 @@ private:
         if (active_cells.empty()) return;
 
         auto point_indices = buildPointIndices(point_features, z);
-
-        auto t_prep1 = std::chrono::steady_clock::now();
 
         const size_t tile_count = active_cells.size();
         std::vector<PackedTile> packed_results(tile_count);
@@ -898,7 +887,6 @@ private:
         point_indices.clear();
         point_indices.rehash(0);
 
-        auto t_palette0 = std::chrono::steady_clock::now();
         // Build global color palette from serialized tiles and collapse 2B color -> 1B index.
         // Tiles are serialized with a temporary 2-byte color in each feature header;
         // here we gather the real color set, assign indices and rewrite every tile in place.
@@ -1010,8 +998,6 @@ private:
             if (error)
                 std::rethrow_exception(error);
 
-        auto t_palette1 = std::chrono::steady_clock::now();
-
         // Compute bounding box of tiles in this zoom level
         uint32_t min_x = UINT32_MAX, min_y = UINT32_MAX;
         uint32_t max_x = 0, max_y = 0;
@@ -1101,8 +1087,6 @@ private:
             entry_offsets[i] = unique_blocks[it->second].file_offset;
         }
 
-        auto t_write0 = std::chrono::steady_clock::now();
-        const std::clock_t writeCpu0 = std::clock();
         uint64_t zoom_bytes = 0;
         std::string pack_path = output_dir + "/Z" + std::to_string(z) + ".nav";
         std::ofstream out(pack_path, std::ios::binary);
@@ -1145,15 +1129,11 @@ private:
             total_generated_bytes += zoom_bytes;
             total_generated_files++;
         }
-        auto t_write1 = std::chrono::steady_clock::now();
         if (out.is_open())
             out.flush();
-        auto t_flush1 = std::chrono::steady_clock::now();
         if (out.is_open())
             out.close();
-        auto t_close1 = std::chrono::steady_clock::now();
-        const std::clock_t writeCpu1 = std::clock();
-        auto end = t_close1;
+        auto end = std::chrono::steady_clock::now();
         std::chrono::duration<double> elapsed = end - start;
         double avg_tps = (elapsed.count() > 0) ? (double)tile_count / elapsed.count() : 0;
         std::cout << "\r\33[2K  Zoom " << std::setw(2) << z << ": "
@@ -1161,24 +1141,6 @@ private:
                   << std::fixed << std::setprecision(1) << avg_tps << " t/s), "
                   << std::setw(8) << (size_t)merged_count << " polygons merged | "
                   << std::setw(6) << std::setprecision(1) << (zoom_bytes / 1024.0 / 1024.0) << " MB done in " << elapsed.count() << "s" << std::endl;
-        {
-            auto secs = [](auto a, auto b) { return std::chrono::duration<double>(b - a).count(); };
-            std::cout << "    [CLOSE z" << z << "] prep_tilemap=" << std::fixed << std::setprecision(1)
-                      << secs(start, t_prep1) << "s  palette_pass=" << secs(t_palette0, t_palette1)
-                      << "s  write_nav=" << secs(t_write0, t_write1) << "s  flush="
-                      << secs(t_write1, t_flush1) << "s  close=" << secs(t_flush1, t_close1) << "s" << std::endl;
-            // TEMP: write metrics for deciding whether a parallel writer can help.
-            const double writeWall = secs(t_write0, t_close1);
-            std::cout << "    [WRITE z" << z << "] bytes=" << zoom_bytes
-                      << "  wall=" << std::fixed << std::setprecision(3) << writeWall
-                      << "s  cpu=" << (static_cast<double>(writeCpu1 - writeCpu0) / CLOCKS_PER_SEC)
-                      << "s  MB/s=" << std::setprecision(1)
-                      << (writeWall > 0.0 ? (zoom_bytes / (1024.0 * 1024.0)) / writeWall : 0.0)
-                      << std::endl;
-            std::cout << "    [PREP z" << z << "] feat_loop=" << std::fixed << std::setprecision(1)
-                      << prep_loop_s << "s  map_insert=" << prep_insert_s << "s  inserts="
-                      << prep_inserts << std::endl;
-        }
     }
 
     /**
@@ -1309,9 +1271,9 @@ private:
         // The polygon buffer only has to keep the cut edge out of the tile.
         double poly_margin = static_cast<double>(constants::CLIP_POLYGON_PX) / constants::TILE_SIZE_PX;
         // GEOSClipByRect is much faster, but it can slightly change merged/clipped
-        // geometry. Keep z13-z16 bit-for-bit identical and use it only at z17,
-        // where the generator spends most of its time and features are not merged.
-        const bool rect_clip = (z >= 17);
+        // geometry. Use it from z14, where the tile count and GEOS cost grow;
+        // z13 and below keep the exact intersection path.
+        const bool rect_clip = (z >= 14);
         auto has_building = [&]() {
             for (const auto& entry : poly_individual)
                 for (const auto& f : entry.second)
@@ -1454,6 +1416,28 @@ private:
             if (!pf.rings.empty()) final_features.push_back(std::move(pf));
         };
 
+        // GEOSClipByRect is not guaranteed to return valid output, and
+        // GEOSMakeValid can wrap repaired polygons in a GeometryCollection.
+        // Emit every polygonal part recursively so nested collections do not
+        // silently drop buildings or landcover.
+        auto emit_polygon_parts = [&](const GEOSGeometry* geom, uint16_t color, uint8_t prio,
+                                      std::string_view layer, bool building,
+                                      const auto& self) -> void {
+            if (!geom || GEOSisEmpty_r(local_handle, geom)) return;
+            const int type = GEOSGeomTypeId_r(local_handle, geom);
+            if (type == GEOS_POLYGON)
+            {
+                emit_polygon(geom, color, prio, layer, building);
+                return;
+            }
+            if (type == GEOS_MULTIPOLYGON || type == GEOS_GEOMETRYCOLLECTION)
+            {
+                const int count = GEOSGetNumGeometries_r(local_handle, geom);
+                for (int i = 0; i < count; ++i)
+                    self(GEOSGetGeometryN_r(local_handle, geom, i), color, prio, layer, building, self);
+            }
+        };
+
         for (auto& [style, geos_polys] : poly_groups)
         {
             GEOSGeometry* coll = GEOSGeom_createCollection_r(local_handle, GEOS_GEOMETRYCOLLECTION, geos_polys.data(), (uint32_t)geos_polys.size());
@@ -1487,14 +1471,10 @@ private:
                 continue;
             }
 
-            int n = GEOSGetNumGeometries_r(local_handle, final_geom);
-            for (int i = 0; i < n; ++i)
-            {
-                const GEOSGeometry* g = GEOSGetGeometryN_r(local_handle, final_geom, i);
-                if (!g || GEOSGeomTypeId_r(local_handle, g) != GEOS_POLYGON || GEOSisEmpty_r(local_handle, g)) continue;
-                emit_polygon(g, style.color, style.prio);
-            }
-            merged_out += ((int)geos_polys.size() - std::max(0, n));
+            const size_t merged_before = final_features.size();
+            emit_polygon_parts(final_geom, style.color, style.prio, "", false, emit_polygon_parts);
+            const int emitted = static_cast<int>(final_features.size() - merged_before);
+            merged_out += std::max(0, static_cast<int>(geos_polys.size()) - emitted);
             GEOSGeom_destroy_r(local_handle, coll); GEOSGeom_destroy_r(local_handle, final_geom);
         }
 
@@ -1557,23 +1537,8 @@ private:
                     GEOSGeometry* s = GEOSTopologyPreserveSimplify_r(local_handle, clipped, tolerance * 0.5);
                     if (s && !GEOSisEmpty_r(local_handle, s)) result = s;
                 }
-                auto emit_geom = [&](const GEOSGeometry* geom) {
-                    if (!geom) return;
-                    int type = GEOSGeomTypeId_r(local_handle, geom);
-                    if (type == GEOS_POLYGON && !GEOSisEmpty_r(local_handle, geom))
-                        emit_polygon(geom, style.color, style.prio, f.layer, f.is_building);
-                    else if (type == GEOS_MULTIPOLYGON || type == GEOS_GEOMETRYCOLLECTION)
-                    {
-                        int np = GEOSGetNumGeometries_r(local_handle, geom);
-                        for (int i = 0; i < np; ++i)
-                        {
-                            const GEOSGeometry* part = GEOSGetGeometryN_r(local_handle, geom, i);
-                            if (part && GEOSGeomTypeId_r(local_handle, part) == GEOS_POLYGON && !GEOSisEmpty_r(local_handle, part))
-                                emit_polygon(part, style.color, style.prio, f.layer, f.is_building);
-                        }
-                    }
-                };
-                emit_geom(result);
+                emit_polygon_parts(result, style.color, style.prio, f.layer, f.is_building,
+                                   emit_polygon_parts);
                 if (result != clipped) GEOSGeom_destroy_r(local_handle, result);
                 GEOSGeom_destroy_r(local_handle, clipped);
             }
