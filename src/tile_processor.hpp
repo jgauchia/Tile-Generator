@@ -1145,13 +1145,17 @@ private:
 
     /**
      * @brief Serialize one tile to NAV1 binary format (geometry clip, simplify, encode).
+     * @details Uses GEOSClipByRect from z14 and the exact intersection below it. After
+     *          repairing invalid output, emits every polygonal part recursively so nested
+     *          collections do not drop features.
      * @param z             Zoom level.
      * @param x             Tile X coordinate.
      * @param y             Tile Y coordinate.
      * @param store         Memory-mapped feature store.
      * @param offsets       Feature offsets within the store that intersect this tile.
      * @param local_handle  GEOS thread-local context for geometry operations.
-     * @param merged_out    Incremented by the number of polygons merged in this tile.
+     * @param merged_out    Incremented per merged group by input features minus emitted features,
+     *                      clamped to zero when that group splits into more parts.
      * @param tile_labels   Pre-placed text label features for this tile.
      * @param point_symbols Pre-built polygon symbols for POI features in this tile.
      * @param buffer        Reused output buffer; cleared on entry and filled with the raw
