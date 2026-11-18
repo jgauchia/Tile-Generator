@@ -1,7 +1,7 @@
 /**
  * @file tile_processor.hpp
  * @author Jordi Gauchía (jgauchia @jgauchia.com)
- * @brief Tile generation engine with flat 2D array index (NPK2). O(1) lookup via rectangular bounding box.
+ * @brief Tile generation engine for the NPK2 sparse index (coverage bitmap + rank table).
  * @version 1.0.3
  * @date 2026-10
  */
@@ -10,13 +10,11 @@
 #include <vector>
 #include <string>
 #include <string_view>
-#include <filesystem>
 #include <fstream>
 #include <cmath>
 #include <algorithm>
 #include <mutex>
 #include <thread>
-#include <future>
 #include <atomic>
 #include <exception>
 #include <memory>
@@ -330,17 +328,18 @@ private:
 
     /**
      * @brief Per-worker cache of source GEOS geometries for water polygons.
-     * @details The water polygons from the shapefile span thousands of tiles. Rebuilding
-     *          the same geometry for every tile is a large part of z17; the cache keeps
-     *          the source geometry alive and reuses it across tiles. GEOS clip/validity
-     *          operations only read the source geometry, so sharing it does not change
-     *          the generated payload. Entries are owned by the worker and destroyed
-     *          with its GEOS context.
+     * @details Water polygons span thousands of tiles. Keeping the source geometry
+     *          alive avoids rebuilding it with feature_to_geos for every tile; clip
+     *          and validity operations only read it, so the payload is unchanged.
+     *          Entries are owned by the worker and released by clear() before the
+     *          GEOS context is finished.
      */
     struct WaterGeometryCache
     {
+        /** @brief Maximum cached geometries before the cache is cleared. */
         static constexpr size_t MAX_ENTRIES = 512;
-        std::unordered_map<size_t, GEOSGeometry*> entries;
+        /** @brief Source geometry keyed by the feature's first point. */
+        std::unordered_map<const Point*, GEOSGeometry*> entries;
 
         /**
          * @brief Destroy every cached geometry and empty the cache.
@@ -433,14 +432,11 @@ private:
      * @brief Generate bridge deck underlay polygons from road linestrings (zoom >= 16 only).
      * @param line_features Processed linestring features for the current tile.
      * @param z             Current zoom level; returns empty if z < 16.
-     * @param tile_x        Tile X coordinate.
-     * @param tile_y        Tile Y coordinate.
      * @param handle        GEOS thread-local context.
      * @return Polygon features representing bridge deck surfaces.
      */
     std::vector<ProcessedFeature> make_bridge_decks(const std::vector<ProcessedFeature>& line_features,
-                                                     int z, int tile_x, int tile_y,
-                                                     GEOSContextHandle_t handle)
+                                                     int z, GEOSContextHandle_t handle)
     {
         if (z < 16) return {};
 
@@ -509,12 +505,12 @@ private:
                 {
                     const GEOSGeometry* part = GEOSGetGeometryN_r(handle, tight_union, i);
                     if (!part || GEOSisEmpty_r(handle, part) || GEOSGeomTypeId_r(handle, part) != GEOS_POLYGON) continue;
-                    extract_deck_polygon(handle, part, result, z, tile_x, tile_y);
+                    extract_deck_polygon(handle, part, result, z);
                 }
             }
             else if (type == GEOS_POLYGON)
             {
-                extract_deck_polygon(handle, deck, result, z, tile_x, tile_y);
+                extract_deck_polygon(handle, deck, result, z);
             }
         }
 
@@ -529,10 +525,10 @@ private:
      * @param handle GEOS thread-local context.
      * @param poly   Clipped bridge deck polygon geometry.
      * @param result Output list to append the decoded ProcessedFeature to.
-     * @param z      Current zoom level (used for coordinate scaling).
+     * @param z      Current zoom level (used for the feature zoom priority).
      */
     void extract_deck_polygon(GEOSContextHandle_t handle, const GEOSGeometry* poly,
-                               std::vector<ProcessedFeature>& result, int z, int /*tile_x*/, int /*tile_y*/)
+                               std::vector<ProcessedFeature>& result, int z)
     {
         static const uint16_t BRIDGE_COLOR = utils::hex_to_rgb565("#b8b8b8");
         const GEOSGeometry* ext = GEOSGetExteriorRing_r(handle, poly);
@@ -559,7 +555,13 @@ private:
         result.push_back(std::move(pf));
     }
 
-    // First pass of the palette pass: record the first tile/feature position of every color.
+    /**
+     * @brief Record the first tile/feature position of every color in a serialized tile.
+     * @param data     Serialized tile payload.
+     * @param size     Payload size in bytes.
+     * @param tileIdx  Index of the tile in the packed results.
+     * @param firstPos Per-color minimum encoded position; updated in place.
+     */
     void scanPaletteTile(const uint8_t* data, size_t size, size_t tileIdx,
                          std::vector<uint64_t>& firstPos) const
     {
@@ -603,7 +605,12 @@ private:
         }
     }
 
-    // Second pass: compact one tile in place, independently of all other tiles.
+    /**
+     * @brief Replace 2-byte colors with 1-byte palette indices in place.
+     * @param data         Serialized tile payload; modified in place.
+     * @param size         Payload size; updated to the compacted size.
+     * @param colorToIndex RGB565 color to palette index.
+     */
     void compactPaletteTile(uint8_t* data, uint32_t& size,
                             const std::unordered_map<uint16_t, uint16_t>& colorToIndex) const
     {
@@ -1026,7 +1033,6 @@ private:
             if (error)
                 std::rethrow_exception(error);
 
-        // Compute bounding box of tiles in this zoom level
         uint32_t min_x = UINT32_MAX, min_y = UINT32_MAX;
         uint32_t max_x = 0, max_y = 0;
         for (const auto& pt : packed_results)
@@ -1120,7 +1126,6 @@ private:
         std::ofstream out(pack_path, std::ios::binary);
         if (out)
         {
-            // Write header
             MapHeader mh;
             memcpy(mh.magic, "NPK2", 4);
             mh.zoom = (uint8_t)z;
@@ -1523,16 +1528,15 @@ private:
                 // layers keep their legacy path.
                 bool is_water = (f.layer == "water");
                 bool subtract_islands = is_water || legacy_prio8;
-                const size_t water_key = reinterpret_cast<size_t>(f.points);
                 GEOSGeometry* g = nullptr;
-                bool g_cached = false;
+                bool cache_owned = false;
                 if (is_water && f.points)
                 {
-                    auto cache_it = water_cache.entries.find(water_key);
+                    auto cache_it = water_cache.entries.find(f.points);
                     if (cache_it != water_cache.entries.end())
                     {
                         g = cache_it->second;
-                        g_cached = true;
+                        cache_owned = true;
                     }
                     else
                     {
@@ -1541,8 +1545,8 @@ private:
                         g = feature_to_geos(f, local_handle);
                         if (g)
                         {
-                            water_cache.entries.emplace(water_key, g);
-                            g_cached = true;
+                            water_cache.entries.emplace(f.points, g);
+                            cache_owned = true;
                         }
                     }
                 }
@@ -1557,14 +1561,14 @@ private:
                 double pymax = f.is_building ? clip_casing_ymax : clip_poly_ymax;
                 const GEOSGeometry* pclip = rect_clip ? nullptr : (f.is_building ? clip_casing : clip_poly);
                 GEOSGeometry* clipped = clip_with_bbox(g, pxmin, pxmax, pymin, pymax, pclip);
-                if (clipped == g && g_cached)
+                if (clipped == g && cache_owned)
                 {
                     // The cache owns the source geometry; clone it before the
                     // clipped-geometry ownership path takes over.
                     clipped = GEOSGeom_clone_r(local_handle, g);
                     if (!clipped) continue;
                 }
-                else if (clipped != g && !g_cached)
+                else if (clipped != g && !cache_owned)
                 {
                     GEOSGeom_destroy_r(local_handle, g);
                 }
@@ -1689,7 +1693,7 @@ private:
             GEOSGeom_destroy_r(local_handle, clipped);
         }
 
-        auto bridge_decks = make_bridge_decks(final_features, z, x, y, local_handle);
+        auto bridge_decks = make_bridge_decks(final_features, z, local_handle);
         final_features.insert(final_features.begin(), bridge_decks.begin(), bridge_decks.end());
 
         for (auto& ps : point_symbols)
