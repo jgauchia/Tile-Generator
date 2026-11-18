@@ -1247,11 +1247,9 @@ private:
                         island_geoms.push_back(ig);
                 }
 
-                uint8_t nibble = f.zoom_priority & 0x0F;
-                bool is_landcover = nibble <= 3 && (f.layer == "wood" || f.layer == "forest");
                 bool is_building_merge = f.is_building && z <= 15;
                 Style key{f.color_rgb565, f.zoom_priority, f.layer, f.is_building};
-                if (is_landcover || is_building_merge)
+                if (is_building_merge)
                 {
                     GEOSGeometry* g = feature_to_geos(f, local_handle);
                     if (g) poly_groups[key].push_back(g);
