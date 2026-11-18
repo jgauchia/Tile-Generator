@@ -328,6 +328,32 @@ private:
         }
     }
 
+    /**
+     * @brief Per-worker cache of source GEOS geometries for water polygons.
+     * @details The water polygons from the shapefile span thousands of tiles. Rebuilding
+     *          the same geometry for every tile is a large part of z17; the cache keeps
+     *          the source geometry alive and reuses it across tiles. GEOS clip/validity
+     *          operations only read the source geometry, so sharing it does not change
+     *          the generated payload. Entries are owned by the worker and destroyed
+     *          with its GEOS context.
+     */
+    struct WaterGeometryCache
+    {
+        static constexpr size_t MAX_ENTRIES = 512;
+        std::unordered_map<size_t, GEOSGeometry*> entries;
+
+        /**
+         * @brief Destroy every cached geometry and empty the cache.
+         * @param handle Worker GEOS context that owns the geometries.
+         */
+        void clear(GEOSContextHandle_t handle)
+        {
+            for (auto& entry : entries)
+                if (entry.second) GEOSGeom_destroy_r(handle, entry.second);
+            entries.clear();
+        }
+    };
+
     std::unordered_map<TileCoord, std::vector<size_t>, TileCoordHash>
     buildPointIndices(const std::vector<Feature>& point_features, int z)
     {
@@ -821,6 +847,7 @@ private:
                 GEOSContextHandle_t handle = GEOS_init_r();
                 std::vector<const Feature*> tile_labels;
                 std::vector<uint8_t> tile_buffer;
+                WaterGeometryCache water_cache;
                 while (true)
                 {
                     size_t idx = next_tile.fetch_add(1);
@@ -853,11 +880,12 @@ private:
                     packed_results[idx].y = (uint32_t)tile_y;
                     serialize_tile(z, tile_x, tile_y, store, tile_offsets,
                                    end - begin, handle, m, tile_labels, pt_syms,
-                                   tile_buffer);
+                                   tile_buffer, water_cache);
                     packed_results[idx].offset = append_payload(tile_buffer.data(), tile_buffer.size());
                     packed_results[idx].size = static_cast<uint32_t>(tile_buffer.size());
                     merged_count += m;
                 }
+                water_cache.clear(handle);
                 GEOS_finish_r(handle);
             });
         }
@@ -1160,13 +1188,15 @@ private:
      * @param point_symbols Pre-built polygon symbols for POI features in this tile.
      * @param buffer        Reused output buffer; cleared on entry and filled with the raw
      *                      NAV1 tile bytes (temporary 2-byte color per feature).
+     * @param water_cache   Per-worker cache of source water geometries, reused across tiles.
      */
     void serialize_tile(int z, int x, int y, const MappedStore& store,
                         const uint32_t* offsets, size_t offset_count,
                         GEOSContextHandle_t local_handle, size_t& merged_out,
                         const std::vector<const Feature*>& tile_labels,
                         const std::vector<ProcessedFeature>& point_symbols,
-                        std::vector<uint8_t>& buffer)
+                        std::vector<uint8_t>& buffer,
+                        WaterGeometryCache& water_cache)
     {
         struct Style {
             uint16_t color; uint8_t prio; std::string_view subclass; bool is_building;
@@ -1493,7 +1523,33 @@ private:
                 // layers keep their legacy path.
                 bool is_water = (f.layer == "water");
                 bool subtract_islands = is_water || legacy_prio8;
-                GEOSGeometry* g = feature_to_geos(f, local_handle);
+                const size_t water_key = reinterpret_cast<size_t>(f.points);
+                GEOSGeometry* g = nullptr;
+                bool g_cached = false;
+                if (is_water && f.points)
+                {
+                    auto cache_it = water_cache.entries.find(water_key);
+                    if (cache_it != water_cache.entries.end())
+                    {
+                        g = cache_it->second;
+                        g_cached = true;
+                    }
+                    else
+                    {
+                        if (water_cache.entries.size() >= WaterGeometryCache::MAX_ENTRIES)
+                            water_cache.clear(local_handle);
+                        g = feature_to_geos(f, local_handle);
+                        if (g)
+                        {
+                            water_cache.entries.emplace(water_key, g);
+                            g_cached = true;
+                        }
+                    }
+                }
+                else
+                {
+                    g = feature_to_geos(f, local_handle);
+                }
                 if (!g) continue;
                 double pxmin = f.is_building ? clip_casing_xmin : clip_poly_xmin;
                 double pxmax = f.is_building ? clip_casing_xmax : clip_poly_xmax;
@@ -1501,7 +1557,17 @@ private:
                 double pymax = f.is_building ? clip_casing_ymax : clip_poly_ymax;
                 const GEOSGeometry* pclip = rect_clip ? nullptr : (f.is_building ? clip_casing : clip_poly);
                 GEOSGeometry* clipped = clip_with_bbox(g, pxmin, pxmax, pymin, pymax, pclip);
-                if (clipped != g) GEOSGeom_destroy_r(local_handle, g);
+                if (clipped == g && g_cached)
+                {
+                    // The cache owns the source geometry; clone it before the
+                    // clipped-geometry ownership path takes over.
+                    clipped = GEOSGeom_clone_r(local_handle, g);
+                    if (!clipped) continue;
+                }
+                else if (clipped != g && !g_cached)
+                {
+                    GEOSGeom_destroy_r(local_handle, g);
+                }
                 if (!clipped || GEOSisEmpty_r(local_handle, clipped)) { if (clipped) GEOSGeom_destroy_r(local_handle, clipped); continue; }
                 if (!GEOSisValid_r(local_handle, clipped)) { GEOSGeometry* v = GEOSMakeValid_r(local_handle, clipped); GEOSGeom_destroy_r(local_handle, clipped); clipped = v; }
                 if (!clipped) continue;
