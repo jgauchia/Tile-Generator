@@ -86,14 +86,26 @@ public:
         // Tag key priority: most specific wins over generic qualifiers
         static const std::vector<std::string> key_priority = {
             "highway", "railway", "aeroway", "aerialway",
-            "waterway", "water", "natural", "landuse",
-            "building", "amenity", "leisure", "man_made",
+            "waterway", "water", "natural", "golf", "landuse",
+            "building", "amenity", "leisure", "tourism", "man_made",
             "boundary", "admin_level", "place",
             "bridge", "tunnel", "surface", "layer"
         };
 
         FeatureConfig best_cfg;
         bool found = false;
+
+        // A building polygon takes the building fill even if it also carries an
+        // amenity/leisure tag (OSM Carto fills the building, not the area).
+        auto building = tags.find("building");
+        if (building != tags.end() && building->second != "no")
+        {
+            const std::string exact = "building=" + building->second;
+            if (config_map.count(exact))
+                return config_map.at(exact);
+            if (config_map.count("building"))
+                return config_map.at("building");
+        }
 
         for (const auto& key : key_priority)
         {

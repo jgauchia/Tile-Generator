@@ -1,7 +1,7 @@
 /**
  * @file tile_processor.hpp
  * @author Jordi Gauchía (jgauchia @jgauchia.com)
- * @brief Tile generation engine with flat 2D array index (NPK2). O(1) lookup via rectangular bounding box.
+ * @brief Tile generation engine for the NPK2 sparse index (coverage bitmap + rank table).
  * @version 1.0.3
  * @date 2026-10
  */
@@ -9,14 +9,15 @@
 #pragma once
 #include <vector>
 #include <string>
-#include <filesystem>
+#include <string_view>
 #include <fstream>
 #include <cmath>
 #include <algorithm>
 #include <mutex>
 #include <thread>
-#include <future>
 #include <atomic>
+#include <exception>
+#include <memory>
 #include <map>
 #include <unordered_map>
 #include <unordered_set>
@@ -83,7 +84,8 @@ private:
         std::size_t operator()(const TileCoord& k) const
         { return std::hash<int>()(k.x) ^ (std::hash<int>()(k.y) << 1); }
     };
-    struct PackedTile { uint32_t x, y; std::vector<uint8_t> data; };
+    struct PackedTile { uint32_t x, y; uint32_t offset, size; };
+    static_assert(sizeof(PackedTile) == 16, "PackedTile size mismatch");
 
     struct ProcessedFeature
     {
@@ -146,13 +148,28 @@ private:
             return false;
         };
 
-        auto expand_tiles = [&](double lon, double lat) -> std::vector<TileCoord> {
-            int tx = static_cast<int>(utils::lon_to_x(lon, zoom));
-            int ty = static_cast<int>(utils::lat_to_y(lat, zoom));
+        auto labelScale = [](const Feature& f) -> double {
+            if (f.font_size == 0) return 1.0;
+            if (f.font_size == 1) return 1.2;
+            return 1.5;
+        };
+
+        auto tilesForLabel = [&](double lon, double lat, double halfW, double halfH) -> std::vector<TileCoord> {
+            int anchorX = static_cast<int>(utils::lon_to_x(lon, zoom));
+            int anchorY = static_cast<int>(utils::lat_to_y(lat, zoom));
+            int tx0 = static_cast<int>(std::floor(utils::lon_to_x(lon - halfW, zoom)));
+            int tx1 = static_cast<int>(std::floor(utils::lon_to_x(lon + halfW, zoom) - 1e-9));
+            int ty0 = static_cast<int>(std::floor(utils::lat_to_y(lat + halfH, zoom)));
+            int ty1 = static_cast<int>(std::floor(utils::lat_to_y(lat - halfH, zoom) - 1e-9));
+            // Clamp the copies to the anchor offsets the text payload can encode.
+            tx0 = std::max(tx0, anchorX - 2);
+            tx1 = std::min(tx1, anchorX + 3);
+            ty0 = std::max(ty0, anchorY - 2);
+            ty1 = std::min(ty1, anchorY + 3);
             std::vector<TileCoord> tiles;
-            for (int dx = -1; dx <= 1; ++dx)
-                for (int dy = -1; dy <= 1; ++dy)
-                    tiles.push_back({tx + dx, ty + dy});
+            for (int tx = tx0; tx <= tx1; ++tx)
+                for (int ty = ty0; ty <= ty1; ++ty)
+                    tiles.push_back({tx, ty});
             return tiles;
         };
 
@@ -161,12 +178,14 @@ private:
         {
             double half_w = char_w * pf->text.size() / 2.0;
             double half_h = label_h;
-            double lon = pf->points[0].lon, lat = pf->points[0].lat;
+            double scale = labelScale(*pf);
+            double lon = pf->points[0].lon;
+            double lat = pf->points[0].lat;
             Box box{lon - half_w, lat - half_h, lon + half_w, lat + half_h};
             if (!check_overlap(box))
             {
                 placed_boxes.push_back(box);
-                result.push_back({*pf, expand_tiles(lon, lat)});
+                result.push_back({*pf, tilesForLabel(lon, lat, half_w * scale, half_h * scale)});
             }
         }
 
@@ -175,6 +194,7 @@ private:
         {
             double half_w = char_w * rf->text.size() / 2.0;
             double half_h = label_h;
+            double scale = labelScale(*rf);
             for (const auto& cand : rf->coords_candidates)
             {
                 Box box{cand.lon - half_w, cand.lat - half_h, cand.lon + half_w, cand.lat + half_h};
@@ -183,7 +203,7 @@ private:
                     placed_boxes.push_back(box);
                     Feature f_copy = *rf;
                     f_copy.points = {cand};
-                    result.push_back({std::move(f_copy), expand_tiles(cand.lon, cand.lat)});
+                    result.push_back({std::move(f_copy), tilesForLabel(cand.lon, cand.lat, half_w * scale, half_h * scale)});
                     break;
                 }
             }
@@ -230,38 +250,65 @@ private:
         return 0;
     }
 
+    GEOSCoordSequence* coord_seq_from_doubles(const double* xy, uint32_t n, GEOSContextHandle_t handle)
+    {
+#if defined(GEOS_VERSION_MAJOR) && (GEOS_VERSION_MAJOR > 3 || (GEOS_VERSION_MAJOR == 3 && GEOS_VERSION_MINOR >= 10))
+        return GEOSCoordSeq_copyFromBuffer_r(handle, xy, n, 0, 0);
+#else
+        GEOSCoordSequence* seq = GEOSCoordSeq_create_r(handle, n, 2);
+        if (!seq) return nullptr;
+        for (uint32_t i = 0; i < n; ++i)
+        {
+            GEOSCoordSeq_setX_r(handle, seq, i, xy[2 * i]);
+            GEOSCoordSeq_setY_r(handle, seq, i, xy[2 * i + 1]);
+        }
+        return seq;
+#endif
+    }
+
+    GEOSCoordSequence* coord_seq_from_points(const Point* pts, uint32_t n, GEOSContextHandle_t handle)
+    {
+        static_assert(sizeof(Point) == 2 * sizeof(double), "Point must be two interleaved doubles");
+        return coord_seq_from_doubles(reinterpret_cast<const double*>(pts), n, handle);
+    }
+
+    GEOSCoordSequence* coord_seq_from_pairs(const std::vector<std::pair<int16_t, int16_t>>& pts,
+                                            GEOSContextHandle_t handle)
+    {
+        std::vector<double> xy;
+        xy.reserve(pts.size() * 2);
+        for (const auto& p : pts)
+        {
+            xy.push_back(p.first);
+            xy.push_back(p.second);
+        }
+        return coord_seq_from_doubles(xy.data(), static_cast<uint32_t>(pts.size()), handle);
+    }
+
     /**
-     * @brief Convert a nav::Feature polygon or linestring to a GEOS geometry for clipping.
-     * @param f      Source feature with ring_ends and points populated.
+     * @brief Convert a FeatureView polygon or linestring to a GEOS geometry for clipping.
+     * @param f      Source view with points and ring_ends populated.
      * @param handle GEOS thread-local context.
      * @return Caller-owned GEOSGeometry*, or nullptr if the feature is degenerate.
      */
-    GEOSGeometry* feature_to_geos(const Feature& f, GEOSContextHandle_t handle)
+    GEOSGeometry* feature_to_geos(const FeatureView& f, GEOSContextHandle_t handle)
     {
-        if (f.ring_ends.empty()) return nullptr;
+        if (f.n_rings == 0) return nullptr;
         if (f.geom_type == GEOM_POLYGON)
         {
             uint32_t end = f.ring_ends[0];
             if (end < 3) return nullptr;
-            GEOSCoordSequence* seq = GEOSCoordSeq_create_r(handle, end, 2);
-            for (uint32_t i = 0; i < end; ++i)
-            {
-                GEOSCoordSeq_setX_r(handle, seq, i, f.points[i].lon);
-                GEOSCoordSeq_setY_r(handle, seq, i, f.points[i].lat);
-            }
+            GEOSCoordSequence* seq = coord_seq_from_points(f.points, end, handle);
+            if (!seq) return nullptr;
             GEOSGeometry* shell = GEOSGeom_createLinearRing_r(handle, seq);
             if (!shell) { GEOSCoordSeq_destroy_r(handle, seq); return nullptr; }
             std::vector<GEOSGeometry*> holes;
-            for (size_t r = 1; r < f.ring_ends.size(); ++r)
+            for (uint32_t r = 1; r < f.n_rings; ++r)
             {
                 uint32_t start = f.ring_ends[r - 1], r_end = f.ring_ends[r], r_size = r_end - start;
                 if (r_size < 3) continue;
-                GEOSCoordSequence* hseq = GEOSCoordSeq_create_r(handle, r_size, 2);
-                for (uint32_t j = 0; j < r_size; ++j)
-                {
-                    GEOSCoordSeq_setX_r(handle, hseq, j, f.points[start + j].lon);
-                    GEOSCoordSeq_setY_r(handle, hseq, j, f.points[start + j].lat);
-                }
+                GEOSCoordSequence* hseq = coord_seq_from_points(f.points + start, r_size, handle);
+                if (!hseq) continue;
                 GEOSGeometry* hole = GEOSGeom_createLinearRing_r(handle, hseq);
                 if (hole) holes.push_back(hole); else GEOSCoordSeq_destroy_r(handle, hseq);
             }
@@ -273,25 +320,58 @@ private:
         {
             uint32_t size = f.ring_ends[0];
             if (size < 2) return nullptr;
-            GEOSCoordSequence* seq = GEOSCoordSeq_create_r(handle, size, 2);
-            for (uint32_t i = 0; i < size; ++i)
-            {
-                GEOSCoordSeq_setX_r(handle, seq, i, f.points[i].lon);
-                GEOSCoordSeq_setY_r(handle, seq, i, f.points[i].lat);
-            }
+            GEOSCoordSequence* seq = coord_seq_from_points(f.points, size, handle);
+            if (!seq) return nullptr;
             return GEOSGeom_createLineString_r(handle, seq);
         }
     }
 
     /**
-     * @brief Build square polygon symbols for GEOM_POINT features visible in a tile.
-     * @param point_features All POI features in the dataset.
-     * @param z              Current zoom level.
-     * @param tile_x         Tile X coordinate.
-     * @param tile_y         Tile Y coordinate.
-     * @return ProcessedFeature list with one polygon per visible point.
+     * @brief Per-worker cache of source GEOS geometries for water polygons.
+     * @details Water polygons span thousands of tiles. Keeping the source geometry
+     *          alive avoids rebuilding it with feature_to_geos for every tile; clip
+     *          and validity operations only read it, so the payload is unchanged.
+     *          Entries are owned by the worker and released by clear() before the
+     *          GEOS context is finished.
      */
+    struct WaterGeometryCache
+    {
+        /** @brief Maximum cached geometries before the cache is cleared. */
+        static constexpr size_t MAX_ENTRIES = 512;
+        /** @brief Source geometry keyed by the feature's first point. */
+        std::unordered_map<const Point*, GEOSGeometry*> entries;
+
+        /**
+         * @brief Destroy every cached geometry and empty the cache.
+         * @param handle Worker GEOS context that owns the geometries.
+         */
+        void clear(GEOSContextHandle_t handle)
+        {
+            for (auto& entry : entries)
+                if (entry.second) GEOSGeom_destroy_r(handle, entry.second);
+            entries.clear();
+        }
+    };
+
+    std::unordered_map<TileCoord, std::vector<size_t>, TileCoordHash>
+    buildPointIndices(const std::vector<Feature>& point_features, int z)
+    {
+        std::unordered_map<TileCoord, std::vector<size_t>, TileCoordHash> indices;
+        indices.reserve(point_features.size());
+        for (size_t i = 0; i < point_features.size(); ++i)
+        {
+            const auto& f = point_features[i];
+            if ((f.zoom_priority >> 4) > z) continue;
+            if (f.points.empty()) continue;
+            int tx = static_cast<int>(utils::lon_to_x(f.points[0].lon, z));
+            int ty = static_cast<int>(utils::lat_to_y(f.points[0].lat, z));
+            indices[TileCoord{tx, ty}].push_back(i);
+        }
+        return indices;
+    }
+
     std::vector<ProcessedFeature> make_point_symbols(const std::vector<Feature>& point_features,
+                                                      const std::vector<size_t>& point_indices,
                                                       int z, int tile_x, int tile_y)
     {
         std::vector<ProcessedFeature> result;
@@ -299,17 +379,10 @@ private:
         double pixel_deg = tile_w_deg / 256.0;
         double size = pixel_deg * constants::POINT_SYMBOL_SIZE_PX;
 
-        for (const auto& f : point_features)
+        for (size_t point_index : point_indices)
         {
-            int min_z = f.zoom_priority >> 4;
-            if (min_z > z) continue;
-            if (f.points.empty()) continue;
+            const auto& f = point_features[point_index];
             double lon = f.points[0].lon, lat = f.points[0].lat;
-
-            int tx = static_cast<int>(utils::lon_to_x(lon, z));
-            int ty = static_cast<int>(utils::lat_to_y(lat, z));
-            if (tx != tile_x || ty != tile_y) continue;
-
             double lat_size = size / std::cos(lat * M_PI / 180.0);
 
             std::vector<std::pair<int16_t, int16_t>> pts;
@@ -359,14 +432,11 @@ private:
      * @brief Generate bridge deck underlay polygons from road linestrings (zoom >= 16 only).
      * @param line_features Processed linestring features for the current tile.
      * @param z             Current zoom level; returns empty if z < 16.
-     * @param tile_x        Tile X coordinate.
-     * @param tile_y        Tile Y coordinate.
      * @param handle        GEOS thread-local context.
      * @return Polygon features representing bridge deck surfaces.
      */
     std::vector<ProcessedFeature> make_bridge_decks(const std::vector<ProcessedFeature>& line_features,
-                                                     int z, int tile_x, int tile_y,
-                                                     GEOSContextHandle_t handle)
+                                                     int z, GEOSContextHandle_t handle)
     {
         if (z < 16) return {};
 
@@ -382,7 +452,6 @@ private:
         const auto& width_table = constants::line_width_per_zoom();
 
         std::vector<GEOSGeometry*> tight_buffers;
-        std::vector<GEOSGeometry*> generous_buffers;
 
         for (const auto& pf : line_features)
         {
@@ -393,12 +462,8 @@ private:
 
             if (pf.rings.empty() || pf.rings[0].size() < 2) continue;
 
-            GEOSCoordSequence* seq = GEOSCoordSeq_create_r(handle, (uint32_t)pf.rings[0].size(), 2);
-            for (size_t j = 0; j < pf.rings[0].size(); ++j)
-            {
-                GEOSCoordSeq_setX_r(handle, seq, (uint32_t)j, pf.rings[0][j].first);
-                GEOSCoordSeq_setY_r(handle, seq, (uint32_t)j, pf.rings[0][j].second);
-            }
+            GEOSCoordSequence* seq = coord_seq_from_pairs(pf.rings[0], handle);
+            if (!seq) continue;
             GEOSGeometry* line = GEOSGeom_createLineString_r(handle, seq);
             if (!line) continue;
 
@@ -413,17 +478,13 @@ private:
             }
 
             double rail_extra = is_rail ? 2.0 : 1.0;
-            double px_scale = 4096.0 / 256.0; 
+            double px_scale = 4096.0 / 256.0;
             double tight_buf = (road_width * 0.4 + rail_extra) * px_scale;
-            double extra = 5.0 * (1 << (z - 16));
-            double generous_buf = (road_width / 4.0 + extra) * px_scale;
 
             GEOSGeometry* tb = GEOSBufferWithStyle_r(handle, line, tight_buf, 4, GEOSBUF_CAP_FLAT, GEOSBUF_JOIN_ROUND, 0.0);
-            GEOSGeometry* gb = GEOSBufferWithStyle_r(handle, line, generous_buf, 4, GEOSBUF_CAP_FLAT, GEOSBUF_JOIN_ROUND, 0.0);
             GEOSGeom_destroy_r(handle, line);
 
             if (tb) tight_buffers.push_back(tb);
-            if (gb) generous_buffers.push_back(gb);
         }
 
         std::vector<ProcessedFeature> result;
@@ -444,18 +505,17 @@ private:
                 {
                     const GEOSGeometry* part = GEOSGetGeometryN_r(handle, tight_union, i);
                     if (!part || GEOSisEmpty_r(handle, part) || GEOSGeomTypeId_r(handle, part) != GEOS_POLYGON) continue;
-                    extract_deck_polygon(handle, part, result, z, tile_x, tile_y);
+                    extract_deck_polygon(handle, part, result, z);
                 }
             }
             else if (type == GEOS_POLYGON)
             {
-                extract_deck_polygon(handle, deck, result, z, tile_x, tile_y);
+                extract_deck_polygon(handle, deck, result, z);
             }
         }
 
         GEOSGeom_destroy_r(handle, tight_coll);
         if (tight_union) GEOSGeom_destroy_r(handle, tight_union);
-        for (auto* g : generous_buffers) GEOSGeom_destroy_r(handle, g);
 
         return result;
     }
@@ -465,10 +525,10 @@ private:
      * @param handle GEOS thread-local context.
      * @param poly   Clipped bridge deck polygon geometry.
      * @param result Output list to append the decoded ProcessedFeature to.
-     * @param z      Current zoom level (used for coordinate scaling).
+     * @param z      Current zoom level (used for the feature zoom priority).
      */
     void extract_deck_polygon(GEOSContextHandle_t handle, const GEOSGeometry* poly,
-                               std::vector<ProcessedFeature>& result, int z, int /*tile_x*/, int /*tile_y*/)
+                               std::vector<ProcessedFeature>& result, int z)
     {
         static const uint16_t BRIDGE_COLOR = utils::hex_to_rgb565("#b8b8b8");
         const GEOSGeometry* ext = GEOSGetExteriorRing_r(handle, poly);
@@ -496,6 +556,115 @@ private:
     }
 
     /**
+     * @brief Record the first tile/feature position of every color in a serialized tile.
+     * @param data     Serialized tile payload.
+     * @param size     Payload size in bytes.
+     * @param tileIdx  Index of the tile in the packed results.
+     * @param firstPos Per-color minimum encoded position; updated in place.
+     */
+    void scanPaletteTile(const uint8_t* data, size_t size, size_t tileIdx,
+                         std::vector<uint64_t>& firstPos) const
+    {
+        if (size < 6)
+            return;
+
+        uint16_t fcount;
+        memcpy(&fcount, data + 4, 2);
+
+        size_t p = 6;
+        for (uint16_t fi = 0; fi < fcount; ++fi)
+        {
+            if (p + 9 > size)
+                throw std::runtime_error("corrupt tile payload while scanning palette");
+
+            uint16_t color;
+            memcpy(&color, data + p + 1, 2);
+            uint64_t pos = (static_cast<uint64_t>(tileIdx) << 32) | fi;
+            if (pos < firstPos[color])
+                firstPos[color] = pos;
+
+            size_t hp = p + 9;
+            while (hp < size && (data[hp++] & 0x80))
+            {
+            }
+
+            uint64_t ps = 0;
+            int shift = 0;
+            while (hp < size)
+            {
+                uint8_t b = data[hp++];
+                ps |= (uint64_t)(b & 0x7F) << shift;
+                if (!(b & 0x80))
+                    break;
+                shift += 7;
+            }
+            if (hp + ps > size)
+                throw std::runtime_error("corrupt tile payload while scanning palette");
+
+            p = hp + ps;
+        }
+    }
+
+    /**
+     * @brief Replace 2-byte colors with 1-byte palette indices in place.
+     * @param data         Serialized tile payload; modified in place.
+     * @param size         Payload size; updated to the compacted size.
+     * @param colorToIndex RGB565 color to palette index.
+     */
+    void compactPaletteTile(uint8_t* data, uint32_t& size,
+                            const std::unordered_map<uint16_t, uint16_t>& colorToIndex) const
+    {
+        if (size < 6)
+            return;
+
+        uint16_t fcount;
+        memcpy(&fcount, data + 4, 2);
+
+        size_t p = 6;
+        size_t d = 6;
+        for (uint16_t fi = 0; fi < fcount; ++fi)
+        {
+            if (p + 9 > size)
+                throw std::runtime_error("corrupt tile payload while compacting palette");
+
+            uint8_t geom = data[p];
+            uint16_t color;
+            memcpy(&color, data + p + 1, 2);
+
+            auto it = colorToIndex.find(color);
+            if (it == colorToIndex.end())
+                throw std::runtime_error("palette color missing while compacting tile");
+            uint16_t cidx = it->second;
+
+            size_t hp = p + 9;
+            while (hp < size && (data[hp++] & 0x80))
+            {
+            }
+
+            uint64_t ps = 0;
+            int shift = 0;
+            while (hp < size)
+            {
+                uint8_t b = data[hp++];
+                ps |= (uint64_t)(b & 0x7F) << shift;
+                if (!(b & 0x80))
+                    break;
+                shift += 7;
+            }
+            if (hp + ps > size)
+                throw std::runtime_error("corrupt tile payload while compacting palette");
+
+            size_t moveLen = hp - (p + 3) + ps;
+            std::memmove(data + d + 2, data + p + 3, moveLen);
+            data[d] = geom;
+            data[d + 1] = static_cast<uint8_t>(cidx);
+            d += 2 + moveLen;
+            p = hp + ps;
+        }
+        size = static_cast<uint32_t>(d);
+    }
+
+    /**
      * @brief Generate the NPK2 tile file for a single zoom level.
      * @param features_by_zoom Feature offset arrays indexed by zoom bucket (0–17).
      * @param store            Memory-mapped feature store.
@@ -508,25 +677,39 @@ private:
                             const std::vector<Feature>& point_features)
     {
         auto start = std::chrono::steady_clock::now();
-        double prep_loop_s = 0.0, prep_insert_s = 0.0;
         uint64_t prep_inserts = 0;
-        std::unordered_map<TileCoord, std::vector<size_t>, TileCoordHash> tile_map;
+
+        struct FeatureSpan
+        {
+            size_t offset;
+            int min_x;
+            int max_x;
+            int min_y;
+            int max_y;
+        };
+        std::vector<FeatureSpan> spans;
+        size_t feature_count = 0;
+        for (int b = 0; b <= z; ++b)
+            feature_count += features_by_zoom[b].size();
+        spans.reserve(feature_count);
+
+        int grid_min_x = 1e9;
+        int grid_max_x = -1;
+        int grid_min_y = 1e9;
+        int grid_max_y = -1;
         for (int b = 0; b <= z; ++b)
         {
             const auto& bucket = features_by_zoom[b];
             for (size_t offset : bucket)
             {
-                auto tl0 = std::chrono::steady_clock::now();
-                Feature f = store.get(offset);
+                FeatureView f = store.get_view(offset);
                 if (z == 9 && f.highway_type == "secondary" && f.ref.empty())
-                {
-                    prep_loop_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - tl0).count();
                     continue;
-                }
 
                 int min_tx = 1e9, max_tx = -1, min_ty = 1e9, max_ty = -1;
-                for (const auto& p : f.points)
+                for (uint32_t pi = 0; pi < f.n_points; ++pi)
                 {
+                    const Point& p = f.points[pi];
                     int tx = static_cast<int>(utils::lon_to_x(p.lon, z));
                     int ty = static_cast<int>(utils::lat_to_y(p.lat, z));
                     if (tx < min_tx) min_tx = tx;
@@ -534,16 +717,15 @@ private:
                     if (ty < min_ty) min_ty = ty;
                     if (ty > max_ty) max_ty = ty;
                 }
-                prep_loop_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - tl0).count();
+                if (min_tx > max_tx) continue;
+                if (offset > UINT32_MAX)
+                    throw std::runtime_error("feature store offset exceeds 32-bit");
 
-                auto ti0 = std::chrono::steady_clock::now();
-                for (int x = min_tx; x <= max_tx; ++x)
-                    for (int y = min_ty; y <= max_ty; ++y)
-                    {
-                        tile_map[{x, y}].push_back(offset);
-                        prep_inserts++;
-                    }
-                prep_insert_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - ti0).count();
+                spans.push_back({offset, min_tx, max_tx, min_ty, max_ty});
+                if (min_tx < grid_min_x) grid_min_x = min_tx;
+                if (max_tx > grid_max_x) grid_max_x = max_tx;
+                if (min_ty < grid_min_y) grid_min_y = min_ty;
+                if (max_ty > grid_max_y) grid_max_y = max_ty;
             }
         }
 
@@ -554,31 +736,113 @@ private:
                 tile_label_indices[tc].push_back(li);
         }
 
-        std::unordered_set<TileCoord, TileCoordHash> all_tile_coords;
-        for (const auto& [tc, _] : tile_map) all_tile_coords.insert(tc);
-        for (const auto& [tc, _] : tile_label_indices) all_tile_coords.insert(tc);
-
-        if (all_tile_coords.empty()) return;
-
-        struct TileWork
+        // Label-only tiles still need a work item, so include them in the grid bounds.
+        for (const auto& [tc, _] : tile_label_indices)
         {
-            TileCoord coord;
-            std::vector<size_t> offsets;
-            std::vector<size_t> label_indices;
-        };
-        std::vector<TileWork> tiles;
-        for (const auto& tc : all_tile_coords)
-        {
-            TileWork tw;
-            tw.coord = tc;
-            if (tile_map.count(tc)) tw.offsets = tile_map.at(tc);
-            if (tile_label_indices.count(tc)) tw.label_indices = tile_label_indices.at(tc);
-            tiles.push_back(std::move(tw));
+            if (tc.x < grid_min_x) grid_min_x = tc.x;
+            if (tc.x > grid_max_x) grid_max_x = tc.x;
+            if (tc.y < grid_min_y) grid_min_y = tc.y;
+            if (tc.y > grid_max_y) grid_max_y = tc.y;
         }
 
-        auto t_prep1 = std::chrono::steady_clock::now();
+        if (grid_min_x > grid_max_x) return;
 
-        std::vector<PackedTile> packed_results(tiles.size());
+        uint32_t grid_wide = static_cast<uint32_t>(grid_max_x - grid_min_x + 1);
+        uint32_t grid_high = static_cast<uint32_t>(grid_max_y - grid_min_y + 1);
+        size_t cell_count = static_cast<size_t>(grid_wide) * grid_high;
+
+        std::vector<uint32_t> cell_starts(cell_count + 1, 0);
+        std::vector<uint8_t> cell_active(cell_count, 0);
+        for (const auto& span : spans)
+        {
+            for (int x = span.min_x; x <= span.max_x; ++x)
+            {
+                for (int y = span.min_y; y <= span.max_y; ++y)
+                {
+                    size_t cell = (size_t)(y - grid_min_y) * grid_wide + (x - grid_min_x);
+                    ++cell_starts[cell + 1];
+                    cell_active[cell] = 1;
+                    ++prep_inserts;
+                }
+            }
+        }
+
+        for (const auto& [tc, _] : tile_label_indices)
+        {
+            size_t cell = (size_t)(tc.y - grid_min_y) * grid_wide + (tc.x - grid_min_x);
+            cell_active[cell] = 1;
+        }
+
+        for (size_t i = 1; i <= cell_count; ++i)
+            cell_starts[i] += cell_starts[i - 1];
+        if (cell_starts[cell_count] > UINT32_MAX)
+            throw std::runtime_error("tile index exceeds 32-bit offsets");
+
+        std::vector<uint32_t> feature_offsets(cell_starts[cell_count]);
+        std::vector<uint32_t> cursor(cell_starts.begin(), cell_starts.end());
+        for (const auto& span : spans)
+        {
+            for (int x = span.min_x; x <= span.max_x; ++x)
+            {
+                for (int y = span.min_y; y <= span.max_y; ++y)
+                {
+                    size_t cell = (size_t)(y - grid_min_y) * grid_wide + (x - grid_min_x);
+                    feature_offsets[cursor[cell]++] = static_cast<uint32_t>(span.offset);
+                }
+            }
+        }
+
+        std::vector<uint32_t> active_cells;
+        active_cells.reserve(std::min(cell_count, static_cast<size_t>(prep_inserts)));
+        for (size_t cell = 0; cell < cell_count; ++cell)
+            if (cell_active[cell]) active_cells.push_back(static_cast<uint32_t>(cell));
+
+        std::vector<FeatureSpan>().swap(spans);
+        std::vector<uint32_t>().swap(cursor);
+        std::vector<uint8_t>().swap(cell_active);
+
+        if (active_cells.empty()) return;
+
+        auto point_indices = buildPointIndices(point_features, z);
+
+        const size_t tile_count = active_cells.size();
+        std::vector<PackedTile> packed_results(tile_count);
+
+        // Tiles are serialized into a reused per-worker buffer and copied into a
+        // chunked arena. The arena replaces 16M per-tile allocations and their
+        // malloc headers; PackedTile keeps a 32-bit offset/size instead of a
+        // 24-byte std::vector, which removes ~500 MB at Z17.
+        constexpr size_t ARENA_BLOCK = 64 << 20;
+        std::vector<std::unique_ptr<uint8_t[]>> payload_blocks;
+        payload_blocks.reserve(32);
+        size_t payload_used = 0;
+        std::mutex payload_mutex;
+
+        auto append_payload = [&](const uint8_t* bytes, size_t n) -> uint32_t {
+            std::lock_guard<std::mutex> lock(payload_mutex);
+            if (n > ARENA_BLOCK)
+                throw std::runtime_error("tile payload exceeds arena block size");
+            size_t block = payload_used / ARENA_BLOCK;
+            size_t within = payload_used % ARENA_BLOCK;
+            if (within + n > ARENA_BLOCK)
+            {
+                payload_used = (block + 1) * ARENA_BLOCK;
+                block++;
+                within = 0;
+            }
+            if (payload_used > UINT32_MAX - n)
+                throw std::runtime_error("payload arena exceeds 32-bit offset");
+            while (block >= payload_blocks.size())
+                payload_blocks.emplace_back(new uint8_t[ARENA_BLOCK]);
+            memcpy(payload_blocks[block].get() + within, bytes, n);
+            uint32_t off = static_cast<uint32_t>(payload_used);
+            payload_used += n;
+            return off;
+        };
+        auto payload_ptr = [&](uint32_t off) -> uint8_t* {
+            return payload_blocks[off / ARENA_BLOCK].get() + (off % ARENA_BLOCK);
+        };
+
         unsigned int num_threads = std::thread::hardware_concurrency();
         if (num_threads == 0) num_threads = 4;
         std::atomic<size_t> next_tile(0), merged_count{0};
@@ -588,123 +852,187 @@ private:
         {
             workers.emplace_back([&]() {
                 GEOSContextHandle_t handle = GEOS_init_r();
+                std::vector<const Feature*> tile_labels;
+                std::vector<uint8_t> tile_buffer;
+                WaterGeometryCache water_cache;
                 while (true)
                 {
                     size_t idx = next_tile.fetch_add(1);
-                    if (idx >= tiles.size()) break;
-                    const auto& tw = tiles[idx];
+                    if (idx >= tile_count) break;
+                    uint32_t cell = active_cells[idx];
+                    int tile_x = grid_min_x + static_cast<int>(cell % grid_wide);
+                    int tile_y = grid_min_y + static_cast<int>(cell / grid_wide);
+                    size_t begin = cell_starts[cell];
+                    size_t end = cell_starts[cell + 1];
                     size_t m = 0;
 
-                    std::vector<const Feature*> tile_labels;
-                    for (size_t li : tw.label_indices)
-                        tile_labels.push_back(&placed_labels[li].feature);
+                    tile_labels.clear();
+                    auto label_it = tile_label_indices.find(TileCoord{tile_x, tile_y});
+                    if (label_it != tile_label_indices.end())
+                    {
+                        tile_labels.reserve(label_it->second.size());
+                        for (size_t li : label_it->second)
+                            tile_labels.push_back(&placed_labels[li].feature);
+                    }
 
-                    auto pt_syms = make_point_symbols(point_features, z, tw.coord.x, tw.coord.y);
+                    std::vector<ProcessedFeature> pt_syms;
+                    auto point_it = point_indices.find(TileCoord{tile_x, tile_y});
+                    if (point_it != point_indices.end())
+                        pt_syms = make_point_symbols(point_features, point_it->second, z, tile_x, tile_y);
 
-                    packed_results[idx].x = (uint32_t)tw.coord.x;
-                    packed_results[idx].y = (uint32_t)tw.coord.y;
-                    packed_results[idx].data = serialize_tile(z, tw.coord.x, tw.coord.y,
-                                                              store, tw.offsets, handle, m,
-                                                              tile_labels, pt_syms);
+                    const uint32_t* tile_offsets = feature_offsets.empty()
+                        ? nullptr
+                        : feature_offsets.data() + begin;
+                    packed_results[idx].x = (uint32_t)tile_x;
+                    packed_results[idx].y = (uint32_t)tile_y;
+                    serialize_tile(z, tile_x, tile_y, store, tile_offsets,
+                                   end - begin, handle, m, tile_labels, pt_syms,
+                                   tile_buffer, water_cache);
+                    packed_results[idx].offset = append_payload(tile_buffer.data(), tile_buffer.size());
+                    packed_results[idx].size = static_cast<uint32_t>(tile_buffer.size());
                     merged_count += m;
                 }
+                water_cache.clear(handle);
                 GEOS_finish_r(handle);
             });
         }
 
-        while (next_tile < tiles.size())
+        while (next_tile < tile_count)
         {
             auto now = std::chrono::steady_clock::now();
             std::chrono::duration<double> zoom_elapsed = now - start;
-            float progress = (float)next_tile / tiles.size();
+            float progress = (float)next_tile / tile_count;
             double tps = (zoom_elapsed.count() > 0.1) ? (double)next_tile / zoom_elapsed.count() : 0;
             std::cout << "\r\33[2K  Zoom " << std::setw(2) << z << ": ["
                       << std::string(progress * 20, '#') << std::string(20 - progress * 20, '-')
                       << "] " << std::setw(3) << int(progress * 100.0) << "% | "
-                      << std::setw(8) << (size_t)next_tile << "/" << tiles.size()
+                      << std::setw(8) << (size_t)next_tile << "/" << tile_count
                       << " tiles | " << std::fixed << std::setprecision(1) << tps << " t/s" << std::flush;
             std::this_thread::sleep_for(std::chrono::milliseconds(200));
         }
         for (auto& w : workers) w.join();
 
-        auto t_palette0 = std::chrono::steady_clock::now();
+        // The workers are done with the feature index and the label/point maps;
+        // release them before the palette pass and the final write.
+        std::vector<uint32_t>().swap(active_cells);
+        std::vector<uint32_t>().swap(cell_starts);
+        std::vector<uint32_t>().swap(feature_offsets);
+        tile_label_indices.clear();
+        tile_label_indices.rehash(0);
+        point_indices.clear();
+        point_indices.rehash(0);
+
         // Build global color palette from serialized tiles and collapse 2B color -> 1B index.
         // Tiles are serialized with a temporary 2-byte color in each feature header;
         // here we gather the real color set, assign indices and rewrite every tile in place.
-        std::vector<uint16_t> palette;
-        std::unordered_map<uint16_t, uint16_t> color_to_index;
+        constexpr size_t PALETTE_CHUNK = 4096;
+        const size_t paletteTileCount = packed_results.size();
+        std::vector<std::vector<uint64_t>> localFirst(num_threads,
+            std::vector<uint64_t>(65536, UINT64_MAX));
+        std::atomic<size_t> nextPaletteTile{0};
+        std::atomic<bool> paletteFailed{false};
+        std::vector<std::exception_ptr> paletteErrors(num_threads);
+        std::vector<std::thread> paletteWorkers;
+        paletteWorkers.reserve(num_threads);
 
-        for (auto& pt : packed_results)
+        for (unsigned int t = 0; t < num_threads; ++t)
         {
-            if (pt.data.size() < 6)
-                continue;
-            uint16_t fcount;
-            memcpy(&fcount, pt.data.data() + 4, 2);
-
-            std::vector<uint8_t> rewritten;
-            rewritten.reserve(pt.data.size());
-            rewritten.insert(rewritten.end(), pt.data.begin(), pt.data.begin() + 6);
-
-            size_t p = 6;
-            bool ok = true;
-            for (uint16_t fi = 0; fi < fcount; ++fi)
-            {
-                if (p + 9 > pt.data.size())
+            paletteWorkers.emplace_back([&, t]() {
+                try
                 {
-                    ok = false;
-                    break;
+                    while (!paletteFailed.load(std::memory_order_relaxed))
+                    {
+                        size_t begin = nextPaletteTile.fetch_add(PALETTE_CHUNK, std::memory_order_relaxed);
+                        if (begin >= paletteTileCount)
+                            break;
+                        size_t end = std::min(begin + PALETTE_CHUNK, paletteTileCount);
+                        for (size_t i = begin; i < end; ++i)
+                        {
+                            const PackedTile& pt = packed_results[i];
+                            if (pt.size >= 6)
+                                scanPaletteTile(payload_ptr(pt.offset), pt.size, i, localFirst[t]);
+                        }
+                    }
                 }
-                uint8_t geom = pt.data[p];
-                uint16_t color;
-                memcpy(&color, pt.data.data() + p + 1, 2);
-
-                auto it = color_to_index.find(color);
-                uint16_t cidx;
-                if (it == color_to_index.end())
+                catch (...)
                 {
-                    cidx = (uint16_t)palette.size();
-                    color_to_index.emplace(color, cidx);
-                    palette.push_back(color);
+                    paletteErrors[t] = std::current_exception();
+                    paletteFailed.store(true, std::memory_order_relaxed);
                 }
-                else
-                    cidx = it->second;
-
-                size_t hp = p + 9;
-                while (hp < pt.data.size() && (pt.data[hp++] & 0x80))
-                {
-                }
-                uint64_t ps = 0;
-                int shift = 0;
-                while (hp < pt.data.size())
-                {
-                    uint8_t b = pt.data[hp++];
-                    ps |= (uint64_t)(b & 0x7F) << shift;
-                    if (!(b & 0x80))
-                        break;
-                    shift += 7;
-                }
-                if (hp + ps > pt.data.size())
-                {
-                    ok = false;
-                    break;
-                }
-
-                rewritten.push_back(geom);
-                rewritten.push_back((uint8_t)cidx);
-                rewritten.insert(rewritten.end(), pt.data.begin() + p + 3, pt.data.begin() + hp);
-                rewritten.insert(rewritten.end(), pt.data.begin() + hp, pt.data.begin() + hp + ps);
-                p = hp + ps;
-            }
-            if (ok)
-                pt.data = std::move(rewritten);
+            });
         }
-        auto t_palette1 = std::chrono::steady_clock::now();
+        for (auto& worker : paletteWorkers)
+            worker.join();
+        for (const auto& error : paletteErrors)
+            if (error)
+                std::rethrow_exception(error);
 
-        if (palette.size() > 255)
-            throw std::runtime_error("Z" + std::to_string(z) + " palette has " + std::to_string(palette.size()) +
+        std::vector<uint64_t> firstPos(65536, UINT64_MAX);
+        for (const auto& local : localFirst)
+            for (uint32_t color = 0; color < 65536; ++color)
+                if (local[color] < firstPos[color])
+                    firstPos[color] = local[color];
+
+        std::vector<std::pair<uint64_t, uint16_t>> paletteOrder;
+        paletteOrder.reserve(64);
+        for (uint32_t color = 0; color < 65536; ++color)
+            if (firstPos[color] != UINT64_MAX)
+                paletteOrder.emplace_back(firstPos[color], static_cast<uint16_t>(color));
+        std::sort(paletteOrder.begin(), paletteOrder.end(),
+                  [](const auto& a, const auto& b) { return a.first < b.first; });
+
+        if (paletteOrder.size() > 255)
+            throw std::runtime_error("Z" + std::to_string(z) + " palette has " + std::to_string(paletteOrder.size()) +
                                      " colors (>255), 1-byte color index would overflow");
 
-        // Compute bounding box of tiles in this zoom level
+        std::vector<uint16_t> palette;
+        palette.reserve(paletteOrder.size());
+        std::unordered_map<uint16_t, uint16_t> colorToIndex;
+        colorToIndex.reserve(paletteOrder.size());
+        for (size_t i = 0; i < paletteOrder.size(); ++i)
+        {
+            palette.push_back(paletteOrder[i].second);
+            colorToIndex.emplace(paletteOrder[i].second, static_cast<uint16_t>(i));
+        }
+
+        std::atomic<size_t> nextCompactTile{0};
+        std::atomic<bool> compactFailed{false};
+        std::vector<std::exception_ptr> compactErrors(num_threads);
+        std::vector<std::thread> compactWorkers;
+        compactWorkers.reserve(num_threads);
+
+        for (unsigned int t = 0; t < num_threads; ++t)
+        {
+            compactWorkers.emplace_back([&, t]() {
+                try
+                {
+                    while (!compactFailed.load(std::memory_order_relaxed))
+                    {
+                        size_t begin = nextCompactTile.fetch_add(PALETTE_CHUNK, std::memory_order_relaxed);
+                        if (begin >= paletteTileCount)
+                            break;
+                        size_t end = std::min(begin + PALETTE_CHUNK, paletteTileCount);
+                        for (size_t i = begin; i < end; ++i)
+                        {
+                            PackedTile& pt = packed_results[i];
+                            if (pt.size >= 6)
+                                compactPaletteTile(payload_ptr(pt.offset), pt.size, colorToIndex);
+                        }
+                    }
+                }
+                catch (...)
+                {
+                    compactErrors[t] = std::current_exception();
+                    compactFailed.store(true, std::memory_order_relaxed);
+                }
+            });
+        }
+        for (auto& worker : compactWorkers)
+            worker.join();
+        for (const auto& error : compactErrors)
+            if (error)
+                std::rethrow_exception(error);
+
         uint32_t min_x = UINT32_MAX, min_y = UINT32_MAX;
         uint32_t max_x = 0, max_y = 0;
         for (const auto& pt : packed_results)
@@ -721,25 +1049,21 @@ private:
         // Sparse index: only tiles with data get entries, sorted by flat index. Coverage
         // is a 1-bit-per-cell bitmap; a rank table (u32 per 64 bitmap bytes = 512 cells)
         // locates each entry in the compact array in O(1) with 2-3 small SD reads.
-        std::vector<const PackedTile*> real_tiles;
+        // packed_results follows active_cells, which is built in ascending flat
+        // order, so it is already sorted by flat index. Filter empty tiles in
+        // place instead of keeping a second 16M-pointer vector.
+        uint32_t index_count = 0;
         for (const auto& pt : packed_results)
-        {
-            if (pt.data.size() < 6)
-                continue;
-            real_tiles.push_back(&pt);
-        }
-        std::sort(real_tiles.begin(), real_tiles.end(), [&](const PackedTile* a, const PackedTile* b)
-        {
-            uint32_t fa = (a->y - min_y) * tiles_wide + (a->x - min_x);
-            uint32_t fb = (b->y - min_y) * tiles_wide + (b->x - min_x);
-            return fa < fb;
-        });
+            if (pt.size >= 6)
+                ++index_count;
 
         uint32_t bitmap_bytes = (flat_count + 7) / 8;
         std::vector<uint8_t> bitmap(bitmap_bytes, 0);
-        for (const PackedTile* pt : real_tiles)
+        for (const auto& pt : packed_results)
         {
-            uint32_t flat = (pt->y - min_y) * tiles_wide + (pt->x - min_x);
+            if (pt.size < 6)
+                continue;
+            uint32_t flat = (pt.y - min_y) * tiles_wide + (pt.x - min_x);
             bitmap[flat >> 3] |= (uint8_t)(1u << (flat & 7));
         }
 
@@ -757,19 +1081,51 @@ private:
             }
         }
 
-        auto t_write0 = std::chrono::steady_clock::now();
+        const uint32_t palette_bytes = (uint32_t)palette.size() * sizeof(uint16_t);
+        const uint64_t data_offset = sizeof(MapHeader) + sizeof(index_count) + bitmap_bytes +
+                                     (uint64_t)rank_count * sizeof(uint32_t) +
+                                     (uint64_t)index_count * sizeof(IndexEntry) + palette_bytes;
+        if (data_offset > UINT32_MAX)
+            throw std::runtime_error("pack header/index/palette exceeds 32-bit offsets");
+
+        // Deduplicate identical serialized tiles after the palette is final. The
+        // index still has one entry per tile, but duplicate entries point to the
+        // first block; NAV1 itself is unchanged.
+        struct UniqueBlock
+        {
+            uint32_t arena_offset;
+            uint32_t file_offset;
+            uint32_t size;
+        };
+        std::vector<UniqueBlock> unique_blocks;
+        unique_blocks.reserve(std::min<size_t>(packed_results.size(), 1'000'000));
+        std::vector<uint32_t> entry_offsets(packed_results.size(), 0);
+        std::unordered_map<std::string_view, uint32_t> unique_by_payload;
+        unique_by_payload.reserve(std::min<size_t>(packed_results.size(), 1'000'000));
+        uint64_t unique_bytes = 0;
+        for (size_t i = 0; i < packed_results.size(); ++i)
+        {
+            const PackedTile& pt = packed_results[i];
+            if (pt.size < 6)
+                continue;
+            const std::string_view block(reinterpret_cast<const char*>(payload_ptr(pt.offset)), pt.size);
+            auto [it, inserted] = unique_by_payload.emplace(block, static_cast<uint32_t>(unique_blocks.size()));
+            if (inserted)
+            {
+                const uint64_t file_offset = data_offset + unique_bytes;
+                if (file_offset > UINT32_MAX)
+                    throw std::runtime_error("deduplicated pack exceeds 32-bit offsets");
+                unique_blocks.push_back({pt.offset, static_cast<uint32_t>(file_offset), pt.size});
+                unique_bytes += pt.size;
+            }
+            entry_offsets[i] = unique_blocks[it->second].file_offset;
+        }
+
         uint64_t zoom_bytes = 0;
         std::string pack_path = output_dir + "/Z" + std::to_string(z) + ".nav";
         std::ofstream out(pack_path, std::ios::binary);
         if (out)
         {
-            uint32_t palette_bytes = (uint32_t)palette.size() * sizeof(uint16_t);
-            uint32_t index_count = (uint32_t)real_tiles.size();
-            uint64_t data_offset = sizeof(MapHeader) + sizeof(index_count) + bitmap_bytes +
-                                   (uint64_t)rank_count * sizeof(uint32_t) +
-                                   (uint64_t)index_count * sizeof(IndexEntry) + palette_bytes;
-
-            // Write header
             MapHeader mh;
             memcpy(mh.magic, "NPK2", 4);
             mh.zoom = (uint8_t)z;
@@ -785,67 +1141,70 @@ private:
             out.write((char*)bitmap.data(), bitmap.size());
             out.write((char*)rank.data(), rank.size() * sizeof(uint32_t));
 
-            uint64_t current_data_offset = data_offset;
-            for (const PackedTile* pt : real_tiles)
+            for (size_t i = 0; i < packed_results.size(); ++i)
             {
+                const PackedTile& pt = packed_results[i];
+                if (pt.size < 6)
+                    continue;
                 IndexEntry entry;
-                entry.offset = (uint32_t)current_data_offset;
-                entry.size   = (uint32_t)pt->data.size();
-                current_data_offset += pt->data.size();
+                entry.offset = entry_offsets[i];
+                entry.size   = pt.size;
                 out.write((char*)&entry, sizeof(entry));
             }
 
             if (!palette.empty())
                 out.write((char*)palette.data(), palette_bytes);
 
-            for (const PackedTile* pt : real_tiles)
-                out.write((char*)pt->data.data(), pt->data.size());
+            for (const auto& block : unique_blocks)
+                out.write((char*)payload_ptr(block.arena_offset), block.size);
 
-            zoom_bytes = current_data_offset;
-            total_generated_bytes += current_data_offset;
+            zoom_bytes = data_offset + unique_bytes;
+            total_generated_bytes += zoom_bytes;
             total_generated_files++;
         }
+        if (out.is_open())
+            out.flush();
+        if (out.is_open())
+            out.close();
         auto end = std::chrono::steady_clock::now();
         std::chrono::duration<double> elapsed = end - start;
-        double avg_tps = (elapsed.count() > 0) ? (double)tiles.size() / elapsed.count() : 0;
+        double avg_tps = (elapsed.count() > 0) ? (double)tile_count / elapsed.count() : 0;
         std::cout << "\r\33[2K  Zoom " << std::setw(2) << z << ": "
-                  << std::setw(8) << tiles.size() << " tiles ("
+                  << std::setw(8) << tile_count << " tiles ("
                   << std::fixed << std::setprecision(1) << avg_tps << " t/s), "
                   << std::setw(8) << (size_t)merged_count << " polygons merged | "
                   << std::setw(6) << std::setprecision(1) << (zoom_bytes / 1024.0 / 1024.0) << " MB done in " << elapsed.count() << "s" << std::endl;
-        {
-            auto secs = [](auto a, auto b) { return std::chrono::duration<double>(b - a).count(); };
-            std::cout << "    [CLOSE z" << z << "] prep_tilemap=" << std::fixed << std::setprecision(1)
-                      << secs(start, t_prep1) << "s  palette_pass=" << secs(t_palette0, t_palette1)
-                      << "s  write_nav=" << secs(t_write0, end) << "s" << std::endl;
-            std::cout << "    [PREP z" << z << "] feat_loop=" << std::fixed << std::setprecision(1)
-                      << prep_loop_s << "s  map_insert=" << prep_insert_s << "s  inserts="
-                      << prep_inserts << std::endl;
-        }
     }
 
     /**
      * @brief Serialize one tile to NAV1 binary format (geometry clip, simplify, encode).
+     * @details Uses GEOSClipByRect from z14 and the exact intersection below it. After
+     *          repairing invalid output, emits every polygonal part recursively so nested
+     *          collections do not drop features.
      * @param z             Zoom level.
      * @param x             Tile X coordinate.
      * @param y             Tile Y coordinate.
      * @param store         Memory-mapped feature store.
      * @param offsets       Feature offsets within the store that intersect this tile.
      * @param local_handle  GEOS thread-local context for geometry operations.
-     * @param merged_out    Incremented by the number of polygons merged in this tile.
+     * @param merged_out    Incremented per merged group by input features minus emitted features,
+     *                      clamped to zero when that group splits into more parts.
      * @param tile_labels   Pre-placed text label features for this tile.
      * @param point_symbols Pre-built polygon symbols for POI features in this tile.
-     * @return Raw NAV1 tile bytes with a temporary 2-byte color per feature; the color is
-     *         later collapsed to a 1-byte palette index during the zoom-level palette pass.
+     * @param buffer        Reused output buffer; cleared on entry and filled with the raw
+     *                      NAV1 tile bytes (temporary 2-byte color per feature).
+     * @param water_cache   Per-worker cache of source water geometries, reused across tiles.
      */
-    std::vector<uint8_t> serialize_tile(int z, int x, int y, const MappedStore& store,
-                                         const std::vector<size_t>& offsets,
-                                         GEOSContextHandle_t local_handle, size_t& merged_out,
-                                         const std::vector<const Feature*>& tile_labels,
-                                         const std::vector<ProcessedFeature>& point_symbols)
+    void serialize_tile(int z, int x, int y, const MappedStore& store,
+                        const uint32_t* offsets, size_t offset_count,
+                        GEOSContextHandle_t local_handle, size_t& merged_out,
+                        const std::vector<const Feature*>& tile_labels,
+                        const std::vector<ProcessedFeature>& point_symbols,
+                        std::vector<uint8_t>& buffer,
+                        WaterGeometryCache& water_cache)
     {
         struct Style {
-            uint16_t color; uint8_t prio; std::string subclass; bool is_building;
+            uint16_t color; uint8_t prio; std::string_view subclass; bool is_building;
             bool operator<(const Style& o) const {
                 if (color != o.color) return color < o.color;
                 if (prio != o.prio) return prio < o.prio;
@@ -854,23 +1213,25 @@ private:
             }
         };
         std::map<Style, std::vector<GEOSGeometry*>> poly_groups;
-        std::map<Style, std::vector<Feature>> poly_individual;
-        std::vector<Feature> lines;
+        std::map<Style, std::vector<FeatureView>> poly_individual;
+        std::vector<FeatureView> lines;
+        lines.reserve(offset_count);
         std::vector<GEOSGeometry*> island_geoms;
         const auto& width_table = constants::line_width_per_zoom();
         const auto& color_table = constants::line_color_per_zoom();
 
         double pre_min_area = constants::min_area_deg2_for_zoom(z);
 
-        for (size_t offset : offsets)
+        for (size_t oi = 0; oi < offset_count; ++oi)
         {
-            Feature f = store.get(offset);
+            size_t offset = offsets[oi];
+            FeatureView f = store.get_view(offset);
             if (f.geom_type == GEOM_POLYGON)
             {
-                if (pre_min_area > 0 && !f.points.empty())
+                if (pre_min_area > 0 && f.n_points > 0)
                 {
                     double area2 = 0;
-                    size_t npts = f.ring_ends.empty() ? f.points.size() : f.ring_ends[0];
+                    size_t npts = (f.n_rings == 0) ? f.n_points : f.ring_ends[0];
                     for (size_t i = 0; i < npts; ++i)
                     {
                         size_t j = (i + 1) % npts;
@@ -886,11 +1247,9 @@ private:
                         island_geoms.push_back(ig);
                 }
 
-                uint8_t nibble = f.zoom_priority & 0x0F;
-                bool is_landcover = nibble <= 3 && (f.layer == "wood" || f.layer == "forest");
                 bool is_building_merge = f.is_building && z <= 15;
                 Style key{f.color_rgb565, f.zoom_priority, f.layer, f.is_building};
-                if (is_landcover || is_building_merge)
+                if (is_building_merge)
                 {
                     GEOSGeometry* g = feature_to_geos(f, local_handle);
                     if (g) poly_groups[key].push_back(g);
@@ -933,37 +1292,77 @@ private:
 
         auto make_clip_box = [&](double margin) -> GEOSGeometry* {
             double lm = (lmax - lmin) * margin, tm = (tmax - tmin) * margin;
-            GEOSCoordSequence* cb = GEOSCoordSeq_create_r(local_handle, 5, 2);
-            GEOSCoordSeq_setX_r(local_handle, cb, 0, lmin - lm); GEOSCoordSeq_setY_r(local_handle, cb, 0, tmin - tm);
-            GEOSCoordSeq_setX_r(local_handle, cb, 1, lmax + lm); GEOSCoordSeq_setY_r(local_handle, cb, 1, tmin - tm);
-            GEOSCoordSeq_setX_r(local_handle, cb, 2, lmax + lm); GEOSCoordSeq_setY_r(local_handle, cb, 2, tmax + tm);
-            GEOSCoordSeq_setX_r(local_handle, cb, 3, lmin - lm); GEOSCoordSeq_setY_r(local_handle, cb, 3, tmax + tm);
-            GEOSCoordSeq_setX_r(local_handle, cb, 4, lmin - lm); GEOSCoordSeq_setY_r(local_handle, cb, 4, tmin - tm);
-            return GEOSGeom_createPolygon_r(local_handle, GEOSGeom_createLinearRing_r(local_handle, cb), NULL, 0);
+            double xy[10] = {
+                lmin - lm, tmin - tm, lmax + lm, tmin - tm,
+                lmax + lm, tmax + tm, lmin - lm, tmax + tm,
+                lmin - lm, tmin - tm
+            };
+            GEOSCoordSequence* cb = coord_seq_from_doubles(xy, 5, local_handle);
+            if (!cb) return nullptr;
+            GEOSGeometry* ring = GEOSGeom_createLinearRing_r(local_handle, cb);
+            if (!ring) { GEOSCoordSeq_destroy_r(local_handle, cb); return nullptr; }
+            GEOSGeometry* poly = GEOSGeom_createPolygon_r(local_handle, ring, NULL, 0);
+            if (!poly) { GEOSGeom_destroy_r(local_handle, ring); return nullptr; }
+            return poly;
         };
-        GEOSGeometry* clip_poly = make_clip_box(constants::CLIP_MARGIN_POLYGON);
-        GEOSGeometry* clip_line = make_clip_box(constants::CLIP_MARGIN_LINE);
+        // The polygon buffer only has to keep the cut edge out of the tile.
+        double poly_margin = static_cast<double>(constants::CLIP_POLYGON_PX) / constants::TILE_SIZE_PX;
+        // GEOSClipByRect is much faster, but it can slightly change merged/clipped
+        // geometry. Use it from z14, where the tile count and GEOS cost grow;
+        // z13 and below keep the exact intersection path.
+        const bool rect_clip = (z >= 14);
+        auto has_building = [&]() {
+            for (const auto& entry : poly_individual)
+                for (const auto& f : entry.second)
+                    if (f.is_building) return true;
+            return false;
+        };
+        GEOSGeometry* clip_poly = (rect_clip || (poly_groups.empty() && poly_individual.empty()))
+            ? nullptr : make_clip_box(poly_margin);
 
-        double poly_lm = (lmax - lmin) * constants::CLIP_MARGIN_POLYGON;
-        double poly_tm = (tmax - tmin) * constants::CLIP_MARGIN_POLYGON;
+        // The line buffer covers the widest stroke plus one pixel, never a whole tile.
+        int max_line_px = 1;
+        for (const auto& f : lines)
+        {
+            for (uint32_t wi = 0; wi < f.n_widths; ++wi)
+                if (f.width_zoom(wi) == z && f.width_px(wi) > max_line_px)
+                    max_line_px = f.width_px(wi);
+        }
+        int line_px = std::max(constants::clip_line_px(z), max_line_px / 2 + 1);
+        double line_margin = static_cast<double>(line_px) / constants::TILE_SIZE_PX;
+
+        double poly_lm = (lmax - lmin) * poly_margin;
+        double poly_tm = (tmax - tmin) * poly_margin;
         double clip_poly_xmin = lmin - poly_lm, clip_poly_xmax = lmax + poly_lm;
         double clip_poly_ymin = tmin - poly_tm, clip_poly_ymax = tmax + poly_tm;
-        double line_lm = (lmax - lmin) * constants::CLIP_MARGIN_LINE;
-        double line_tm = (tmax - tmin) * constants::CLIP_MARGIN_LINE;
+        double casing_lm = (lmax - lmin) * constants::CLIP_MARGIN_CASING;
+        double casing_tm = (tmax - tmin) * constants::CLIP_MARGIN_CASING;
+        double clip_casing_xmin = lmin - casing_lm, clip_casing_xmax = lmax + casing_lm;
+        double clip_casing_ymin = tmin - casing_tm, clip_casing_ymax = tmax + casing_tm;
+        GEOSGeometry* clip_casing = (rect_clip || !has_building())
+            ? nullptr : make_clip_box(constants::CLIP_MARGIN_CASING);
+        double line_lm = (lmax - lmin) * line_margin;
+        double line_tm = (tmax - tmin) * line_margin;
         double clip_line_xmin = lmin - line_lm, clip_line_xmax = lmax + line_lm;
         double clip_line_ymin = tmin - line_tm, clip_line_ymax = tmax + line_tm;
+        GEOSGeometry* clip_line = (rect_clip || lines.empty())
+            ? nullptr : make_clip_box(line_margin);
 
-        auto clip_with_bbox = [&](const GEOSGeometry* geom, const GEOSGeometry* clip_box,
-                                  double cxmin, double cxmax, double cymin, double cymax) -> GEOSGeometry* {
+        auto clip_with_bbox = [&](const GEOSGeometry* geom,
+                                  double cxmin, double cxmax, double cymin, double cymax,
+                                  const GEOSGeometry* polygon_clip = nullptr) -> GEOSGeometry* {
             double gxmin, gymin, gxmax, gymax;
             if (GEOSGeom_getExtent_r(local_handle, geom, &gxmin, &gymin, &gxmax, &gymax))
             {
                 if (gxmax < cxmin || gxmin > cxmax || gymax < cymin || gymin > cymax)
                     return nullptr;
                 if (gxmin >= cxmin && gxmax <= cxmax && gymin >= cymin && gymax <= cymax)
-                    return GEOSGeom_clone_r(local_handle, geom);
+                    return const_cast<GEOSGeometry*>(geom);
             }
-            return GEOSIntersection_r(local_handle, geom, clip_box);
+            if (polygon_clip)
+                return GEOSIntersection_r(local_handle, geom, polygon_clip);
+            // When no polygon clip is supplied, use GEOS' specialized rectangle clip.
+            return GEOSClipByRect_r(local_handle, geom, cxmin, cymin, cxmax, cymax);
         };
         double tolerance = (lmax - lmin) / 1024.0;
         double pixel_deg = (lmax - lmin) / 256.0;
@@ -974,6 +1373,7 @@ private:
             min_hole_area_deg2 = (pixel_deg * pixel_deg) * constants::K_VISIBILITY * hole_factor;
         }
         std::vector<ProcessedFeature> final_features;
+        final_features.reserve(offset_count + tile_labels.size() + point_symbols.size() + 8);
 
         auto project_ring = [&](const GEOSGeometry* ring) -> std::vector<std::pair<int16_t, int16_t>> {
             std::vector<std::pair<int16_t, int16_t>> rpts;
@@ -982,6 +1382,7 @@ private:
             if (!s) return rpts;
             uint32_t sz = 0; GEOSCoordSeq_getSize_r(local_handle, s, &sz);
             if (sz < 3) return rpts;
+            rpts.reserve(sz);
             for (uint32_t j = 0; j < sz; ++j)
             {
                 double lon, lat;
@@ -993,14 +1394,15 @@ private:
         };
 
         auto emit_polygon = [&](const GEOSGeometry* safe, uint16_t color, uint8_t prio,
-                                const std::string& feat_layer = "", bool is_building = false) {
+                                std::string_view feat_layer = "", bool is_building = false) {
             if (!safe || GEOSGeomTypeId_r(local_handle, safe) != GEOS_POLYGON || GEOSisEmpty_r(local_handle, safe)) return;
-            bool is_water = ((prio & 0x0F) == 8);
+            // Legacy filter policy: priority nibble 8 skips the area/hole filters.
+            bool skip_area_filters = ((prio & 0x0F) == 8);
 
             auto ext_pts = project_ring(GEOSGetExteriorRing_r(local_handle, safe));
             if (ext_pts.size() < 3) return;
 
-            if (!is_water && min_pixel_area > 0)
+            if (!skip_area_filters && min_pixel_area > 0)
             {
                 int16_t minx = 4096, maxx = 0, miny = 4096, maxy = 0;
                 for (const auto& p : ext_pts)
@@ -1016,7 +1418,7 @@ private:
                 if (pixel_area < min_pixel_area) return;
             }
 
-            ProcessedFeature pf{GEOM_POLYGON, color, prio, 0, {}, {}, "", feat_layer, false, is_building};
+            ProcessedFeature pf{GEOM_POLYGON, color, prio, 0, {}, {}, "", std::string(feat_layer), false, is_building};
             pf.rings.push_back(std::move(ext_pts));
 
             int nh = GEOSGetNumInteriorRings_r(local_handle, safe);
@@ -1025,7 +1427,7 @@ private:
                 const GEOSGeometry* hole = GEOSGetInteriorRingN_r(local_handle, safe, h);
                 if (!hole) continue;
 
-                if (!is_water && min_hole_area_deg2 > 0)
+                if (!skip_area_filters && min_hole_area_deg2 > 0)
                 {
                     const GEOSCoordSequence* hs = GEOSGeom_getCoordSeq_r(local_handle, hole);
                     if (hs)
@@ -1051,6 +1453,28 @@ private:
             if (!pf.rings.empty()) final_features.push_back(std::move(pf));
         };
 
+        // GEOSClipByRect is not guaranteed to return valid output, and
+        // GEOSMakeValid can wrap repaired polygons in a GeometryCollection.
+        // Emit every polygonal part recursively so nested collections do not
+        // silently drop buildings or landcover.
+        auto emit_polygon_parts = [&](const GEOSGeometry* geom, uint16_t color, uint8_t prio,
+                                      std::string_view layer, bool building,
+                                      const auto& self) -> void {
+            if (!geom || GEOSisEmpty_r(local_handle, geom)) return;
+            const int type = GEOSGeomTypeId_r(local_handle, geom);
+            if (type == GEOS_POLYGON)
+            {
+                emit_polygon(geom, color, prio, layer, building);
+                return;
+            }
+            if (type == GEOS_MULTIPOLYGON || type == GEOS_GEOMETRYCOLLECTION)
+            {
+                const int count = GEOSGetNumGeometries_r(local_handle, geom);
+                for (int i = 0; i < count; ++i)
+                    self(GEOSGetGeometryN_r(local_handle, geom, i), color, prio, layer, building, self);
+            }
+        };
+
         for (auto& [style, geos_polys] : poly_groups)
         {
             GEOSGeometry* coll = GEOSGeom_createCollection_r(local_handle, GEOS_GEOMETRYCOLLECTION, geos_polys.data(), (uint32_t)geos_polys.size());
@@ -1060,8 +1484,8 @@ private:
             {
                 GEOSGeometry* simplified = GEOSTopologyPreserveSimplify_r(local_handle, merged, tolerance * 0.5);
                 GEOSGeometry* to_clip = (simplified && !GEOSisEmpty_r(local_handle, simplified)) ? simplified : merged;
-                GEOSGeometry* clipped = clip_with_bbox(to_clip, clip_poly, clip_poly_xmin, clip_poly_xmax, clip_poly_ymin, clip_poly_ymax);
-                if (to_clip != merged) GEOSGeom_destroy_r(local_handle, to_clip);
+                GEOSGeometry* clipped = clip_with_bbox(to_clip, clip_poly_xmin, clip_poly_xmax, clip_poly_ymin, clip_poly_ymax, clip_poly);
+                if (to_clip != merged && clipped != to_clip) GEOSGeom_destroy_r(local_handle, to_clip);
                 if (clipped)
                 {
                     if (!GEOSisValid_r(local_handle, clipped))
@@ -1071,7 +1495,8 @@ private:
                     }
                     else final_geom = clipped;
                 }
-                GEOSGeom_destroy_r(local_handle, merged);
+                if (merged && final_geom != merged && clipped != merged)
+                    GEOSGeom_destroy_r(local_handle, merged);
             }
             if (!final_geom) { GEOSGeom_destroy_r(local_handle, coll); continue; }
 
@@ -1083,33 +1508,76 @@ private:
                 continue;
             }
 
-            int n = GEOSGetNumGeometries_r(local_handle, final_geom);
-            for (int i = 0; i < n; ++i)
-            {
-                const GEOSGeometry* g = GEOSGetGeometryN_r(local_handle, final_geom, i);
-                if (!g || GEOSGeomTypeId_r(local_handle, g) != GEOS_POLYGON || GEOSisEmpty_r(local_handle, g)) continue;
-                emit_polygon(g, style.color, style.prio);
-            }
-            merged_out += ((int)geos_polys.size() - std::max(0, n));
+            const size_t merged_before = final_features.size();
+            emit_polygon_parts(final_geom, style.color, style.prio, "", false, emit_polygon_parts);
+            const int emitted = static_cast<int>(final_features.size() - merged_before);
+            merged_out += std::max(0, static_cast<int>(geos_polys.size()) - emitted);
             GEOSGeom_destroy_r(local_handle, coll); GEOSGeom_destroy_r(local_handle, final_geom);
         }
 
         for (auto& [style, feats] : poly_individual)
         {
             uint8_t nibble = style.prio & 0x0F;
-            bool is_water = (nibble == 8);
             bool is_landuse_low = (nibble <= 3) && z < 14;
+            bool legacy_prio8 = (nibble == 8);
             for (auto& f : feats)
             {
-                GEOSGeometry* g = feature_to_geos(f, local_handle);
+                // Only water gains the island subtraction; priority-8 non-water
+                // layers keep their legacy path.
+                bool is_water = (f.layer == "water");
+                bool subtract_islands = is_water || legacy_prio8;
+                GEOSGeometry* g = nullptr;
+                bool cache_owned = false;
+                if (is_water && f.points)
+                {
+                    auto cache_it = water_cache.entries.find(f.points);
+                    if (cache_it != water_cache.entries.end())
+                    {
+                        g = cache_it->second;
+                        cache_owned = true;
+                    }
+                    else
+                    {
+                        if (water_cache.entries.size() >= WaterGeometryCache::MAX_ENTRIES)
+                            water_cache.clear(local_handle);
+                        g = feature_to_geos(f, local_handle);
+                        if (g)
+                        {
+                            water_cache.entries.emplace(f.points, g);
+                            cache_owned = true;
+                        }
+                    }
+                }
+                else
+                {
+                    g = feature_to_geos(f, local_handle);
+                }
                 if (!g) continue;
-                GEOSGeometry* clipped = clip_with_bbox(g, clip_poly, clip_poly_xmin, clip_poly_xmax, clip_poly_ymin, clip_poly_ymax);
-                GEOSGeom_destroy_r(local_handle, g);
+                double pxmin = f.is_building ? clip_casing_xmin : clip_poly_xmin;
+                double pxmax = f.is_building ? clip_casing_xmax : clip_poly_xmax;
+                double pymin = f.is_building ? clip_casing_ymin : clip_poly_ymin;
+                double pymax = f.is_building ? clip_casing_ymax : clip_poly_ymax;
+                const GEOSGeometry* pclip = rect_clip ? nullptr : (f.is_building ? clip_casing : clip_poly);
+                GEOSGeometry* clipped = clip_with_bbox(g, pxmin, pxmax, pymin, pymax, pclip);
+                if (clipped == g && cache_owned)
+                {
+                    // The cache owns the source geometry; clone it before the
+                    // clipped-geometry ownership path takes over.
+                    clipped = GEOSGeom_clone_r(local_handle, g);
+                    if (!clipped) continue;
+                }
+                else if (clipped != g && !cache_owned)
+                {
+                    GEOSGeom_destroy_r(local_handle, g);
+                }
                 if (!clipped || GEOSisEmpty_r(local_handle, clipped)) { if (clipped) GEOSGeom_destroy_r(local_handle, clipped); continue; }
                 if (!GEOSisValid_r(local_handle, clipped)) { GEOSGeometry* v = GEOSMakeValid_r(local_handle, clipped); GEOSGeom_destroy_r(local_handle, clipped); clipped = v; }
                 if (!clipped) continue;
 
-                if (is_water && island_union)
+                // Subtract islands so water does not paint over them. Keep the
+                // normal simplification: skipping it exposes a rectangular land
+                // gap in the current water source at z6.
+                if (subtract_islands && island_union)
                 {
                     GEOSGeometry* diff = GEOSDifference_r(local_handle, clipped, island_union);
                     if (diff && !GEOSisEmpty_r(local_handle, diff))
@@ -1136,28 +1604,13 @@ private:
                     GEOSGeometry* s = GEOSTopologyPreserveSimplify_r(local_handle, clipped, tolerance);
                     if (s && !GEOSisEmpty_r(local_handle, s)) result = s;
                 }
-                else if (!is_water)
+                else if (!legacy_prio8)
                 {
                     GEOSGeometry* s = GEOSTopologyPreserveSimplify_r(local_handle, clipped, tolerance * 0.5);
                     if (s && !GEOSisEmpty_r(local_handle, s)) result = s;
                 }
-                auto emit_geom = [&](const GEOSGeometry* geom) {
-                    if (!geom) return;
-                    int type = GEOSGeomTypeId_r(local_handle, geom);
-                    if (type == GEOS_POLYGON && !GEOSisEmpty_r(local_handle, geom))
-                        emit_polygon(geom, style.color, style.prio, f.layer, f.is_building);
-                    else if (type == GEOS_MULTIPOLYGON || type == GEOS_GEOMETRYCOLLECTION)
-                    {
-                        int np = GEOSGetNumGeometries_r(local_handle, geom);
-                        for (int i = 0; i < np; ++i)
-                        {
-                            const GEOSGeometry* part = GEOSGetGeometryN_r(local_handle, geom, i);
-                            if (part && GEOSGeomTypeId_r(local_handle, part) == GEOS_POLYGON && !GEOSisEmpty_r(local_handle, part))
-                                emit_polygon(part, style.color, style.prio, f.layer, f.is_building);
-                        }
-                    }
-                };
-                emit_geom(result);
+                emit_polygon_parts(result, style.color, style.prio, f.layer, f.is_building,
+                                   emit_polygon_parts);
                 if (result != clipped) GEOSGeom_destroy_r(local_handle, result);
                 GEOSGeom_destroy_r(local_handle, clipped);
             }
@@ -1167,10 +1620,29 @@ private:
         {
             GEOSGeometry* g = feature_to_geos(f, local_handle);
             if (!g) continue;
-            GEOSGeometry* clipped = clip_with_bbox(g, clip_line, clip_line_xmin, clip_line_xmax, clip_line_ymin, clip_line_ymax);
+
+            // Simplify once per zoom, before the tile split: every tile simplifies the
+            // same source geometry, so the vertices match across the border and the
+            // clip buffer only has to cover the stroke instead of hiding a mismatched join.
+            bool skip_simplify = (f.layer == "water" || f.layer == "roads");
+            double line_tol = tolerance;
+            if (f.layer == "infrastructure") line_tol = pixel_deg * 0.1;
+
+            if (!skip_simplify)
+            {
+                GEOSGeometry* simplified = GEOSTopologyPreserveSimplify_r(local_handle, g, line_tol);
+                if (simplified && !GEOSisEmpty_r(local_handle, simplified))
+                {
+                    GEOSGeom_destroy_r(local_handle, g);
+                    g = simplified;
+                }
+                else if (simplified) GEOSGeom_destroy_r(local_handle, simplified);
+            }
+
+            GEOSGeometry* clipped = clip_with_bbox(g, clip_line_xmin, clip_line_xmax, clip_line_ymin, clip_line_ymax, clip_line);
             if (!clipped || GEOSisEmpty_r(local_handle, clipped))
             {
-                GEOSGeom_destroy_r(local_handle, g);
+                if (clipped != g) GEOSGeom_destroy_r(local_handle, g);
                 if (clipped) GEOSGeom_destroy_r(local_handle, clipped);
                 continue;
             }
@@ -1178,7 +1650,7 @@ private:
             uint16_t line_color = f.color_rgb565;
             if (!f.highway_type.empty())
             {
-                auto cit = color_table.find(f.highway_type);
+                auto cit = color_table.find(std::string(f.highway_type));
                 if (cit != color_table.end())
                 {
                     auto zit = cit->second.find(z);
@@ -1187,10 +1659,6 @@ private:
                 }
             }
 
-            bool skip_simplify = (f.layer == "water" || f.layer == "roads");
-            double line_tol = tolerance;
-            if (f.layer == "infrastructure") line_tol = pixel_deg * 0.1;
-
             int n = GEOSGetNumGeometries_r(local_handle, clipped);
             for (int i = 0; i < n; ++i)
             {
@@ -1198,23 +1666,17 @@ private:
                 if (!part || (GEOSGeomTypeId_r(local_handle, part) != GEOS_LINESTRING && GEOSGeomTypeId_r(local_handle, part) != GEOS_LINEARRING) || GEOSisEmpty_r(local_handle, part)) continue;
 
                 const GEOSGeometry* use = part;
-                GEOSGeometry* simplified = nullptr;
-                if (!skip_simplify)
-                {
-                    simplified = GEOSTopologyPreserveSimplify_r(local_handle, part, line_tol);
-                    if (simplified && !GEOSisEmpty_r(local_handle, simplified)) use = simplified;
-                    else { if (simplified) GEOSGeom_destroy_r(local_handle, simplified); simplified = nullptr; }
-                }
-
-                if (GEOSGeomTypeId_r(local_handle, use) != GEOS_LINESTRING && GEOSGeomTypeId_r(local_handle, use) != GEOS_LINEARRING)
-                { if (simplified) GEOSGeom_destroy_r(local_handle, simplified); continue; }
 
                 const GEOSCoordSequence* s = GEOSGeom_getCoordSeq_r(local_handle, use);
                 uint32_t sz = 0; if (s) GEOSCoordSeq_getSize_r(local_handle, s, &sz);
                 if (sz >= 2)
                 {
+                    std::map<int, uint8_t> zoom_widths;
+                    for (uint32_t wi = 0; wi < f.n_widths; ++wi)
+                        zoom_widths[f.width_zoom(wi)] = f.width_px(wi);
                     ProcessedFeature pf{GEOM_LINESTRING, line_color, f.zoom_priority, f.width_meters,
-                                       {{}}, f.zoom_widths, f.highway_type, f.layer, f.is_bridge, f.is_building};
+                                       {{}}, std::move(zoom_widths), std::string(f.highway_type), std::string(f.layer), f.is_bridge, f.is_building};
+                    pf.rings[0].reserve(sz);
                     for (uint32_t j = 0; j < sz; ++j)
                     {
                         double lon, lat;
@@ -1224,12 +1686,12 @@ private:
                     }
                     if (pf.rings[0].size() >= 2) final_features.push_back(std::move(pf));
                 }
-                if (simplified) GEOSGeom_destroy_r(local_handle, simplified);
             }
-            GEOSGeom_destroy_r(local_handle, g); GEOSGeom_destroy_r(local_handle, clipped);
+            if (g != clipped) GEOSGeom_destroy_r(local_handle, g);
+            GEOSGeom_destroy_r(local_handle, clipped);
         }
 
-        auto bridge_decks = make_bridge_decks(final_features, z, x, y, local_handle);
+        auto bridge_decks = make_bridge_decks(final_features, z, local_handle);
         final_features.insert(final_features.begin(), bridge_decks.begin(), bridge_decks.end());
 
         for (auto& ps : point_symbols)
@@ -1246,7 +1708,8 @@ private:
             final_features.insert(final_features.begin(), std::move(bg));
         }
 
-        std::vector<uint8_t> buffer;
+        buffer.clear();
+        buffer.reserve(1024 + final_features.size() * 48 + tile_labels.size() * 48);
         double t_max_merc = utils::lat_to_mercator_y(tmax);
         double t_min_merc = utils::lat_to_mercator_y(tmin);
         double merc_range = t_max_merc - t_min_merc;
@@ -1265,6 +1728,9 @@ private:
             uint8_t final_width = 1;
             if (pf.type == GEOM_LINESTRING)
             {
+                // TODO(width): for path-like features (path, track, footway,
+                // bridleway, cycleway), prefer OSM width_meters converted to
+                // packed half-pixels when present; otherwise use the table.
                 if (!pf.highway_type.empty())
                 {
                     auto wit = width_table.find(pf.highway_type);
@@ -1298,7 +1764,11 @@ private:
                 width_byte |= 0x80;
             }
 
-            std::vector<uint8_t> payload;
+            size_t total_points = 0;
+            for (const auto& r : pf.rings) total_points += r.size();
+            static thread_local std::vector<uint8_t> payload;
+            payload.clear();
+            payload.reserve(total_points * 3 + 8);
             int16_t minx = 4096, maxx = 0, miny = 4096, maxy = 0;
             size_t pts = 0;
             int16_t lx = 0, ly = 0;
@@ -1306,10 +1776,8 @@ private:
             {
                 for (const auto& p : r)
                 {
-                    auto vx = utils::to_varint(utils::zigzag_encode(p.first - lx));
-                    payload.insert(payload.end(), vx.begin(), vx.end());
-                    auto vy = utils::to_varint(utils::zigzag_encode(p.second - ly));
-                    payload.insert(payload.end(), vy.begin(), vy.end());
+                    utils::append_varint(payload, utils::zigzag_encode(p.first - lx));
+                    utils::append_varint(payload, utils::zigzag_encode(p.second - ly));
                     lx = p.first; ly = p.second;
                     int16_t cx = std::max((int16_t)0, std::min((int16_t)4096, p.first));
                     int16_t cy = std::max((int16_t)0, std::min((int16_t)4096, p.second));
@@ -1320,7 +1788,8 @@ private:
                 }
                 pts += r.size();
             }
-            std::vector<uint8_t> ri;
+            static thread_local std::vector<uint8_t> ri;
+            ri.clear();
             if (pf.type == GEOM_POLYGON)
             {
                 uint16_t nr = (uint16_t)pf.rings.size();
@@ -1336,10 +1805,8 @@ private:
                              (uint8_t)std::min(255, minx / 16), (uint8_t)std::min(255, miny / 16),
                              (uint8_t)std::min(255, maxx / 16), (uint8_t)std::min(255, maxy / 16)};
             buffer.insert(buffer.end(), fh, fh + 9);
-            auto vcc = utils::to_varint((uint64_t)pts);
-            buffer.insert(buffer.end(), vcc.begin(), vcc.end());
-            auto vps = utils::to_varint((uint64_t)(payload.size() + ri.size()));
-            buffer.insert(buffer.end(), vps.begin(), vps.end());
+            utils::append_varint(buffer, (uint64_t)pts);
+            utils::append_varint(buffer, (uint64_t)(payload.size() + ri.size()));
             buffer.insert(buffer.end(), payload.begin(), payload.end());
             if (!ri.empty()) buffer.insert(buffer.end(), ri.begin(), ri.end());
             written++;
@@ -1362,7 +1829,9 @@ private:
             int data_size = 4 + 1 + text_len + (has_shield ? 4 : 0);
             uint16_t coord_count = (uint16_t)data_size;
 
-            std::vector<uint8_t> text_payload;
+            static thread_local std::vector<uint8_t> text_payload;
+            text_payload.clear();
+            text_payload.reserve(data_size);
             text_payload.push_back(px & 0xFF); text_payload.push_back(px >> 8);
             text_payload.push_back(py & 0xFF); text_payload.push_back(py >> 8);
             text_payload.push_back(text_len);
@@ -1382,21 +1851,23 @@ private:
                               label->zoom_priority, label->font_size,
                               bx, by, bx, by};
             buffer.insert(buffer.end(), th2, th2 + 9);
-            auto vcc = utils::to_varint((uint64_t)coord_count);
-            buffer.insert(buffer.end(), vcc.begin(), vcc.end());
-            auto vps = utils::to_varint((uint64_t)text_payload.size());
-            buffer.insert(buffer.end(), vps.begin(), vps.end());
+            utils::append_varint(buffer, (uint64_t)coord_count);
+            utils::append_varint(buffer, (uint64_t)text_payload.size());
             buffer.insert(buffer.end(), text_payload.begin(), text_payload.end());
             written++;
         }
 
         memcpy(buffer.data() + 4, &written, 2);
 
-        GEOSGeom_destroy_r(local_handle, clip_poly); GEOSGeom_destroy_r(local_handle, clip_line);
+        if (clip_poly) GEOSGeom_destroy_r(local_handle, clip_poly);
+        if (clip_casing) GEOSGeom_destroy_r(local_handle, clip_casing);
+        if (clip_line) GEOSGeom_destroy_r(local_handle, clip_line);
         if (!island_geoms_owned)
             for (auto* ig : island_geoms) GEOSGeom_destroy_r(local_handle, ig);
         if (island_union) GEOSGeom_destroy_r(local_handle, island_union);
-        return buffer;
+
+        // The caller copies this buffer into the zoom arena and reuses it for the
+        // next tile, so no per-tile allocation or shrink_to_fit() is needed.
     }
 };
 
