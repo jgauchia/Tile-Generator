@@ -177,11 +177,11 @@ via `palette[color_index]`.
 ```
  0: Background land
  1: Large zones (aerodrome, residential, commercial, industrial)
- 2: Landuse base (parking, heath, scrub), islands
+ 2: Landuse base (parking, heath, scrub, park), islands
  3: Boundaries, retail, cemetery, leisure
  4: Surfaces (pitch, beach, wetland, farmland)
- 5: Forest/wood, apron
- 6: Infrastructure (runway, taxiway, helipad)
+ 5: Forest/wood, grass, golf fairway/rough, apron
+ 6: Infrastructure (runway, taxiway, helipad), golf bunkers/greens/tees
  7: Buildings, water
  8-14: Roads (by class)
 15: Rail, bridges, labels

@@ -40,7 +40,7 @@ entry = index.get((tile_x, tile_y))  # dict keyed by (x, y)
 - **`S`**: Open/Close **Statistics Panel**.
 - **`L`**: Open/Close **Color Legend Panel**.
 - **`P`**: Cycle routing profile (WALK → BIKE → CAR); recomputes the route if origin+dest are set.
-- **`R`**: Refresh current viewport (Clear Cache).
+- **`R`**: Clear the route and refresh the tiles.
 - **`Q` / `ESC`**: Quit application.
 
 ### Mouse Controls
@@ -57,7 +57,6 @@ entry = index.get((tile_x, tile_y))  # dict keyed by (x, y)
 Displays per-zoom information:
 - **Tiles**: Total tile count and bounding box dimensions (wide×high).
 - **Origin**: Bottom-left tile coordinate of the bounding box.
-- **Palette colors**: Number of RGB565 entries in the pack's global color palette.
 - **Pack size**: Actual size of the `.nav` file on disk.
 
 ### Query Statistics
