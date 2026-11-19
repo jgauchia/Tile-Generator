@@ -18,7 +18,7 @@ Each entry in the JSON file is a key-value pair:
 | :--- | :--- | :--- |
 | `zoom` | integer | Minimum zoom level at which the feature is included in the packed containers. |
 | `color` | string | HTML hex color (`#rrggbb`). Converted to RGB565 in the binary format. |
-| `priority`| integer | Rendering priority (0-15) for line and polygon features; it becomes the lower nibble of the binary zoom_priority. Higher values draw later. |
+| `priority`| integer | Rendering priority (0-15) for line features; it becomes the lower nibble of the binary zoom_priority. Higher values draw later. Polygon z-order is assigned by the generator from the feature's tags/layer (see §4). |
 | `widths` | object | **Manual Width Scaling**: Map of zoom level to pixels (0.5px units in binary). |
 
 ---
@@ -53,7 +53,7 @@ Each entry in the JSON file is a key-value pair:
 
 ## 4. Layer Priority System
 
-The generator uses a simplified 16-level priority system (0-15). For line and polygon features, this value determines the rendering order within each of the four rendering passes; features with the same priority share a z-order level.
+The generator uses a simplified 16-level priority system (0-15). For lines, the JSON `priority` determines the rendering order within each of the four rendering passes; polygon z-order is assigned by the generator from the feature's tags/layer (the table below). Features with the same priority share a z-order level.
 
 | Priority | Feature Type Examples |
 | :--- | :--- |
@@ -70,7 +70,7 @@ The generator uses a simplified 16-level priority system (0-15). For line and po
 >
 > Bare rock and scree polygons use priority 6 so they stay visible above grass and forest; rock polygons keep priority 2, matching OSM at z16.
 >
-> `highway=footway` is included at z16 in red (`#f88576`), priority 8, with a 1 px core (2 half-pixel units). It does not use a casing. Underground footways (`tunnel=yes`, `layer<0` or `level<0`) are deliberately excluded. These settings are tag-scoped: they do not change the style or priority of other features.
+> `highway=path` and `highway=footway` are included at z16 in red (`#f88576`), priority 8, with a 1 px core (2 half-pixel units). They do not use a casing. Underground footways (`tunnel=yes`, `layer<0` or `level<0`) are deliberately excluded; underground paths are kept and drawn light grey. These settings are tag-scoped: they do not change the style or priority of other features.
 >
 > Waterway lines with `layer<0` are retained unless they are tagged `tunnel=yes`/`culvert` or `level<0`; a negative layer alone only changes stacking, so a river passing below a bridge is not erased. This keeps the `Riu Aixec` stretches visible while the underground drain remains excluded. `waterway=river` uses 2 half-pixel units at z10 and 6 (3 px) at z16 so the line remains legible; `waterway=stream`/`canal` also use 6 (3 px) at z16 so newly visible tributaries match the river, while drains/ditches use 2 (1 px). Water line segments with `layer<0` (a river below a bridge/deck) get at least 8 (4 px) at z16, so restored below-grade stretches such as Riu Aixec do not disappear; at-grade rivers keep their configured width.
 >
@@ -118,12 +118,12 @@ Labels for places and road references are generated with collision detection:
 - **Place Names**: Priority 12-15 based on population.
 - **Road Shields**: Priority 15, matching the bridge/railway layer.
 
-The final z-order is the configured 0-15 priority nibble; there is no layer-base arithmetic. Special features override it: bridges use 15, place labels use 12-15 by population, and road shields use 15.
+The final z-order is the 0-15 priority nibble: the configured `priority` for lines and the generator-assigned tag/layer priority for polygons. There is no layer-base arithmetic. Special features override it: bridges use 15, place labels use 12-15 by population, and road shields use 15.
 
 ---
 
 ## 7. Rendering Order (Bottom to Top)
 
 1. **Background**: priority 0.
-2. **Polygons and lines**: their configured priority from `features.json`.
+2. **Polygons**: the generator-assigned tag/layer priority (see §4). **Lines**: their configured priority from `features.json`.
 3. **Information**: labels and municipal limits on top.

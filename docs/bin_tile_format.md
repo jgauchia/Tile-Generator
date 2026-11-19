@@ -76,6 +76,11 @@ entries already account for the palette size, so reading is still a single seek.
 |-------------|---------|--------|------|-----------------------|
 | `i × 2`     | color   | uint16 | 2    | RGB565 color (LE)     |
 
+> **Tile deduplication:** identical NAV1 payloads are stored once. Multiple
+> sparse-index entries can therefore share the same `(offset, size)`; `index_count`
+> still counts populated cells, not unique blocks. Readers need no special
+> handling — each entry resolves to a self-contained tile block.
+
 ---
 
 ## 3. Internal Tile Format (NAV1)
@@ -177,11 +182,11 @@ via `palette[color_index]`.
 ```
  0: Background land
  1: Large zones (aerodrome, residential, commercial, industrial)
- 2: Landuse base (parking, heath, scrub, park), islands
+ 2: Landuse base (heath, scrub, park, apron), islands
  3: Boundaries, retail, cemetery, leisure
  4: Surfaces (pitch, beach, wetland, farmland)
- 5: Forest/wood, grass, golf fairway/rough, apron
- 6: Infrastructure (runway, taxiway, helipad), golf bunkers/greens/tees
+ 5: Forest/wood, grass, golf fairway/rough
+ 6: Infrastructure (runway, taxiway, helipad), parking, rock/scree, golf bunkers/greens/tees
  7: Buildings, water
  8-14: Roads (by class)
 15: Rail, bridges, labels

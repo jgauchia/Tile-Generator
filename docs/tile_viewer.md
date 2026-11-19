@@ -21,6 +21,9 @@ The simulator mirrors the IceNav-v3 firmware's four-pass logic:
 3. **Pass 3**: Road cores (original color and width).
 4. **Pass 4**: Text labels on top of everything.
 
+Building polygons flagged at z>=16 also get a 1 px casing 35% darker than the fill,
+matching the firmware's polygon pass.
+
 ### Tile Lookup Logic
 ```python
 # O(1) lookup — no Hilbert conversion, no binary search

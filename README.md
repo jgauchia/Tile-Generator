@@ -7,6 +7,7 @@ C++ toolset for generating optimized vector map tiles from OpenStreetMap PBF fil
 - **Sparse Index (bitmap + rank)**: O(1) tile lookup over the bounding box. A 1-bit-per-cell coverage bitmap plus a popcount rank table locates each compact 8-byte entry — empty cells (sea, gaps) resolve with a single small read instead of wasting an index slot.
 - **High-Performance C++ Engine**: OSM PBF parsing and tile generation using GEOS, GDAL, and Libosmium.
 - **Efficient Binary Format**: Packed NPK2 containers with Delta+ZigZag+VarInt coordinate encoding.
+- **Tile Deduplication**: Identical NAV1 payloads are stored once per pack, reducing output size without changing the format.
 - **Memory-Mapped Storage**: Uses `mmap` for feature storage, allowing processing of large PBF files with minimal RAM.
 - **Multi-threaded Processing**: Parallel tile generation leveraging all available CPU cores.
 - **Z-Order Management**: 4-pass rendering pipeline supported in binary format.
