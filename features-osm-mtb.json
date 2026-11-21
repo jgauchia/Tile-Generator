@@ -1,5 +1,5 @@
 {
-  "_nibble_doc": "Original features.json plus MTB trail colour schemes. priority = z-order nibble 0-15.",
+  "_nibble_doc": "Original features.json plus MTB trail colour schemes. priority = z-order nibble 0-15. 0:bg 1:large zones(aerodrome,nature_reserve,residential,commercial,industrial) 2:landuse base(apron,heath,scrub,park) 3:landuse detail(retail,cemetery,garages,leisure) 4:surfaces(pitch,beach,wetland,playground) 5:forest/wood/grass/golf base 6:infrastructure/rock/golf bunker,green,tee,parking 7:buildings+water 8:paths/trails/piers 9-14:roads 15:rail/bridges",
   "landuse=forest": {
     "zoom": 8,
     "color": "#add19e",
@@ -260,6 +260,21 @@
     "color": "#eeeeee",
     "priority": 2
   },
+  "leisure=dog_park": {
+    "zoom": 10,
+    "color": "#d8fdda",
+    "priority": 3
+  },
+  "tourism=picnic_site": {
+    "zoom": 10,
+    "color": "#def6c0",
+    "priority": 3
+  },
+  "tourism=camp_site": {
+    "zoom": 10,
+    "color": "#def6c0",
+    "priority": 3
+  },
   "place=island": {
     "zoom": 8,
     "color": "#f2efe9",
@@ -303,7 +318,7 @@
   "natural=bare_rock": {
     "zoom": 8,
     "color": "#eee6dd",
-    "priority": 2
+    "priority": 6
   },
   "natural=peak": {
     "zoom": 11,
@@ -323,7 +338,7 @@
   "natural=scree": {
     "zoom": 8,
     "color": "#eee6dd",
-    "priority": 2
+    "priority": 6
   },
   "natural=cliff": {
     "zoom": 11,
@@ -432,8 +447,8 @@
   },
   "natural=coastline": {
     "zoom": 12,
-    "color": "#aad2df",
-    "priority": 7
+    "color": "#5a8ca3",
+    "priority": 8
   },
   "natural=wetland": {
     "zoom": 11,

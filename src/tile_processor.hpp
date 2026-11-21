@@ -1738,10 +1738,13 @@ private:
             uint8_t final_width = 1;
             if (pf.type == GEOM_LINESTRING)
             {
-                // TODO(width): for path-like features (path, track, footway,
-                // bridleway, cycleway), prefer OSM width_meters converted to
-                // packed half-pixels when present; otherwise use the table.
-                if (!pf.highway_type.empty())
+                if (!pf.zoom_widths.empty())
+                {
+                    // Explicit per-feature width table (features JSON) wins
+                    for (auto const& [w_zoom, w_pixels] : pf.zoom_widths)
+                        if (z >= w_zoom) final_width = w_pixels;
+                }
+                else if (!pf.highway_type.empty())
                 {
                     auto wit = width_table.find(pf.highway_type);
                     if (wit != width_table.end())
@@ -1752,13 +1755,13 @@ private:
                     else if (pf.width > 0)
                         final_width = utils::meters_to_pixels(pf.width, z);
                 }
-                else if (!pf.zoom_widths.empty())
-                {
-                    for (auto const& [w_zoom, w_pixels] : pf.zoom_widths)
-                        if (z >= w_zoom) final_width = w_pixels;
-                }
                 else if (pf.width > 0)
                     final_width = utils::meters_to_pixels(pf.width, z);
+
+                // TODO(width): for path-like features (path, track, footway,
+                // bridleway, cycleway), prefer OSM width_meters converted to
+                // packed half-pixels when present; otherwise use the table above.
+                // width_meters is already parsed into pf.width in osmium_handler.
             }
             if (final_width == 0) final_width = 1;
 
