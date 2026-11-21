@@ -84,6 +84,7 @@ struct Feature
     uint8_t font_size = 0;
     std::vector<uint8_t> text;
     int population = 0;
+    int text_min_zoom = 0; ///< 0 = use zoom_priority nibble; else first zoom that may place this label
 
     bool is_bridge = false;
     bool is_building = false;
